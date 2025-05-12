@@ -6,7 +6,7 @@ results/
 
 # Model weights - large binary files
 yolov8n.pt
-yolov11n.pt
+yolo11n.pt
 
 # Log files
 output.log
