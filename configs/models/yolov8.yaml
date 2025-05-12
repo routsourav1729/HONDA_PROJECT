@@ -1,0 +1,13 @@
+name: yolov8n_idd
+model: yolov8n.pt  
+epochs: 50
+imgsz: 640
+batch_size: 128  
+mosaic: 1.0
+mixup: 0.1
+copy_paste: 0.1
+degrees: 10.0
+translate: 0.2
+scale: 0.5
+shear: 2.0
+perspective: 0.0005

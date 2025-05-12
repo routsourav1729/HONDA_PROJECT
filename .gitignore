@@ -1,0 +1,29 @@
+# Data files - often large and not suitable for Git
+data/
+
+# Results - generated artifacts
+results/
+
+# Model weights - large binary files
+yolov8n.pt
+yolov11n.pt
+
+# Log files
+output.log
+
+# Python virtual environments
+venv/
+*.venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE and OS specific files
+.idea/
+.vscode/
+.DS_Store
+*.swp
