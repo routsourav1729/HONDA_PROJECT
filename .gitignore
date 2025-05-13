@@ -1,6 +1,6 @@
 # Data files - often large and not suitable for Git
 data/
-
+runs/
 # Results - generated artifacts
 results/
 
