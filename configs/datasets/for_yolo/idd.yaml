@@ -1,0 +1,21 @@
+names:
+  - rider
+  - motorcycle
+  - person
+  - car
+  - truck
+  - traffic sign
+  - vehicle fallback
+  - animal
+  - autorickshaw
+  - bus
+  - bicycle
+  - traffic light
+  - caravan
+  - train
+  - trailer
+nc: 15
+path: /raid/biplab/souravr/honda/detection_benchmark/data/yolo_format
+train: /raid/biplab/souravr/honda/detection_benchmark/data/yolo_format/images/train
+val: /raid/biplab/souravr/honda/detection_benchmark/data/yolo_format/images/val
+test: /raid/biplab/souravr/honda/detection_benchmark/data/yolo_format/images/val  # Using val for testing for now

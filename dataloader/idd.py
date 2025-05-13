@@ -56,7 +56,7 @@ class IDDDataset(Dataset):
                     self.img_paths.append(img_path)
                     self.anno_paths.append(anno_path)
                     break
-        
+            
         print(f"Loaded {len(self.img_paths)} images for {split} split")
         
     def __len__(self):
