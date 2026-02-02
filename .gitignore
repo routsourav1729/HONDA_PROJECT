@@ -147,6 +147,9 @@ Thumbs.db
 *.bak
 *.backup
 
+# Project-specific files to keep locally only
+README.md
+
 # SageMath parsed files
 *.sage.py
 
