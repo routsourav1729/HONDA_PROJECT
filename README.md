@@ -1,0 +1,77 @@
+# [BMVC 2025 Oral] From Open Vocabulary to Open World: Teaching Vision Language Models to Detect Novel Objects
+
+<p align="center">
+    <img src="assets/main.png" alt="main" width=100%>
+</p>
+
+## Environment
+- Step 1: Set up the Conda environment
+```
+conda create --name ovow python==3.11
+```
+- Step 2: Install PyTorch
+```
+pip install numpy==1.26.4
+conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia
+```
+- Step 3: Install [Yolo World](https://github.com/AILab-CVC/YOLO-World)
+  - Requires: mmcv, mmcv-lite, mmdet, mmengine, mmyolo, numpy, opencv-python, openmim, supervision, tokenizers, torch, torchvision, transformers, wheel
+- Note: YOLO-World has changed over time. To run our code, you may need to install a previous version of YOLO-World (I use 4d90f458c1d0de310643b0ac2498f188c98c819c).
+
+```
+pip install mmcv==2.1.0 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
+git clone https://github.com/AILab-CVC/YOLO-World.git
+cd YOLO-World
+git checkout 4d90f458c1d0de310643b0ac2498f188c98c819c
+pip install -e .
+```
+- Step 4: Install other dependencies
+```
+pip install 'git+https://github.com/facebookresearch/detectron2.git'
+```
+- If you encounter other installation problems, feel free to raise an issue with details about your environment and error message.
+- Prepare datasets:
+    - M-OWODB and S-OWODB
+      - Download [COCO](https://cocodataset.org/#download) and [PASCAL VOC](http://host.robots.ox.ac.uk/pascal/VOC/).
+      - Convert annotation format using `coco_to_voc.py`.
+      - Move all images to `datasets/JPEGImages` and annotations to `datasets/Annotations`.
+    - nu-OWODB
+      - For nu-OWODB, first download nuimages from [here](https://www.nuscenes.org/nuimages).
+      - Convert annotation format using `nuimages_to_voc.py`.
+
+## Getting Started
+- Training open world object detector:
+  ```
+  sh train.sh
+  ```
+    - Model training starts from pretrained [Yolo World checkpoint](https://huggingface.co/wondervictor/YOLO-World/blob/main/yolo_world_v2_xl_obj365v1_goldg_cc3mlite_pretrain-5daf1395.pth)
+  
+- To evaluate the model:
+  ```
+  sh test_owod.sh
+  ```
+    - To reproduce our results, please download our checkpoints [here](https://huggingface.co/343GltySprk/ovow/tree/main)
+
+
+## Citation
+If you find this code useful, please consider citing:
+```
+@inproceedings{Li_2025_BMVC,
+author    = {Zizhao Li and Zhengkang Xiang and Joseph West and Kourosh Khoshelham},
+title     = {From Open Vocabulary to Open World: Teaching Vision Language Models to Detect Novel Objects},
+booktitle = {36th British Machine Vision Conference 2025, {BMVC} 2025, Sheffield, UK, November 24-27, 2025},
+publisher = {BMVA},
+year      = {2025},
+url       = {https://bmva-archive.org.uk/bmvc/2025/assets/papers/Paper_717/paper.pdf}
+}
+
+@misc{li2024openvocabularyopenworld,
+      title={From Open Vocabulary to Open World: Teaching Vision Language Models to Detect Novel Objects}, 
+      author={Zizhao Li and Zhengkang Xiang and Joseph West and Kourosh Khoshelham},
+      year={2024},
+      eprint={2411.18207},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2411.18207}, 
+}
+```
