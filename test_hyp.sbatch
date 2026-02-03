@@ -16,7 +16,7 @@
 # ============================================================================
 
 TASK="IDD/t1"
-CKPT="IDD/t1/hyperbolic/model_30.pth"
+CKPT="IDD/t1/hyperbolic_sep/model_final.pth"
 
 # Hyperbolic hyperparameters (must match training)
 HYP_C=0.1

@@ -16,7 +16,7 @@
 # ============================================================================
 
 TASK="IDD/t1"
-CKPT="IDD/t1/hyperbolic_sep/model_latest.pth"
+CKPT="IDD/t1/hyperbolic_sep/model_final.pth"
 
 echo "=========================================="
 echo "POINCARÉ BALL VISUALIZATION"
@@ -64,7 +64,10 @@ python debug/visualize_simple.py \
     --clip_r 2.3 \
     --output_dir visualizations \
     --num_batches 100 \
-    --samples_per_class 50
+    --samples_per_class 50 \
+    --projection hyperbolic_umap \
+    --n_neighbors 15 \
+    --min_dist 0.1
 
 echo ""
 echo "=========================================="
