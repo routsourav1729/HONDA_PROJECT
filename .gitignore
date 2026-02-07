@@ -126,7 +126,7 @@ wandb/
 lightning_logs/
 slurm_logs/
 visualizations/
-debug/
+
 
 # Large pretrained models
 yolo_world_v2_*.pth
