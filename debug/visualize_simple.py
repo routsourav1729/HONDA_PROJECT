@@ -448,9 +448,14 @@ if __name__ == "__main__":
 
     task_name = args.task.split('/')[0]
     split_name = args.task.split('/')[1]
-    dataset_key = task_name
     
-    data_register = Register('./datasets/', args.task, cfg, dataset_key)
+    # Handle IDD_HYP -> IDD for dataset registration (dataset is registered as IDD)
+    base_dataset = task_name.replace('_HYP', '')
+    dataset_key = base_dataset
+    
+    # Use base dataset path for data registration
+    data_split = f"{base_dataset}/{split_name}"
+    data_register = Register('./datasets/', data_split, cfg, dataset_key)
     data_register.register_dataset()
 
     class_names = list(inital_prompts()[dataset_key])
