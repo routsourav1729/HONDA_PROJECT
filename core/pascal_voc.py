@@ -162,40 +162,42 @@ T3_CLASS_NAMES = [
 VOC_COCO_CLASS_NAMES["nu-prompt"] = tuple(
     itertools.chain(T1_CLASS_NAMES, T2_CLASS_NAMES, T3_CLASS_NAMES, UNK_CLASS))
 
-# IDD changes made for custom dataset
-# IMPORTANT: Order must match what the model was trained with!
+# =============================================================================
+# IDD Open World Detection Configuration
+# =============================================================================
+# Base T1 (9 classes): Known classes trained in first task
+# Novel T2 (5 classes): Few-shot classes introduced in second task  
+# Unknown (6 classes): Remain unknown throughout training
+# =============================================================================
+
 IDD_T1_CLASS_NAMES = [
     "car",
-    "motorcycle",
+    "motorcycle", 
     "rider",
     "person",
     "autorickshaw",
-    "bus",
-    "truck",
-    "bicycle",
     "traffic sign",
     "traffic light",
-    "ego vehicle"
+    "pole",
+    "bicycle"
 ]
 VOC_COCO_CLASS_NAMES["IDD"] = tuple(itertools.chain(IDD_T1_CLASS_NAMES, UNK_CLASS))
 
 # IDD T2: Novel classes for few-shot incremental learning
-# These were previously "unknown" in T1, now we learn them with few-shot
+# These were "unknown" in T1, now we learn them with few-shot data
 IDD_T2_CLASS_NAMES = [
-    "concrete_mixer",
-    "crane_truck",
-    "excavator",
-    "pole",
-    "street_cart",
+    "bus",
+    "truck",
     "tanker_vehicle",
-    "tractor"
+    "tractor",
+    "street_cart"
 ]
 # T2 = base classes (T1) + novel classes (T2) + unknown
 VOC_COCO_CLASS_NAMES["IDD_T2"] = tuple(itertools.chain(IDD_T1_CLASS_NAMES, IDD_T2_CLASS_NAMES, UNK_CLASS))
 
-# Classes that should be treated as unknown during evaluation (from your notebook):
-# NOVEL: tractor, tanker_vehicle, street_cart, excavator, crane_truck, concrete_mixer, pole
-# UNKNOWN: train, trailer, caravan, pull_cart/pullcart, road_roller, animal, covered_vehicle
+# Classes that remain UNKNOWN throughout evaluation:
+# animal, pull_cart, road_roller, concrete_mixer, crane_truck, excavator
+# These will be detected as "unknown" by the OOD detector
 
 def load_voc_instances(dirname: str, split: str, class_names: Union[List[str], Tuple[str, ...]], cfg):
     """

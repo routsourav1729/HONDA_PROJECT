@@ -32,7 +32,7 @@ class HorosphericalClassifier(nn.Module):
         Poincaré ball curvature (default: 1.0)
     """
     
-    def __init__(self, num_classes, embed_dim, curvature=1.0):
+    def __init__(self, num_classes, embed_dim, curvature=1.0, clip_embeddings=None):
         super().__init__()
         self.c = curvature
         self.R = 1.0 / (curvature ** 0.5)  # Ball radius
@@ -40,11 +40,37 @@ class HorosphericalClassifier(nn.Module):
         self.embed_dim = embed_dim
         
         # Ideal prototype directions (normalized to boundary at runtime)
-        self.prototype_direction = nn.Parameter(torch.randn(num_classes, embed_dim))
+        # IMPORTANT: Should be initialized from CLIP text embeddings, not random!
+        # clip_embeddings: (num_classes, embed_dim) from CLIP text encoder
+        if clip_embeddings is not None:
+            assert clip_embeddings.shape == (num_classes, embed_dim), \
+                f"CLIP embeddings shape mismatch: {clip_embeddings.shape} vs ({num_classes}, {embed_dim})"
+            self.prototype_direction = nn.Parameter(clip_embeddings.clone())
+        else:
+            # Fallback to random (only for testing, NOT for actual training!)
+            self.prototype_direction = nn.Parameter(torch.randn(num_classes, embed_dim))
         
         # Learnable bias per class - controls horosphere position
         # Positive bias = larger decision region (good for rare classes)
         self.prototype_bias = nn.Parameter(torch.zeros(num_classes))
+    
+    def init_from_clip(self, clip_embeddings):
+        """
+        Initialize prototype directions from CLIP text embeddings.
+        
+        This should be called AFTER running CLIP to get text embeddings for class names.
+        The CLIP embeddings encode semantic meaning of classes.
+        
+        Parameters
+        ----------
+        clip_embeddings : tensor (num_classes, embed_dim)
+            Text embeddings from CLIP for each class name
+        """
+        assert clip_embeddings.shape == (self.num_classes, self.embed_dim), \
+            f"CLIP embeddings shape mismatch: {clip_embeddings.shape} vs ({self.num_classes}, {self.embed_dim})"
+        
+        with torch.no_grad():
+            self.prototype_direction.copy_(clip_embeddings)
     
     @property
     def prototypes(self):
@@ -239,7 +265,8 @@ class HyperbolicProjector(nn.Module):
         curvature=1.0,
         num_classes=20,
         clip_r=0.95,
-        riemannian=True
+        riemannian=True,
+        clip_embeddings=None
     ):
         super().__init__()
         
@@ -279,11 +306,13 @@ class HyperbolicProjector(nn.Module):
             clip_r=clip_r
         )
         
-        # Horospherical classifier (replaces old prototype_tangent)
+        # Horospherical classifier
+        # IMPORTANT: clip_embeddings should be provided from CLIP text encoder
         self.classifier = HorosphericalClassifier(
             num_classes=num_classes,
             embed_dim=out_dim,
-            curvature=curvature
+            curvature=curvature,
+            clip_embeddings=clip_embeddings
         )
         
         self._init_weights()
@@ -313,6 +342,23 @@ class HyperbolicProjector(nn.Module):
     def prototype_bias(self):
         """Access to prototype biases (for checkpoint saving)."""
         return self.classifier.prototype_bias
+    
+    def init_from_clip(self, clip_embeddings):
+        """
+        Initialize prototype directions from CLIP text embeddings.
+        
+        This should be called after running CLIP to get text embeddings.
+        The workflow is:
+        1. Run CLIP text encoder on class prompts (e.g., "a photo of a car")
+        2. Project CLIP embeddings to hyperbolic space dimension
+        3. Call this method to initialize prototypes
+        
+        Parameters
+        ----------
+        clip_embeddings : tensor (num_classes, out_dim)
+            Text embeddings from CLIP, projected to out_dim
+        """
+        self.classifier.init_from_clip(clip_embeddings)
     
     def forward(self, img_feats):
         """

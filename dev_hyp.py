@@ -98,6 +98,8 @@ if __name__ == "__main__":
     parser.add_argument("--clip_r", type=float, default=0.95, help="Clip radius for ToPoincare")
     parser.add_argument("--hyp_loss_weight", type=float, default=1.0, help="Horospherical loss weight")
     parser.add_argument("--dispersion_weight", type=float, default=0.1, help="Prototype dispersion loss weight")
+    parser.add_argument("--clip_cache", type=str, default=None, 
+                        help="Path to CLIP cache for prototype initialization (from compute_clip_cache.py)")
     
     args = parser.parse_args()
     print("Command Line Args:", args)
@@ -156,6 +158,18 @@ if __name__ == "__main__":
         runner.model, unknown_index,
         hyp_c=args.hyp_c, hyp_dim=args.hyp_dim, clip_r=args.clip_r
     )
+    
+    # Initialize prototypes from CLIP cache (if provided)
+    if args.clip_cache and os.path.exists(args.clip_cache):
+        print(f"Initializing prototypes from CLIP cache: {args.clip_cache}")
+        model.init_prototypes_from_clip(args.clip_cache)
+    elif args.clip_cache:
+        print(f"WARNING: CLIP cache not found: {args.clip_cache}")
+        print("  Run: python compute_clip_cache.py --task {t1|t2} first!")
+    else:
+        print("INFO: No CLIP cache provided, using learned projection for prototypes")
+        # Initialize from current CLIP embeddings via learned projection
+        model.init_prototypes_from_clip(clip_cache_path=None)
     
     if args.resume_from:
         print(f"Resuming from: {args.resume_from}")

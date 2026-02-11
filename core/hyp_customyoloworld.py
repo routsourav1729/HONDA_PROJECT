@@ -152,14 +152,60 @@ class HypCustomYoloWorld(nn.Module):
             self.embeddings = nn.Parameter(self.text_feats)
     
     def _init_hyperbolic_projector(self, clip_r):
+        """
+        Initialize hyperbolic projector.
+        
+        Prototype directions will be initialized from CLIP text embeddings.
+        The CLIP embeddings should be pre-computed and cached, then loaded
+        via load_clip_prototypes() before training.
+        
+        Workflow:
+        1. Run CLIP on compute node to get text embeddings for class prompts
+        2. Save projected embeddings to cache file
+        3. Load cache and call init_prototypes_from_clip() before training
+        """
+        # Linear projection from CLIP space to hyperbolic space
+        # This is trained along with the projector
+        clip_dim = self.text_feats.shape[-1] if self.text_feats is not None else 512
+        self.clip_to_hyp = nn.Linear(clip_dim, self.hyp_dim, bias=False)
+        nn.init.orthogonal_(self.clip_to_hyp.weight)  # Orthogonal init for better preservation
+        
+        # Create projector (prototypes will be random initially, 
+        # should call init_prototypes_from_clip() after loading CLIP cache)
         self.hyp_projector = HyperbolicProjector(
             in_dims=[384, 768, 768],
             out_dim=self.hyp_dim,
             curvature=self.hyp_c,
             num_classes=self.unknown_index,
             clip_r=clip_r,
-            riemannian=True
+            riemannian=True,
+            clip_embeddings=None  # Will be initialized from CLIP cache
         )
+    
+    def init_prototypes_from_clip(self, clip_cache_path=None):
+        """
+        Initialize prototype directions from cached CLIP embeddings.
+        
+        Call this BEFORE training after loading the CLIP cache.
+        
+        Parameters
+        ----------
+        clip_cache_path : str, optional
+            Path to cached CLIP embeddings (.pt file)
+            If None, uses self.text_feats with learned projection
+        """
+        with torch.no_grad():
+            if clip_cache_path is not None:
+                # Load pre-computed and projected embeddings from cache
+                cache = torch.load(clip_cache_path)
+                hyp_emb = cache['projected_embeddings'][:self.unknown_index]
+            else:
+                # Project current CLIP embeddings
+                clip_emb = self.text_feats[0, :self.unknown_index, :]
+                hyp_emb = self.clip_to_hyp(clip_emb)
+            
+            # Initialize prototypes
+            self.hyp_projector.init_from_clip(hyp_emb.to(self.hyp_projector.prototype_direction.device))
     
     @property
     def prototypes(self):
