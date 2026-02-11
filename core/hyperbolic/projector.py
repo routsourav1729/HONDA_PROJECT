@@ -155,20 +155,38 @@ class HorosphericalLoss(nn.Module):
         self.label_smoothing = label_smoothing
         self.dispersion_weight = dispersion_weight
     
-    def direction_dispersion_loss(self, prototype_direction):
+    def direction_dispersion_loss(self, prototype_direction, frozen_directions=None):
         """
         Penalize cosine similarity between prototype directions.
         
-        Encourages prototype directions to spread apart on the unit sphere.
+        For T2+, also includes cross-similarity between new and frozen directions
+        to prevent new prototypes from collapsing onto frozen ones.
+        
+        Parameters
+        ----------
+        prototype_direction : tensor (K_new, D)
+            Trainable prototype directions
+        frozen_directions : tensor (K_frozen, D), optional
+            Frozen directions from previous tasks (T2+)
         """
-        dirs = F.normalize(prototype_direction, dim=-1)  # (K, D)
-        sim = dirs @ dirs.T  # (K, K)
+        dirs = F.normalize(prototype_direction, dim=-1)  # (K_new, D)
+        
+        # Self-dispersion among trainable prototypes
+        sim = dirs @ dirs.T  # (K_new, K_new)
         K = dirs.shape[0]
         mask = ~torch.eye(K, dtype=torch.bool, device=dirs.device)
-        # Push cosine similarities toward 0 (orthogonal)
-        return sim[mask].pow(2).mean()
+        self_disp = sim[mask].pow(2).mean() if K > 1 else dirs.new_tensor(0.0)
+        
+        # Cross-dispersion with frozen (T2+)
+        if frozen_directions is not None and frozen_directions.numel() > 0:
+            frozen = F.normalize(frozen_directions, dim=-1)  # (K_frozen, D)
+            cross_sim = dirs @ frozen.T  # (K_new, K_frozen)
+            cross_disp = cross_sim.pow(2).mean()
+            return self_disp + cross_disp
+        
+        return self_disp
     
-    def forward(self, scores, labels, prototype_direction=None):
+    def forward(self, scores, labels, prototype_direction=None, frozen_directions=None):
         """
         Compute cross-entropy loss over horospherical scores.
         
@@ -180,6 +198,8 @@ class HorosphericalLoss(nn.Module):
             Class labels, -1 for background/ignore
         prototype_direction : tensor (K, D), optional
             Raw prototype directions for dispersion loss
+        frozen_directions : tensor (K_frozen, D), optional
+            Frozen directions from previous tasks for cross-dispersion (T2+)
         
         Returns
         -------
@@ -201,14 +221,15 @@ class HorosphericalLoss(nn.Module):
             valid_labels = labels[valid]
             ce_loss = F.cross_entropy(valid_scores, valid_labels, label_smoothing=self.label_smoothing)
         
-        # Add dispersion loss if directions provided
+        # Add dispersion loss if directions provided (includes cross-dispersion for T2+)
         disp_loss = scores.new_tensor(0.0)
         if prototype_direction is not None and self.dispersion_weight > 0:
-            disp_loss = self.direction_dispersion_loss(prototype_direction)
+            disp_loss = self.direction_dispersion_loss(prototype_direction, frozen_directions)
         
         return ce_loss + self.dispersion_weight * disp_loss
     
-    def forward_with_breakdown(self, scores, labels, all_prototypes=None, all_biases=None):
+    def forward_with_breakdown(self, scores, labels, all_prototypes=None, all_biases=None,
+                                  prototype_direction=None, frozen_directions=None):
         """
         Same as forward but returns diagnostic info.
         
@@ -222,8 +243,39 @@ class HorosphericalLoss(nn.Module):
             Full prototypes (frozen + trainable) for T2+ stats
         all_biases : tensor, optional
             Full biases (frozen + trainable) for T2+ stats
+        prototype_direction : tensor, optional
+            Trainable directions for dispersion
+        frozen_directions : tensor, optional
+            Frozen directions for cross-dispersion (T2+)
         """
-        loss = self.forward(scores, labels)
+        # Compute full loss (CE + dispersion)
+        loss = self.forward(scores, labels, prototype_direction, frozen_directions)
+        
+        # Compute individual components for breakdown
+        # CE loss
+        if scores.dim() == 3:
+            B, N, K = scores.shape
+            scores_flat = scores.reshape(B * N, K)
+            labels_flat = labels.reshape(B * N)
+        else:
+            scores_flat = scores
+            labels_flat = labels
+        
+        valid = labels_flat >= 0
+        if valid.sum() == 0:
+            ce_loss_val = 0.0
+        else:
+            ce_loss_val = F.cross_entropy(
+                scores_flat[valid], labels_flat[valid], 
+                label_smoothing=self.label_smoothing
+            ).item()
+        
+        # Dispersion loss
+        disp_loss_val = 0.0
+        if prototype_direction is not None and self.dispersion_weight > 0:
+            disp_loss_val = self.direction_dispersion_loss(
+                prototype_direction, frozen_directions
+            ).item()
         
         # Use provided full prototypes/biases if available (for T2+ accuracy)
         if all_biases is not None:
@@ -234,7 +286,10 @@ class HorosphericalLoss(nn.Module):
             proto_norms = scores.new_zeros(1)
         
         loss_dict = {
-            'horo_ce_loss': loss.item(),
+            'horo_ce_loss': ce_loss_val,
+            'horo_disp_loss': disp_loss_val,
+            'horo_disp_weighted': self.dispersion_weight * disp_loss_val,
+            'horo_total_loss': loss.item(),
             'bias_mean': biases.mean().item(),
             'bias_std': biases.std().item() if len(biases) > 1 else 0.0,
             'proto_norm_mean': proto_norms.mean().item(),

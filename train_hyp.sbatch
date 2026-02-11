@@ -14,36 +14,20 @@
 # ============================================================================
 # Hyperbolic YOLO-World Training - SBATCH Script
 # ============================================================================
+# All hyperbolic parameters are now in config files (configs/IDD/t1.py, t2.py)!
+# 
 # Usage:
-#   sbatch train_hyp.sbatch [exp_name]
-#
-# Examples:
-#   sbatch train_hyp.sbatch                    # saves to IDD/t1/hyperbolic
-#   sbatch train_hyp.sbatch hyp_v2             # saves to IDD/t1/hyp_v2
-#   sbatch train_hyp.sbatch hyp_c0.05_temp0.2  # saves to IDD/t1/hyp_c0.05_temp0.2
+#   sbatch train_hyp.sbatch             # T1 training
+#   sbatch train_hyp.sbatch t2          # T2 training (auto-loads T1 checkpoint)
+#   sbatch train_hyp.sbatch t1 my_exp   # T1 with custom exp name
 # ============================================================================
 
-# Configuration - EDIT THESE
-TASK="IDD/t1"
+# Arguments
+SPLIT=${1:-t1}       # t1 or t2
+EXP_NAME=${2:-horospherical}
+
+TASK="IDD_HYP/$SPLIT"
 PRETRAINED_CKPT="yolo_world_v2_xl_obj365v1_goldg_cc3mlite_pretrain-5daf1395.pth"
-
-# Hyperbolic hyperparameters - EDIT THESE
-# NOTE: For horospherical classifiers, c=1.0 (ball radius=1) is standard
-HYP_C=1.0           # Poincaré ball curvature (ball radius = 1/sqrt(c) = 1.0)
-HYP_DIM=256         # Embedding dimension
-CLIP_R=0.95         # Clip radius (must be < 1.0 for c=1.0)
-HYP_LOSS_WEIGHT=1.0 # Weight for hyperbolic loss
-
-# Prototype dispersion hyperparameters (Issue #9: keeps prototype directions spread)
-# dispersion_weight: 0.1-0.5 recommended, prevents direction collapse
-DISPERSION_WEIGHT=0.1   # Weight for angular dispersion loss (0=disabled)
-
-# Experiment name (from argument or default)
-EXP_NAME=${1:-hyperbolic_horo}
-
-# Prototype initialization (REQUIRED - generate with init_prototypes.py)
-# Example: python init_prototypes.py --classes "car,motorcycle,rider,person,autorickshaw,traffic sign,traffic light,pole,bicycle" --out_dim 256 --output init_protos_t1.pt
-INIT_PROTOS=${2:-init_protos_t1.pt}
 
 echo "=========================================="
 echo "HYPERBOLIC YOLO-WORLD TRAINING"
@@ -51,19 +35,14 @@ echo "=========================================="
 echo "Job started at: $(date)"
 echo "Running on node: $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
-echo "Working directory: $(pwd)"
 echo ""
 echo "Configuration:"
 echo "  Task: $TASK"
 echo "  Experiment: $EXP_NAME"
 echo "  Output dir: $TASK/$EXP_NAME"
-echo "  Init protos: $INIT_PROTOS"
 echo ""
-echo "Hyperbolic params:"
-echo "  c=$HYP_C (ball_radius=$(python3 -c "import math; print(f'{1/math.sqrt($HYP_C):.2f}')"))"
-echo "  dim=$HYP_DIM, clip_r=$CLIP_R, loss_weight=$HYP_LOSS_WEIGHT"
-echo "Dispersion params:"
-echo "  dispersion_weight=$DISPERSION_WEIGHT"
+echo "NOTE: All hyperbolic params are in configs/IDD_HYP/$SPLIT.py"
+echo "      Edit hyp_config section to change: curvature, embed_dim, clip_r, etc."
 echo "=========================================="
 
 # Activate conda environment
@@ -106,15 +85,9 @@ echo "=========================================="
 echo "Starting TRAINING"
 echo "=========================================="
 
-# Run training
+# Run training (all hyp params read from config!)
 python dev_hyp.py \
-    --config-file configs/IDD/base.yaml \
+    --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $PRETRAINED_CKPT \
-    --hyp_c $HYP_C \
-    --hyp_dim $HYP_DIM \
-    --clip_r $CLIP_R \
-    --hyp_loss_weight $HYP_LOSS_WEIGHT \
-    --dispersion_weight $DISPERSION_WEIGHT \
-    --init_protos $INIT_PROTOS \
     --exp_name $EXP_NAME

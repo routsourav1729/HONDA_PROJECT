@@ -65,10 +65,11 @@ if __name__ == "__main__":
     parser.add_argument("--hyp_dim", type=int, default=256, help="Embedding dim")
     parser.add_argument("--clip_r", type=float, default=0.95, help="Clip radius")
     
-    # OOD threshold (for max horosphere score)
-    # Lower threshold = stricter (more unknowns)
+    # OOD threshold: ood_score = -max(horosphere_scores)
+    # Higher ood_score = farther from all prototypes = more likely OOD
+    # If ood_score > threshold → classify as unknown
     parser.add_argument("--ood_threshold", type=float, default=0.0,
-                        help="OOD threshold: if max_score < threshold → unknown")
+                        help="OOD threshold: if ood_score > threshold → unknown")
     
     args = parser.parse_args()
     print("Args:", args)

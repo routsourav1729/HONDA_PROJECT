@@ -88,18 +88,17 @@ def load_checkpoint(model, optimizer, path):
 if __name__ == "__main__":
     parser = default_argument_parser()
     parser.add_argument("--task", default="")
-    parser.add_argument("--ckpt", default="model.pth")
+    parser.add_argument("--ckpt", default="")  # Override config's prev_ckpt if provided
     parser.add_argument("--resume_from", default="")
     parser.add_argument("--exp_name", default="")
     
-    # Hyperbolic/Horospherical parameters
-    parser.add_argument("--hyp_c", type=float, default=1.0, help="Curvature (ball radius = 1/√c)")
-    parser.add_argument("--hyp_dim", type=int, default=256, help="Embedding dimension")
-    parser.add_argument("--clip_r", type=float, default=0.95, help="Clip radius for ToPoincare")
-    parser.add_argument("--hyp_loss_weight", type=float, default=1.0, help="Horospherical loss weight")
-    parser.add_argument("--dispersion_weight", type=float, default=0.1, help="Prototype dispersion loss weight")
-    parser.add_argument("--init_protos", type=str, default="",
-                        help="Path to init_protos.pt from init_prototypes.py (REQUIRED for training!)")
+    # Hyperbolic params can be overridden from command line (but config is preferred)
+    parser.add_argument("--hyp_c", type=float, default=None, help="Override curvature from config")
+    parser.add_argument("--hyp_dim", type=int, default=None, help="Override embed_dim from config")
+    parser.add_argument("--clip_r", type=float, default=None, help="Override clip_r from config")
+    parser.add_argument("--hyp_loss_weight", type=float, default=None, help="Override hyp_loss_weight from config")
+    parser.add_argument("--dispersion_weight", type=float, default=None, help="Override dispersion_weight from config")
+    parser.add_argument("--init_protos", type=str, default=None, help="Override init_protos from config")
     
     args = parser.parse_args()
     print("Command Line Args:", args)
@@ -107,22 +106,25 @@ if __name__ == "__main__":
 
     task_name, split_name = args.task.split('/')
     
-    # Dataset key
-    if task_name == "nu-OWODB":
+    # Dataset key - map IDD_HYP to IDD for dataset registration
+    base_task = task_name.replace('_HYP', '')  # IDD_HYP -> IDD
+    
+    if base_task == "nu-OWODB":
         dataset_key = 'nu-prompt'
     elif split_name in ['t2', 't3', 't4']:
-        dataset_key = f"{task_name}_T{split_name[1].upper()}"
+        dataset_key = f"{base_task}_T{split_name[1].upper()}"
     else:
-        dataset_key = task_name
+        dataset_key = base_task
     
-    class_names = list(inital_prompts().get(dataset_key, inital_prompts()[task_name]))
+    class_names = list(inital_prompts().get(dataset_key, inital_prompts()[base_task]))
     
     print(f"\n=== Configuration ===")
     print(f"Task: {args.task}, Dataset: {dataset_key}")
     print(f"Classes: {len(class_names)}")
-    print(f"Curvature: {args.hyp_c} (ball radius = {1.0 / args.hyp_c**0.5:.2f})")
     
-    data_register = Register('./datasets/', args.task, cfg, dataset_key)
+    # Register dataset using base_task path (IDD not IDD_HYP)
+    data_split = f"{base_task}/{split_name}"  # e.g., IDD/t1
+    data_register = Register('./datasets/', data_split, cfg, dataset_key)
     data_register.register_dataset()
 
     # Model config
@@ -152,37 +154,63 @@ if __name__ == "__main__":
     train_loader = Runner.build_dataloader(cfgY.trlder)
     print(f"✓ Training loader: {len(train_loader)} batches")
 
-    # Load init_prototypes if provided
+    # ==========================================================================
+    # Load Hyperbolic Config from cfgY.hyp_config (with CLI overrides)
+    # ==========================================================================
+    hyp_cfg = cfgY.get('hyp_config', {})
+    
+    # Get values from config, allow CLI override
+    hyp_c = args.hyp_c if args.hyp_c is not None else hyp_cfg.get('curvature', 1.0)
+    hyp_dim = args.hyp_dim if args.hyp_dim is not None else hyp_cfg.get('embed_dim', 256)
+    clip_r = args.clip_r if args.clip_r is not None else hyp_cfg.get('clip_r', 0.95)
+    hyp_loss_weight = args.hyp_loss_weight if args.hyp_loss_weight is not None else hyp_cfg.get('hyp_loss_weight', 1.0)
+    dispersion_weight = args.dispersion_weight if args.dispersion_weight is not None else hyp_cfg.get('dispersion_weight', 0.0)
+    init_protos_path = args.init_protos if args.init_protos is not None else hyp_cfg.get('init_protos', '')
+    prev_ckpt = args.ckpt if args.ckpt else hyp_cfg.get('prev_ckpt', '')
+    
+    print(f"\n=== Hyperbolic Config ===")
+    print(f"  curvature: {hyp_c}")
+    print(f"  embed_dim: {hyp_dim}")
+    print(f"  clip_r: {clip_r}")
+    print(f"  hyp_loss_weight: {hyp_loss_weight}")
+    print(f"  dispersion_weight: {dispersion_weight}")
+    print(f"  init_protos: {init_protos_path}")
+    if cfg.TEST.PREV_INTRODUCED_CLS > 0:
+        print(f"  prev_ckpt (T2+): {prev_ckpt}")
+    
+    # Load init_prototypes
     init_prototypes = None
-    if args.init_protos:
-        if os.path.exists(args.init_protos):
-            print(f"Loading prototype initialization from: {args.init_protos}")
-            proto_data = torch.load(args.init_protos)
+    if init_protos_path:
+        if os.path.exists(init_protos_path):
+            print(f"Loading prototype initialization from: {init_protos_path}")
+            proto_data = torch.load(init_protos_path)
             init_prototypes = proto_data['init_directions']
             print(f"  Loaded {init_prototypes.shape[0]} prototype directions (dim={init_prototypes.shape[1]})")
         else:
-            print(f"ERROR: init_protos file not found: {args.init_protos}")
+            print(f"ERROR: init_protos file not found: {init_protos_path}")
             print("  Run: python init_prototypes.py --classes '...' --output init_protos_t1.pt")
             exit(1)
     else:
-        print("⚠ WARNING: No --init_protos provided! Using random initialization.")
-        print("  For proper training, run init_prototypes.py first!")
+        print("⚠ WARNING: No init_protos in config! Using random initialization.")
+        print("  For proper training, add init_protos to hyp_config in configs/IDD/t1.py!")
 
     # Build Horospherical model
     print(f"\n=== Building Horospherical Model ===")
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
-        hyp_c=args.hyp_c, hyp_dim=args.hyp_dim, clip_r=args.clip_r,
+        hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
         init_prototypes=init_prototypes,
-        dispersion_weight=args.dispersion_weight
+        dispersion_weight=dispersion_weight
     )
     
     if args.resume_from:
         print(f"Resuming from: {args.resume_from}")
         model = load_hyp_ckpt(model, args.resume_from, cfg.TEST.PREV_INTRODUCED_CLS, cfg.TEST.CUR_INTRODUCED_CLS)
     elif cfg.TEST.PREV_INTRODUCED_CLS > 0:
-        print(f"T2+ training: loading {args.ckpt}")
-        model = load_hyp_ckpt(model, args.ckpt, cfg.TEST.PREV_INTRODUCED_CLS, cfg.TEST.CUR_INTRODUCED_CLS)
+        # T2+: load previous task checkpoint
+        ckpt_path = prev_ckpt if prev_ckpt else args.ckpt
+        print(f"T2+ training: loading {ckpt_path}")
+        model = load_hyp_ckpt(model, ckpt_path, cfg.TEST.PREV_INTRODUCED_CLS, cfg.TEST.CUR_INTRODUCED_CLS)
     else:
         print("T1 training: fresh start")
     

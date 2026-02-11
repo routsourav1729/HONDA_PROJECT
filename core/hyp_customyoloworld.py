@@ -51,10 +51,10 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
         if state_dict.get('embeddings') is not None:
             model.embeddings = nn.Parameter(state_dict['embeddings'], requires_grad=False)
         
-        # Load frozen prototypes as buffers (no grad)
+        # Load frozen prototypes as buffers - use register_buffer() method!
         if state_dict.get('frozen_directions') is not None:
-            model.frozen_directions = state_dict['frozen_directions'].cuda()
-            model.frozen_biases = state_dict['frozen_biases'].cuda()
+            model.register_buffer('frozen_directions', state_dict['frozen_directions'].cuda())
+            model.register_buffer('frozen_biases', state_dict['frozen_biases'].cuda())
         
         # Load trainable prototypes
         if state_dict.get('hyp_projector.classifier.prototype_direction') is not None:
@@ -94,9 +94,9 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
         freeze_biases = bias_a if bias_a is not None else bias_b
     
     if freeze_dirs is not None:
-        # Frozen prototypes are buffers — NO gradients
-        model.frozen_directions = freeze_dirs.cuda()
-        model.frozen_biases = freeze_biases.cuda()
+        # Frozen prototypes are buffers — use register_buffer() method!
+        model.register_buffer('frozen_directions', freeze_dirs.cuda())
+        model.register_buffer('frozen_biases', freeze_biases.cuda())
         
         # Initialize new trainable prototypes for novel classes
         # NOTE: For T2+, should also use init_prototypes.py for novel class prototypes!
@@ -267,10 +267,11 @@ class HypCustomYoloWorld(nn.Module):
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0)
         scores = self.compute_horosphere_scores(hyp_embeddings)
-        # Pass prototype_direction for dispersion loss
+        # Pass prototype_direction + frozen_directions for dispersion loss (including cross-dispersion at T2+)
         return self.hyp_loss_fn(
             scores, self.tmp_labels,
-            prototype_direction=self.hyp_projector.prototype_direction
+            prototype_direction=self.hyp_projector.prototype_direction,
+            frozen_directions=self.frozen_directions
         )
     
     def horospherical_loss_with_breakdown(self, hyp_embeddings):
@@ -278,11 +279,13 @@ class HypCustomYoloWorld(nn.Module):
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0), {}
         scores = self.compute_horosphere_scores(hyp_embeddings)
-        # Pass full prototypes/biases for accurate breakdown at T2+
+        # Pass full prototypes/biases + directions for accurate breakdown at T2+
         return self.hyp_loss_fn.forward_with_breakdown(
             scores, self.tmp_labels, 
             all_prototypes=self.prototypes, 
-            all_biases=self.prototype_biases
+            all_biases=self.prototype_biases,
+            prototype_direction=self.hyp_projector.prototype_direction,
+            frozen_directions=self.frozen_directions
         )
     
     def head_loss(self, batch_inputs: Tensor, batch_data_samples: SampleList):
@@ -464,7 +467,23 @@ class HypCustomYoloWorld(nn.Module):
             if cfg.get('yolox_style', False):
                 cfg.max_per_img = len(result)
             
+            # Save ood_scores before post-process (NMS may drop them)
+            pre_nms_ood_scores = result.ood_scores.clone()
+            pre_nms_bboxes = result.bboxes.clone()
+            
             result = self.bbox_head._bbox_post_process(result, cfg, rescale=False, with_nms=True, img_meta=img_meta)
+            
+            # Restore ood_scores if lost during post-process
+            if not hasattr(result, 'ood_scores') or result.ood_scores is None:
+                # Match kept boxes to original boxes via IoU
+                from torchvision.ops import box_iou
+                if len(result.bboxes) > 0 and len(pre_nms_bboxes) > 0:
+                    iou = box_iou(result.bboxes, pre_nms_bboxes)
+                    matched_idx = iou.argmax(dim=1)
+                    result.ood_scores = pre_nms_ood_scores[matched_idx]
+                else:
+                    result.ood_scores = result.scores.new_zeros(len(result.scores))
+            
             result.bboxes[:, 0::2].clamp_(0, img_meta['ori_shape'][1])
             result.bboxes[:, 1::2].clamp_(0, img_meta['ori_shape'][0])
             results.append(result)
