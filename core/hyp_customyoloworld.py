@@ -30,6 +30,8 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
     Handles:
     - Text embeddings (frozen_embeddings, embeddings)
     - Prototype directions + biases (frozen_directions, frozen_biases, trainable)
+    
+    Note: frozen_directions and frozen_biases are registered as buffers (no grad).
     """
     checkpoint = torch.load(checkpoint_path, map_location='cuda')
     state_dict = checkpoint.get('model_state_dict', checkpoint)
@@ -44,12 +46,15 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
     
     if eval:
         # Evaluation: load all embeddings and prototypes
-        model.frozen_embeddings = nn.Parameter(state_dict['frozen_embeddings'], requires_grad=False) if state_dict.get('frozen_embeddings') is not None else None
-        model.embeddings = nn.Parameter(state_dict['embeddings'], requires_grad=False) if state_dict.get('embeddings') is not None else None
+        if state_dict.get('frozen_embeddings') is not None:
+            model.frozen_embeddings = nn.Parameter(state_dict['frozen_embeddings'], requires_grad=False)
+        if state_dict.get('embeddings') is not None:
+            model.embeddings = nn.Parameter(state_dict['embeddings'], requires_grad=False)
         
-        # Load frozen prototypes (requires_grad=False since we're in eval)
-        model.frozen_directions = nn.Parameter(state_dict['frozen_directions'], requires_grad=False) if state_dict.get('frozen_directions') is not None else None
-        model.frozen_biases = nn.Parameter(state_dict['frozen_biases'], requires_grad=False) if state_dict.get('frozen_biases') is not None else None
+        # Load frozen prototypes as buffers (no grad)
+        if state_dict.get('frozen_directions') is not None:
+            model.frozen_directions = state_dict['frozen_directions'].cuda()
+            model.frozen_biases = state_dict['frozen_biases'].cuda()
         
         # Load trainable prototypes
         if state_dict.get('hyp_projector.classifier.prototype_direction') is not None:
@@ -89,10 +94,14 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
         freeze_biases = bias_a if bias_a is not None else bias_b
     
     if freeze_dirs is not None:
-        # Frozen prototypes should not require gradients
-        model.frozen_directions = nn.Parameter(freeze_dirs, requires_grad=False)
-        model.frozen_biases = nn.Parameter(freeze_biases, requires_grad=False)
-        # Initialize new trainable prototypes
+        # Frozen prototypes are buffers — NO gradients
+        model.frozen_directions = freeze_dirs.cuda()
+        model.frozen_biases = freeze_biases.cuda()
+        
+        # Initialize new trainable prototypes for novel classes
+        # NOTE: For T2+, should also use init_prototypes.py for novel class prototypes!
+        print(f"  ⚠ T2+: Using random init for {current_classes} novel prototypes")
+        print(f"     Consider using init_prototypes.py for better init!")
         model.hyp_projector.classifier.prototype_direction = nn.Parameter(
             torch.randn(current_classes, model.hyp_projector.out_dim))
         model.hyp_projector.classifier.prototype_bias = nn.Parameter(
@@ -119,6 +128,8 @@ class HypCustomYoloWorld(nn.Module):
         hyp_c=1.0,
         hyp_dim=256,
         clip_r=0.95,
+        init_prototypes=None,  # Pre-computed from init_prototypes.py
+        dispersion_weight=0.1,
     ):
         super().__init__()
         
@@ -136,14 +147,15 @@ class HypCustomYoloWorld(nn.Module):
         self.embeddings = None
         
         # Frozen prototypes from previous tasks (T2+)
-        self.frozen_directions = None
-        self.frozen_biases = None
+        # Use register_buffer so they don't require gradients
+        self.register_buffer('frozen_directions', None)
+        self.register_buffer('frozen_biases', None)
         
         self._init_text_embedding()
-        self._init_hyperbolic_projector(clip_r)
+        self._init_hyperbolic_projector(clip_r, init_prototypes)
         
-        # Loss function
-        self.hyp_loss_fn = HorosphericalLoss(curvature=hyp_c)
+        # Loss function with dispersion
+        self.hyp_loss_fn = HorosphericalLoss(curvature=hyp_c, dispersion_weight=dispersion_weight)
     
     def _init_text_embedding(self):
         with torch.no_grad():
@@ -151,27 +163,17 @@ class HypCustomYoloWorld(nn.Module):
             self.text_feats = self.parent.text_feats.clone()
             self.embeddings = nn.Parameter(self.text_feats)
     
-    def _init_hyperbolic_projector(self, clip_r):
+    def _init_hyperbolic_projector(self, clip_r, init_prototypes=None):
         """
         Initialize hyperbolic projector.
         
-        Prototype directions will be initialized from CLIP text embeddings.
-        The CLIP embeddings should be pre-computed and cached, then loaded
-        via load_clip_prototypes() before training.
-        
-        Workflow:
-        1. Run CLIP on compute node to get text embeddings for class prompts
-        2. Save projected embeddings to cache file
-        3. Load cache and call init_prototypes_from_clip() before training
+        Parameters
+        ----------
+        clip_r : float
+            Clip radius for ToPoincare
+        init_prototypes : tensor, optional
+            Pre-computed prototype directions from init_prototypes.py (K, hyp_dim)
         """
-        # Linear projection from CLIP space to hyperbolic space
-        # This is trained along with the projector
-        clip_dim = self.text_feats.shape[-1] if self.text_feats is not None else 512
-        self.clip_to_hyp = nn.Linear(clip_dim, self.hyp_dim, bias=False)
-        nn.init.orthogonal_(self.clip_to_hyp.weight)  # Orthogonal init for better preservation
-        
-        # Create projector (prototypes will be random initially, 
-        # should call init_prototypes_from_clip() after loading CLIP cache)
         self.hyp_projector = HyperbolicProjector(
             in_dims=[384, 768, 768],
             out_dim=self.hyp_dim,
@@ -179,33 +181,8 @@ class HypCustomYoloWorld(nn.Module):
             num_classes=self.unknown_index,
             clip_r=clip_r,
             riemannian=True,
-            clip_embeddings=None  # Will be initialized from CLIP cache
+            init_prototypes=init_prototypes
         )
-    
-    def init_prototypes_from_clip(self, clip_cache_path=None):
-        """
-        Initialize prototype directions from cached CLIP embeddings.
-        
-        Call this BEFORE training after loading the CLIP cache.
-        
-        Parameters
-        ----------
-        clip_cache_path : str, optional
-            Path to cached CLIP embeddings (.pt file)
-            If None, uses self.text_feats with learned projection
-        """
-        with torch.no_grad():
-            if clip_cache_path is not None:
-                # Load pre-computed and projected embeddings from cache
-                cache = torch.load(clip_cache_path)
-                hyp_emb = cache['projected_embeddings'][:self.unknown_index]
-            else:
-                # Project current CLIP embeddings
-                clip_emb = self.text_feats[0, :self.unknown_index, :]
-                hyp_emb = self.clip_to_hyp(clip_emb)
-            
-            # Initialize prototypes
-            self.hyp_projector.init_from_clip(hyp_emb.to(self.hyp_projector.prototype_direction.device))
     
     @property
     def prototypes(self):
@@ -286,11 +263,15 @@ class HypCustomYoloWorld(nn.Module):
         return scores
     
     def horospherical_loss(self, hyp_embeddings):
-        """Compute horospherical CE loss."""
+        """Compute horospherical CE loss with dispersion regularization."""
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0)
         scores = self.compute_horosphere_scores(hyp_embeddings)
-        return self.hyp_loss_fn(scores, self.tmp_labels)
+        # Pass prototype_direction for dispersion loss
+        return self.hyp_loss_fn(
+            scores, self.tmp_labels,
+            prototype_direction=self.hyp_projector.prototype_direction
+        )
     
     def horospherical_loss_with_breakdown(self, hyp_embeddings):
         """Loss with diagnostics."""

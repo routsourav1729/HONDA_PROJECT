@@ -98,8 +98,8 @@ if __name__ == "__main__":
     parser.add_argument("--clip_r", type=float, default=0.95, help="Clip radius for ToPoincare")
     parser.add_argument("--hyp_loss_weight", type=float, default=1.0, help="Horospherical loss weight")
     parser.add_argument("--dispersion_weight", type=float, default=0.1, help="Prototype dispersion loss weight")
-    parser.add_argument("--clip_cache", type=str, default=None, 
-                        help="Path to CLIP cache for prototype initialization (from compute_clip_cache.py)")
+    parser.add_argument("--init_protos", type=str, default="",
+                        help="Path to init_protos.pt from init_prototypes.py (REQUIRED for training!)")
     
     args = parser.parse_args()
     print("Command Line Args:", args)
@@ -152,24 +152,30 @@ if __name__ == "__main__":
     train_loader = Runner.build_dataloader(cfgY.trlder)
     print(f"✓ Training loader: {len(train_loader)} batches")
 
+    # Load init_prototypes if provided
+    init_prototypes = None
+    if args.init_protos:
+        if os.path.exists(args.init_protos):
+            print(f"Loading prototype initialization from: {args.init_protos}")
+            proto_data = torch.load(args.init_protos)
+            init_prototypes = proto_data['init_directions']
+            print(f"  Loaded {init_prototypes.shape[0]} prototype directions (dim={init_prototypes.shape[1]})")
+        else:
+            print(f"ERROR: init_protos file not found: {args.init_protos}")
+            print("  Run: python init_prototypes.py --classes '...' --output init_protos_t1.pt")
+            exit(1)
+    else:
+        print("⚠ WARNING: No --init_protos provided! Using random initialization.")
+        print("  For proper training, run init_prototypes.py first!")
+
     # Build Horospherical model
     print(f"\n=== Building Horospherical Model ===")
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
-        hyp_c=args.hyp_c, hyp_dim=args.hyp_dim, clip_r=args.clip_r
+        hyp_c=args.hyp_c, hyp_dim=args.hyp_dim, clip_r=args.clip_r,
+        init_prototypes=init_prototypes,
+        dispersion_weight=args.dispersion_weight
     )
-    
-    # Initialize prototypes from CLIP cache (if provided)
-    if args.clip_cache and os.path.exists(args.clip_cache):
-        print(f"Initializing prototypes from CLIP cache: {args.clip_cache}")
-        model.init_prototypes_from_clip(args.clip_cache)
-    elif args.clip_cache:
-        print(f"WARNING: CLIP cache not found: {args.clip_cache}")
-        print("  Run: python compute_clip_cache.py --task {t1|t2} first!")
-    else:
-        print("INFO: No CLIP cache provided, using learned projection for prototypes")
-        # Initialize from current CLIP embeddings via learned projection
-        model.init_prototypes_from_clip(clip_cache_path=None)
     
     if args.resume_from:
         print(f"Resuming from: {args.resume_from}")

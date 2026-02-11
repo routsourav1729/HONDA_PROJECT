@@ -41,6 +41,10 @@ DISPERSION_WEIGHT=0.1   # Weight for angular dispersion loss (0=disabled)
 # Experiment name (from argument or default)
 EXP_NAME=${1:-hyperbolic_horo}
 
+# Prototype initialization (REQUIRED - generate with init_prototypes.py)
+# Example: python init_prototypes.py --classes "car,motorcycle,rider,person,autorickshaw,traffic sign,traffic light,pole,bicycle" --out_dim 256 --output init_protos_t1.pt
+INIT_PROTOS=${2:-init_protos_t1.pt}
+
 echo "=========================================="
 echo "HYPERBOLIC YOLO-WORLD TRAINING"
 echo "=========================================="
@@ -53,6 +57,7 @@ echo "Configuration:"
 echo "  Task: $TASK"
 echo "  Experiment: $EXP_NAME"
 echo "  Output dir: $TASK/$EXP_NAME"
+echo "  Init protos: $INIT_PROTOS"
 echo ""
 echo "Hyperbolic params:"
 echo "  c=$HYP_C (ball_radius=$(python3 -c "import math; print(f'{1/math.sqrt($HYP_C):.2f}')"))"
@@ -111,3 +116,5 @@ python dev_hyp.py \
     --clip_r $CLIP_R \
     --hyp_loss_weight $HYP_LOSS_WEIGHT \
     --dispersion_weight $DISPERSION_WEIGHT \
+    --init_protos $INIT_PROTOS \
+    --exp_name $EXP_NAME

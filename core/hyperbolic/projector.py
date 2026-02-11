@@ -30,9 +30,11 @@ class HorosphericalClassifier(nn.Module):
         Embedding dimension
     curvature : float
         Poincaré ball curvature (default: 1.0)
+    init_directions : tensor, optional
+        Pre-computed prototype directions from init_prototypes.py (K, embed_dim)
     """
     
-    def __init__(self, num_classes, embed_dim, curvature=1.0, clip_embeddings=None):
+    def __init__(self, num_classes, embed_dim, curvature=1.0, init_directions=None):
         super().__init__()
         self.c = curvature
         self.R = 1.0 / (curvature ** 0.5)  # Ball radius
@@ -40,37 +42,19 @@ class HorosphericalClassifier(nn.Module):
         self.embed_dim = embed_dim
         
         # Ideal prototype directions (normalized to boundary at runtime)
-        # IMPORTANT: Should be initialized from CLIP text embeddings, not random!
-        # clip_embeddings: (num_classes, embed_dim) from CLIP text encoder
-        if clip_embeddings is not None:
-            assert clip_embeddings.shape == (num_classes, embed_dim), \
-                f"CLIP embeddings shape mismatch: {clip_embeddings.shape} vs ({num_classes}, {embed_dim})"
-            self.prototype_direction = nn.Parameter(clip_embeddings.clone())
+        # Should be initialized from init_prototypes.py output!
+        if init_directions is not None:
+            assert init_directions.shape == (num_classes, embed_dim), \
+                f"init_directions shape mismatch: {init_directions.shape} vs ({num_classes}, {embed_dim})"
+            self.prototype_direction = nn.Parameter(init_directions.clone())
+            print(f"  ✓ Prototype directions initialized from pre-computed tensor")
         else:
-            # Fallback to random (only for testing, NOT for actual training!)
+            # Random fallback - only for testing!
+            print(f"  ⚠ WARNING: Random prototype initialization (use init_prototypes.py for training!)")
             self.prototype_direction = nn.Parameter(torch.randn(num_classes, embed_dim))
         
         # Learnable bias per class - controls horosphere position
-        # Positive bias = larger decision region (good for rare classes)
         self.prototype_bias = nn.Parameter(torch.zeros(num_classes))
-    
-    def init_from_clip(self, clip_embeddings):
-        """
-        Initialize prototype directions from CLIP text embeddings.
-        
-        This should be called AFTER running CLIP to get text embeddings for class names.
-        The CLIP embeddings encode semantic meaning of classes.
-        
-        Parameters
-        ----------
-        clip_embeddings : tensor (num_classes, embed_dim)
-            Text embeddings from CLIP for each class name
-        """
-        assert clip_embeddings.shape == (self.num_classes, self.embed_dim), \
-            f"CLIP embeddings shape mismatch: {clip_embeddings.shape} vs ({self.num_classes}, {self.embed_dim})"
-        
-        with torch.no_grad():
-            self.prototype_direction.copy_(clip_embeddings)
     
     @property
     def prototypes(self):
@@ -151,9 +135,9 @@ class HorosphericalClassifier(nn.Module):
 
 class HorosphericalLoss(nn.Module):
     """
-    Cross-entropy loss over horospherical scores.
+    Cross-entropy loss over horospherical scores with optional direction dispersion.
     
-    L = -log P(ŷ=y | x) where P(ŷ=k | x) = softmax_k(ξ_k(x))
+    L = CE(scores, labels) + dispersion_weight * dispersion_loss
     
     Parameters
     ----------
@@ -161,14 +145,30 @@ class HorosphericalLoss(nn.Module):
         Poincaré ball curvature (default: 1.0)
     label_smoothing : float
         Label smoothing factor (default: 0.0)
+    dispersion_weight : float
+        Weight for direction dispersion loss (default: 0.1)
     """
     
-    def __init__(self, curvature=1.0, label_smoothing=0.0):
+    def __init__(self, curvature=1.0, label_smoothing=0.0, dispersion_weight=0.1):
         super().__init__()
         self.c = curvature
         self.label_smoothing = label_smoothing
+        self.dispersion_weight = dispersion_weight
     
-    def forward(self, scores, labels):
+    def direction_dispersion_loss(self, prototype_direction):
+        """
+        Penalize cosine similarity between prototype directions.
+        
+        Encourages prototype directions to spread apart on the unit sphere.
+        """
+        dirs = F.normalize(prototype_direction, dim=-1)  # (K, D)
+        sim = dirs @ dirs.T  # (K, K)
+        K = dirs.shape[0]
+        mask = ~torch.eye(K, dtype=torch.bool, device=dirs.device)
+        # Push cosine similarities toward 0 (orthogonal)
+        return sim[mask].pow(2).mean()
+    
+    def forward(self, scores, labels, prototype_direction=None):
         """
         Compute cross-entropy loss over horospherical scores.
         
@@ -178,11 +178,13 @@ class HorosphericalLoss(nn.Module):
             Horospherical scores from classifier
         labels : tensor (B*N,) or (N,)
             Class labels, -1 for background/ignore
+        prototype_direction : tensor (K, D), optional
+            Raw prototype directions for dispersion loss
         
         Returns
         -------
         tensor
-            Scalar loss
+            Scalar loss (CE + dispersion)
         """
         # Flatten if batched
         if scores.dim() == 3:
@@ -193,12 +195,18 @@ class HorosphericalLoss(nn.Module):
         # Filter valid (ignore background label=-1)
         valid = labels >= 0
         if valid.sum() == 0:
-            return scores.new_tensor(0.0)
+            ce_loss = scores.new_tensor(0.0)
+        else:
+            valid_scores = scores[valid]
+            valid_labels = labels[valid]
+            ce_loss = F.cross_entropy(valid_scores, valid_labels, label_smoothing=self.label_smoothing)
         
-        valid_scores = scores[valid]
-        valid_labels = labels[valid]
+        # Add dispersion loss if directions provided
+        disp_loss = scores.new_tensor(0.0)
+        if prototype_direction is not None and self.dispersion_weight > 0:
+            disp_loss = self.direction_dispersion_loss(prototype_direction)
         
-        return F.cross_entropy(valid_scores, valid_labels, label_smoothing=self.label_smoothing)
+        return ce_loss + self.dispersion_weight * disp_loss
     
     def forward_with_breakdown(self, scores, labels, all_prototypes=None, all_biases=None):
         """
@@ -266,7 +274,7 @@ class HyperbolicProjector(nn.Module):
         num_classes=20,
         clip_r=0.95,
         riemannian=True,
-        clip_embeddings=None
+        init_prototypes=None
     ):
         super().__init__()
         
@@ -307,12 +315,12 @@ class HyperbolicProjector(nn.Module):
         )
         
         # Horospherical classifier
-        # IMPORTANT: clip_embeddings should be provided from CLIP text encoder
+        # init_prototypes should come from init_prototypes.py!
         self.classifier = HorosphericalClassifier(
             num_classes=num_classes,
             embed_dim=out_dim,
             curvature=curvature,
-            clip_embeddings=clip_embeddings
+            init_directions=init_prototypes
         )
         
         self._init_weights()
@@ -342,23 +350,6 @@ class HyperbolicProjector(nn.Module):
     def prototype_bias(self):
         """Access to prototype biases (for checkpoint saving)."""
         return self.classifier.prototype_bias
-    
-    def init_from_clip(self, clip_embeddings):
-        """
-        Initialize prototype directions from CLIP text embeddings.
-        
-        This should be called after running CLIP to get text embeddings.
-        The workflow is:
-        1. Run CLIP text encoder on class prompts (e.g., "a photo of a car")
-        2. Project CLIP embeddings to hyperbolic space dimension
-        3. Call this method to initialize prototypes
-        
-        Parameters
-        ----------
-        clip_embeddings : tensor (num_classes, out_dim)
-            Text embeddings from CLIP, projected to out_dim
-        """
-        self.classifier.init_from_clip(clip_embeddings)
     
     def forward(self, img_feats):
         """
