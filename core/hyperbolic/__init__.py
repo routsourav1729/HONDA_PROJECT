@@ -1,6 +1,6 @@
 """
 Hyperbolic geometry modules for open-world object detection.
-Based on HypGCD and Hyp-OW implementations.
+Uses Horospherical classification with ideal prototypes on boundary.
 """
 
 from .pmath import (
@@ -12,11 +12,17 @@ from .pmath import (
     poincare_mean,
     mobius_add,
     RiemannianGradient,
+    busemann,
+    busemann_batch,
 )
 
 from .nn import ToPoincare, FromPoincare, HyperbolicMLR
 
-from .projector import HyperbolicProjector, HyperbolicContrastiveLoss
+from .projector import (
+    HyperbolicProjector,
+    HorosphericalClassifier,
+    HorosphericalLoss,
+)
 
 from .visualization import (
     visualize_hyperbolic_embeddings,
@@ -25,6 +31,7 @@ from .visualization import (
 )
 
 __all__ = [
+    # Math operations
     'expmap0',
     'logmap0', 
     'project',
@@ -33,11 +40,17 @@ __all__ = [
     'poincare_mean',
     'mobius_add',
     'RiemannianGradient',
+    'busemann',
+    'busemann_batch',
+    # NN layers
     'ToPoincare',
     'FromPoincare',
     'HyperbolicMLR',
+    # Projector and classifier
     'HyperbolicProjector',
-    'HyperbolicContrastiveLoss',
+    'HorosphericalClassifier',
+    'HorosphericalLoss',
+    # Visualization
     'visualize_hyperbolic_embeddings',
     'plot_poincare_disk',
     'hyperbolic_umap_visualization',

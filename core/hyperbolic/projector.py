@@ -1,6 +1,8 @@
 """
-Hyperbolic Projector for multi-scale FPN features.
-Projects visual features from YOLO backbone to Poincare ball.
+Hyperbolic Projector with Horospherical Classifier.
+
+Projects visual features from YOLO backbone to Poincaré ball,
+then classifies using Busemann function with ideal prototypes on boundary.
 """
 
 import torch
@@ -11,43 +13,187 @@ from .nn import ToPoincare
 from . import pmath
 
 
+class HorosphericalClassifier(nn.Module):
+    """
+    Classification via Busemann function with ideal prototypes on boundary.
+    
+    Score: ξ_k(x) = -B_{p_k}(x) + a_k
+    Prediction: argmax_k softmax(ξ_k(x))
+    
+    For OOD detection: max_k ξ_k(x) < threshold → unknown
+    
+    Parameters
+    ----------
+    num_classes : int
+        Number of known classes
+    embed_dim : int
+        Embedding dimension
+    curvature : float
+        Poincaré ball curvature (default: 1.0)
+    """
+    
+    def __init__(self, num_classes, embed_dim, curvature=1.0):
+        super().__init__()
+        self.c = curvature
+        self.R = 1.0 / (curvature ** 0.5)  # Ball radius
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        
+        # Ideal prototype directions (normalized to boundary at runtime)
+        self.prototype_direction = nn.Parameter(torch.randn(num_classes, embed_dim))
+        
+        # Learnable bias per class - controls horosphere position
+        # Positive bias = larger decision region (good for rare classes)
+        self.prototype_bias = nn.Parameter(torch.zeros(num_classes))
+    
+    @property
+    def prototypes(self):
+        """Ideal prototypes on the Poincaré ball boundary (‖p‖ = R = 1/√c)."""
+        direction = F.normalize(self.prototype_direction, dim=-1)
+        return direction * self.R
+    
+    def busemann_scores(self, x):
+        """
+        Compute horospherical logits: ξ_k(x) = -B_{p_k}(x) + a_k
+        
+        Higher score = closer to prototype = more likely that class.
+        
+        Parameters
+        ----------
+        x : tensor (N, D) or (B, N, D)
+            Points in Poincaré ball
+        
+        Returns
+        -------
+        tensor (N, K) or (B, N, K)
+            Horospherical scores for each class
+        """
+        p = self.prototypes  # (K, D) on boundary
+        
+        # Handle batched input
+        if x.dim() == 3:
+            B_vals = pmath.busemann_batch(p, x, c=self.c)  # (B, N, K)
+        else:
+            B_vals = pmath.busemann(p, x, c=self.c)  # (N, K)
+        
+        # Score = -Busemann + bias (higher = closer to prototype)
+        scores = -B_vals + self.prototype_bias
+        return scores
+    
+    def forward(self, x):
+        """Returns horospherical logits for classification."""
+        return self.busemann_scores(x)
+    
+    def get_ood_scores(self, x):
+        """
+        OOD score: negative of max horosphere score.
+        Higher value = more OOD (far from all prototypes).
+        """
+        scores = self.busemann_scores(x)
+        max_scores = scores.max(dim=-1).values
+        return -max_scores
+
+
+class HorosphericalLoss(nn.Module):
+    """
+    Cross-entropy loss over horospherical scores.
+    
+    L = -log P(ŷ=y | x) where P(ŷ=k | x) = softmax_k(ξ_k(x))
+    
+    Parameters
+    ----------
+    curvature : float
+        Poincaré ball curvature (default: 1.0)
+    label_smoothing : float
+        Label smoothing factor (default: 0.0)
+    """
+    
+    def __init__(self, curvature=1.0, label_smoothing=0.0):
+        super().__init__()
+        self.c = curvature
+        self.label_smoothing = label_smoothing
+    
+    def forward(self, scores, labels):
+        """
+        Compute cross-entropy loss over horospherical scores.
+        
+        Parameters
+        ----------
+        scores : tensor (B*N, K) or (N, K)
+            Horospherical scores from classifier
+        labels : tensor (B*N,) or (N,)
+            Class labels, -1 for background/ignore
+        
+        Returns
+        -------
+        tensor
+            Scalar loss
+        """
+        # Flatten if batched
+        if scores.dim() == 3:
+            B, N, K = scores.shape
+            scores = scores.reshape(B * N, K)
+            labels = labels.reshape(B * N)
+        
+        # Filter valid (ignore background label=-1)
+        valid = labels >= 0
+        if valid.sum() == 0:
+            return scores.new_tensor(0.0)
+        
+        valid_scores = scores[valid]
+        valid_labels = labels[valid]
+        
+        return F.cross_entropy(valid_scores, valid_labels, label_smoothing=self.label_smoothing)
+    
+    def forward_with_breakdown(self, scores, labels, classifier):
+        """Same as forward but returns diagnostic info."""
+        loss = self.forward(scores, labels)
+        
+        biases = classifier.prototype_bias
+        proto_norms = classifier.prototypes.norm(dim=-1)
+        
+        loss_dict = {
+            'horo_ce_loss': loss.item(),
+            'bias_mean': biases.mean().item(),
+            'bias_std': biases.std().item() if len(biases) > 1 else 0.0,
+            'proto_norm_mean': proto_norms.mean().item(),
+        }
+        return loss, loss_dict
+
+
 class HyperbolicProjector(nn.Module):
     """
-    Projects multi-scale FPN features to hyperbolic (Poincare ball) space.
+    Projects multi-scale FPN features to Poincaré ball with horospherical classification.
     
     Architecture:
-    - 3 separate projectors for 3 FPN scales (P3, P4, P5)
-    - Each projector: Conv → BN → ReLU → Conv → flatten
-    - Concatenate all scales → ToPoincare
-    - Learnable class prototypes in Poincare ball
+    - 3 Conv projectors for FPN scales (P3, P4, P5)
+    - ToPoincare layer for Euclidean → Poincaré mapping
+    - HorosphericalClassifier with ideal prototypes on boundary
     
     Parameters
     ----------
     in_dims : list of int
-        Input dimensions for each scale [P3_dim, P4_dim, P5_dim]
-        Default: [384, 768, 768] for YOLO-World XL
+        Input dims for each FPN scale [P3, P4, P5]. Default: [384, 768, 768]
     out_dim : int
         Output embedding dimension (default: 256)
     curvature : float
-        Poincare ball curvature (default: 0.1)
+        Poincaré ball curvature (default: 1.0)
     num_classes : int
         Number of class prototypes
     clip_r : float
-        Clip radius for ToPoincare (default: 2.3)
-    riemannian : bool
-        Use Riemannian gradient (default: True)
+        Clip radius for ToPoincare. Must be < 1/√c (default: 0.95 for c=1)
     """
     
     def __init__(
         self,
         in_dims=[384, 768, 768],
         out_dim=256,
-        curvature=0.1,
+        curvature=1.0,
         num_classes=20,
-        clip_r=2.3,
+        clip_r=0.95,
         riemannian=True
     ):
-        super(HyperbolicProjector, self).__init__()
+        super().__init__()
         
         self.in_dims = in_dims
         self.out_dim = out_dim
@@ -55,22 +201,19 @@ class HyperbolicProjector(nn.Module):
         self.num_classes = num_classes
         self.clip_r = clip_r
         
-        # Per-scale projectors
-        # Architecture: Conv(in→in) → SyncBN → ReLU → Conv(in→out_dim)
+        # Per-scale Conv projectors
         self.proj_p3 = nn.Sequential(
             nn.Conv2d(in_dims[0], in_dims[0], kernel_size=1, bias=False),
             nn.SyncBatchNorm(in_dims[0]),
             nn.ReLU(inplace=True),
             nn.Conv2d(in_dims[0], out_dim, kernel_size=1, bias=False)
         )
-        
         self.proj_p4 = nn.Sequential(
             nn.Conv2d(in_dims[1], in_dims[1], kernel_size=1, bias=False),
             nn.SyncBatchNorm(in_dims[1]),
             nn.ReLU(inplace=True),
             nn.Conv2d(in_dims[1], out_dim, kernel_size=1, bias=False)
         )
-        
         self.proj_p5 = nn.Sequential(
             nn.Conv2d(in_dims[2], in_dims[2], kernel_size=1, bias=False),
             nn.SyncBatchNorm(in_dims[2]),
@@ -78,7 +221,7 @@ class HyperbolicProjector(nn.Module):
             nn.Conv2d(in_dims[2], out_dim, kernel_size=1, bias=False)
         )
         
-        # ToPoincare layer (projects Euclidean → Poincare ball)
+        # ToPoincare layer
         self.to_poincare = ToPoincare(
             c=curvature,
             train_c=False,
@@ -88,17 +231,17 @@ class HyperbolicProjector(nn.Module):
             clip_r=clip_r
         )
         
-        # Learnable prototypes in TANGENT space (Euclidean)
-        # Will be projected to Poincare ball via expmap0
-        self.prototype_tangent = nn.Parameter(
-            torch.randn(num_classes, out_dim) * 0.01
+        # Horospherical classifier (replaces old prototype_tangent)
+        self.classifier = HorosphericalClassifier(
+            num_classes=num_classes,
+            embed_dim=out_dim,
+            curvature=curvature
         )
         
-        # Initialize projectors
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize convolutional weights."""
+        """Initialize Conv weights."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -110,384 +253,110 @@ class HyperbolicProjector(nn.Module):
     
     @property
     def prototypes(self):
-        """
-        Get prototypes in Poincare ball.
-        Projects from tangent space to ball using expmap0.
-        """
-        protos = pmath.expmap0(self.prototype_tangent, c=self.c)
-        protos = pmath.project(protos, c=self.c)  # Safety projection
-        return protos
+        """Ideal prototypes on boundary (for compatibility)."""
+        return self.classifier.prototypes
+    
+    @property
+    def prototype_direction(self):
+        """Access to prototype directions (for checkpoint saving)."""
+        return self.classifier.prototype_direction
+    
+    @property
+    def prototype_bias(self):
+        """Access to prototype biases (for checkpoint saving)."""
+        return self.classifier.prototype_bias
     
     def forward(self, img_feats):
         """
-        Project FPN features to Poincare ball.
+        Project FPN features to Poincaré ball.
         
         Parameters
         ----------
         img_feats : tuple of tensor
-            FPN features (P3, P4, P5) with shapes:
-            - P3: (B, C0, H0, W0) e.g., (B, 384, 80, 80)
-            - P4: (B, C1, H1, W1) e.g., (B, 768, 40, 40)
-            - P5: (B, C2, H2, W2) e.g., (B, 768, 20, 20)
+            FPN features (P3, P4, P5)
         
         Returns
         -------
-        tensor
-            Hyperbolic embeddings of shape (B, N_anchors, out_dim)
-            where N_anchors = H0*W0 + H1*W1 + H2*W2 (e.g., 8400)
+        tensor (B, N_anchors, out_dim)
+            Hyperbolic embeddings in Poincaré ball
         """
         p3, p4, p5 = img_feats[0], img_feats[1], img_feats[2]
         B = p3.shape[0]
         
         # Project each scale
-        z3 = self.proj_p3(p3)  # (B, out_dim, H0, W0)
-        z4 = self.proj_p4(p4)  # (B, out_dim, H1, W1)
-        z5 = self.proj_p5(p5)  # (B, out_dim, H2, W2)
+        z3 = self.proj_p3(p3).permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
+        z4 = self.proj_p4(p4).permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
+        z5 = self.proj_p5(p5).permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
         
-        # Flatten spatial dimensions: (B, out_dim, H, W) → (B, H*W, out_dim)
-        z3 = z3.permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
-        z4 = z4.permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
-        z5 = z5.permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
-        
-        # Concatenate all anchors: (B, N_total, out_dim)
+        # Concatenate and project to Poincaré ball
         z = torch.cat([z3, z4, z5], dim=1)
-        
-        # Project to Poincare ball
-        z_hyp = self.to_poincare(z)
-        
-        return z_hyp
+        return self.to_poincare(z)
     
-    def compute_distances(self, embeddings, prototype_indices=None):
-        """
-        Compute distances from embeddings to prototypes.
-        
-        Parameters
-        ----------
-        embeddings : tensor
-            Hyperbolic embeddings of shape (N, out_dim) or (B, N, out_dim)
-        prototype_indices : tensor, optional
-            If provided, only compute distance to these prototypes
-        
-        Returns
-        -------
-        tensor
-            Distance matrix of shape (N, K) or (B, N, K)
-        """
-        protos = self.prototypes  # (K, out_dim)
-        
-        if prototype_indices is not None:
-            protos = protos[prototype_indices]
-        
-        # Handle batched input
-        if embeddings.dim() == 3:
-            B, N, D = embeddings.shape
-            embeddings_flat = embeddings.reshape(B * N, D)
-            distances = pmath.dist_matrix(embeddings_flat, protos, c=self.c)
-            distances = distances.reshape(B, N, -1)
-        else:
-            distances = pmath.dist_matrix(embeddings, protos, c=self.c)
-        
-        return distances
+    def compute_scores(self, embeddings):
+        """Compute horospherical classification scores."""
+        return self.classifier(embeddings)
     
     def get_ood_scores(self, embeddings):
-        """
-        Compute OOD scores (minimum distance to any prototype).
-        
-        Parameters
-        ----------
-        embeddings : tensor
-            Hyperbolic embeddings
-        
-        Returns
-        -------
-        tensor
-            OOD scores (higher = more likely OOD)
-        """
-        distances = self.compute_distances(embeddings)  # (..., K)
-        min_distances = distances.min(dim=-1).values
-        return min_distances
+        """OOD scores via negative max horosphere score."""
+        return self.classifier.get_ood_scores(embeddings)
     
     def extra_repr(self):
         return (f"in_dims={self.in_dims}, out_dim={self.out_dim}, "
-                f"c={self.c}, num_classes={self.num_classes}, clip_r={self.clip_r}")
+                f"c={self.c}, num_classes={self.num_classes}")
 
 
-class HyperbolicContrastiveLoss(nn.Module):
-    """
-    Supervised contrastive loss in hyperbolic space with optional prototype separation.
-    
-    Components:
-    1. Contrastive loss: Push embeddings toward their prototype (STANDARD - always on)
-    2. Separation loss: Push prototypes apart (EXPERIMENTAL - off by default)
-    3. Boundary loss: Push prototypes toward boundary (EXPERIMENTAL - off by default)
-    
-    NOTE: The separation and boundary losses are heuristic additions, not from literature.
-    Use with caution. Set weights to 0 to disable (default).
-    
-    Parameters
-    ----------
-    temperature : float
-        Temperature for softmax (default: 0.1)
-    curvature : float
-        Poincare ball curvature (default: 0.1)
-    separation_weight : float
-        Weight for inter-prototype separation loss (default: 0.0 = disabled)
-    boundary_weight : float
-        Weight for boundary push loss (default: 0.0 = disabled)
-    min_proto_dist : float
-        Minimum desired distance between prototypes (default: 2.0)
-    target_norm : float
-        Target norm for prototypes (push toward boundary) (default: 0.9)
-    """
-    
-    def __init__(self, temperature=0.1, curvature=0.1, 
-                 separation_weight=0.0, boundary_weight=0.0,
-                 min_proto_dist=2.0, target_norm=0.9):
-        super(HyperbolicContrastiveLoss, self).__init__()
-        self.temperature = temperature
-        self.c = curvature
-        self.separation_weight = separation_weight
-        self.boundary_weight = boundary_weight
-        self.min_proto_dist = min_proto_dist
-        self.target_norm = target_norm
-    
-    def prototype_separation_loss(self, prototypes):
-        """
-        Loss to push prototypes apart from each other.
-        
-        Uses hinge loss: penalize if inter-prototype distance < min_proto_dist
-        """
-        K = prototypes.shape[0]
-        if K < 2:
-            return prototypes.new_tensor(0.0)
-        
-        # Compute pairwise distances between all prototypes
-        proto_dists = pmath.dist_matrix(prototypes, prototypes, c=self.c)  # (K, K)
-        
-        # Get upper triangular (unique pairs), exclude diagonal
-        mask = torch.triu(torch.ones(K, K, device=prototypes.device), diagonal=1).bool()
-        pairwise_dists = proto_dists[mask]  # (K*(K-1)/2,)
-        
-        # Hinge loss: penalize if distance < min_proto_dist
-        # loss = max(0, min_dist - actual_dist)
-        separation_loss = F.relu(self.min_proto_dist - pairwise_dists).mean()
-        
-        return separation_loss
-    
-    def boundary_push_loss(self, prototypes):
-        """
-        Loss to push prototypes toward the boundary of the Poincaré ball.
-        
-        Penalizes prototypes with low norm (near origin).
-        The target_norm is interpreted as a FRACTION of the ball radius.
-        For c=0.1, ball radius = 1/sqrt(c) ≈ 3.16
-        So target_norm=0.9 means push to 90% of boundary = 2.85
-        """
-        # Compute norms
-        norms = prototypes.norm(dim=-1)  # (K,)
-        
-        # Max norm in Poincaré ball with curvature c is 1/sqrt(c)
-        ball_radius = 1.0 / (self.c ** 0.5)  # e.g., 3.16 for c=0.1
-        
-        # target_norm is a fraction (0-1), convert to absolute target
-        absolute_target = self.target_norm * ball_radius * 0.95  # 0.95 for numerical safety
-        
-        # Penalize if norm < absolute_target
-        boundary_loss = F.relu(absolute_target - norms).mean()
-        
-        return boundary_loss
-    
-    def forward(self, embeddings, labels, prototypes):
-        """
-        Compute hyperbolic contrastive loss with prototype separation.
-        
-        Parameters
-        ----------
-        embeddings : tensor
-            Hyperbolic embeddings of shape (B, N, D) or (N, D)
-        labels : tensor
-            Class labels of shape (B, N) or (N), -1 for ignore
-        prototypes : tensor
-            Class prototypes of shape (K, D)
-        
-        Returns
-        -------
-        tensor
-            Scalar loss value (contrastive + separation + boundary)
-        """
-        # Flatten if batched
-        if embeddings.dim() == 3:
-            B, N, D = embeddings.shape
-            embeddings = embeddings.reshape(B * N, D)
-            labels = labels.reshape(B * N)
-        
-        # Filter valid samples (ignore background with label=-1)
-        valid_mask = labels >= 0
-        
-        # === Component 1: Contrastive Loss ===
-        if valid_mask.sum() == 0:
-            contrastive_loss = embeddings.new_tensor(0.0)
-        else:
-            valid_embeddings = embeddings[valid_mask]  # (N_valid, D)
-            valid_labels = labels[valid_mask]          # (N_valid,)
-            
-            # Safety check: ensure labels are in valid range
-            num_protos = prototypes.shape[0]
-            if valid_labels.max() >= num_protos:
-                raise ValueError(f"Label {valid_labels.max()} >= num_prototypes {num_protos}. "
-                               f"Check num_classes in HyperbolicProjector init.")
-            
-            # Compute distances to all prototypes
-            distances = pmath.dist_matrix(valid_embeddings, prototypes, c=self.c)  # (N_valid, K)
-            
-            # Convert to logits: negative distance / temperature
-            logits = -distances / self.temperature
-            
-            # Cross-entropy loss
-            contrastive_loss = F.cross_entropy(logits, valid_labels)
-        
-        # === Component 2: Prototype Separation Loss ===
-        separation_loss = self.prototype_separation_loss(prototypes)
-        
-        # === Component 3: Boundary Push Loss ===
-        boundary_loss = self.boundary_push_loss(prototypes)
-        
-        # Total loss
-        total_loss = (contrastive_loss + 
-                      self.separation_weight * separation_loss +
-                      self.boundary_weight * boundary_loss)
-        
-        return total_loss
-    
-    def forward_with_breakdown(self, embeddings, labels, prototypes):
-        """
-        Same as forward() but returns loss breakdown for logging.
-        
-        Returns
-        -------
-        total_loss : tensor
-        loss_dict : dict with individual loss components
-        """
-        if embeddings.dim() == 3:
-            B, N, D = embeddings.shape
-            embeddings = embeddings.reshape(B * N, D)
-            labels = labels.reshape(B * N)
-        
-        valid_mask = labels >= 0
-        
-        if valid_mask.sum() == 0:
-            contrastive_loss = embeddings.new_tensor(0.0)
-        else:
-            valid_embeddings = embeddings[valid_mask]
-            valid_labels = labels[valid_mask]
-            num_protos = prototypes.shape[0]
-            if valid_labels.max() >= num_protos:
-                raise ValueError(f"Label {valid_labels.max()} >= num_prototypes {num_protos}")
-            distances = pmath.dist_matrix(valid_embeddings, prototypes, c=self.c)
-            logits = -distances / self.temperature
-            contrastive_loss = F.cross_entropy(logits, valid_labels)
-        
-        separation_loss = self.prototype_separation_loss(prototypes)
-        boundary_loss = self.boundary_push_loss(prototypes)
-        
-        total_loss = (contrastive_loss + 
-                      self.separation_weight * separation_loss +
-                      self.boundary_weight * boundary_loss)
-        
-        # Also compute prototype stats for logging
-        proto_norms = prototypes.norm(dim=-1)
-        proto_dists = pmath.dist_matrix(prototypes, prototypes, c=self.c)
-        K = prototypes.shape[0]
-        mask = torch.triu(torch.ones(K, K, device=prototypes.device), diagonal=1).bool()
-        
-        loss_dict = {
-            'contrastive': contrastive_loss.item(),
-            'separation': separation_loss.item(),
-            'boundary': boundary_loss.item(),
-            'proto_norm_mean': proto_norms.mean().item(),
-            'proto_norm_min': proto_norms.min().item(),
-            'proto_dist_mean': proto_dists[mask].mean().item() if K > 1 else 0.0,
-            'proto_dist_min': proto_dists[mask].min().item() if K > 1 else 0.0,
-        }
-        
-        return total_loss, loss_dict
+# =============================================================================
+# TEST FUNCTIONS
+# =============================================================================
 
-
-def test_hyperbolic_projector():
+def test_horospherical():
     """Quick test to verify shapes and gradients."""
-    print("Testing HyperbolicProjector...")
+    print("Testing HorosphericalClassifier + HyperbolicProjector...")
     
-    # Create projector
+    # Create projector with c=1.0
     projector = HyperbolicProjector(
         in_dims=[384, 768, 768],
         out_dim=256,
-        curvature=0.1,
+        curvature=1.0,
         num_classes=10,
-        clip_r=2.3
+        clip_r=0.95
     )
     
-    # Create dummy FPN features
+    # Dummy FPN features
     B = 2
     p3 = torch.randn(B, 384, 80, 80)
     p4 = torch.randn(B, 768, 40, 40)
     p5 = torch.randn(B, 768, 20, 20)
-    img_feats = (p3, p4, p5)
-    
-    # Forward pass
-    z_hyp = projector(img_feats)
-    
-    print(f"  Input shapes: P3={p3.shape}, P4={p4.shape}, P5={p5.shape}")
-    print(f"  Output shape: {z_hyp.shape}")
-    print(f"  Expected: (B, 8400, 256) = ({B}, {80*80 + 40*40 + 20*20}, 256)")
-    
-    # Check norms (should be < 1/sqrt(c) ≈ 3.16 for c=0.1)
-    norms = z_hyp.norm(dim=-1)
-    max_norm = 1.0 / (0.1 ** 0.5)
-    print(f"  Embedding norms: min={norms.min():.4f}, max={norms.max():.4f}, bound={max_norm:.4f}")
-    
-    # Check prototypes
-    protos = projector.prototypes
-    print(f"  Prototype shape: {protos.shape}")
-    proto_norms = protos.norm(dim=-1)
-    print(f"  Prototype norms: min={proto_norms.min():.4f}, max={proto_norms.max():.4f}")
-    
-    # Test distance computation
-    distances = projector.compute_distances(z_hyp)
-    print(f"  Distance matrix shape: {distances.shape}")
-    
-    # Test gradient flow
-    loss = z_hyp.sum()
-    loss.backward()
-    print(f"  Gradient flow: OK (prototype_tangent.grad norm: {projector.prototype_tangent.grad.norm():.4f})")
-    
-    print("HyperbolicProjector test PASSED!\n")
-    return projector
-
-
-def test_contrastive_loss():
-    """Test hyperbolic contrastive loss."""
-    print("Testing HyperbolicContrastiveLoss...")
-    
-    loss_fn = HyperbolicContrastiveLoss(temperature=0.1, curvature=0.1)
-    
-    # Create dummy data
-    B, N, D, K = 2, 100, 256, 10
-    embeddings = torch.randn(B, N, D) * 0.1  # Small to be in ball
-    embeddings = pmath.expmap0(embeddings, c=0.1)  # Project to ball
-    labels = torch.randint(-1, K, (B, N))  # -1 to K-1
-    prototypes = pmath.expmap0(torch.randn(K, D) * 0.01, c=0.1)
     
     # Forward
-    loss = loss_fn(embeddings, labels, prototypes)
-    print(f"  Loss value: {loss.item():.4f}")
+    z_hyp = projector((p3, p4, p5))
+    print(f"  Output shape: {z_hyp.shape} (expected: {(B, 8400, 256)})")
     
-    # Backward
+    # Check embeddings are inside ball (‖x‖ < 1 for c=1)
+    norms = z_hyp.norm(dim=-1)
+    print(f"  Embedding norms: min={norms.min():.4f}, max={norms.max():.4f}, bound=1.0")
+    
+    # Check prototypes are on boundary (‖p‖ = 1 for c=1)
+    proto_norms = projector.prototypes.norm(dim=-1)
+    print(f"  Prototype norms: {proto_norms.mean():.4f} (should be ~1.0)")
+    
+    # Compute scores
+    scores = projector.compute_scores(z_hyp)
+    print(f"  Scores shape: {scores.shape} (expected: {(B, 8400, 10)})")
+    
+    # Test loss
+    labels = torch.randint(-1, 10, (B, 8400))
+    loss_fn = HorosphericalLoss(curvature=1.0)
+    loss = loss_fn(scores, labels)
+    print(f"  Loss: {loss.item():.4f}")
+    
+    # Test gradient flow
     loss.backward()
-    print(f"  Gradient flow: OK")
+    print(f"  Gradient OK: direction={projector.prototype_direction.grad.norm():.4f}, "
+          f"bias={projector.prototype_bias.grad.norm():.4f}")
     
-    print("HyperbolicContrastiveLoss test PASSED!\n")
+    print("✓ All tests passed!\n")
 
 
 if __name__ == "__main__":
-    test_hyperbolic_projector()
-    test_contrastive_loss()
+    test_horospherical()

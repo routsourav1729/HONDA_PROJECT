@@ -406,3 +406,74 @@ def auto_select_c(d):
     R = R ** (1 / float(d))
     c = 1 / (R ** 2)
     return c
+
+
+# =============================================================================
+# BUSEMANN FUNCTION FOR HOROSPHERICAL CLASSIFICATION
+# =============================================================================
+
+def busemann(p, x, c=1.0):
+    """
+    Busemann function B_p^c(x) for ideal prototype p on boundary.
+    
+    For curvature c, ball radius R = 1/√c.
+    Ideal prototypes p live on the boundary sphere: ‖p‖ = R = 1/√c.
+    
+    B_p^c(x) = (1/√c) · log(c · ‖p - x‖² / (1 - c·‖x‖²))
+    
+    Properties:
+        - B → -∞ as x → p (close to prototype)
+        - B → +∞ as x → -p (far from prototype)
+    
+    Parameters
+    ----------
+    p : tensor (K, D)
+        Ideal prototypes on boundary, ‖p‖ = 1/√c
+    x : tensor (N, D)
+        Points inside Poincaré ball, ‖x‖ < 1/√c
+    c : float
+        Ball curvature (default: 1.0)
+    
+    Returns
+    -------
+    tensor (N, K)
+        Busemann values for each point to each prototype
+    """
+    c = torch.as_tensor(c).type_as(x)
+    
+    # ‖p - x‖² pairwise: x (N,1,D) - p (1,K,D) → (N,K,D) → sum → (N,K)
+    diff_sq = (x.unsqueeze(1) - p.unsqueeze(0)).pow(2).sum(-1)  # (N, K)
+    
+    # 1 - c·‖x‖²: (N, 1)
+    x_sq = x.pow(2).sum(-1, keepdim=True)  # (N, 1)
+    denom = (1.0 - c * x_sq).clamp(min=1e-6)  # (N, 1)
+    
+    # B = (1/√c) · log(c · diff_sq / denom)
+    sqrt_c = c ** 0.5
+    B = (1.0 / sqrt_c) * torch.log((c * diff_sq / denom).clamp(min=1e-6))
+    
+    return B  # (N, K)
+
+
+def busemann_batch(p, x, c=1.0):
+    """
+    Batched Busemann function for (B, N, D) input.
+    
+    Parameters
+    ----------
+    p : tensor (K, D)
+        Ideal prototypes on boundary
+    x : tensor (B, N, D)
+        Batched points inside ball
+    c : float
+        Curvature
+    
+    Returns
+    -------
+    tensor (B, N, K)
+        Busemann values
+    """
+    B_size, N, D = x.shape
+    x_flat = x.reshape(B_size * N, D)
+    B_vals = busemann(p, x_flat, c)  # (B*N, K)
+    return B_vals.reshape(B_size, N, -1)  # (B, N, K)

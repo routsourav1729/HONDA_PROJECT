@@ -1,12 +1,8 @@
 """
-Hyperbolic Custom YOLO World for Open-World Object Detection.
-Replaces MSCAL with hyperbolic prototype-based OOD detection.
+Hyperbolic Custom YOLO World with Horospherical Classification.
 
-Key differences from original CustomYoloWorld:
-- Uses HyperbolicProjector instead of per-class ProjectionHead
-- Learnable prototypes in Poincaré ball instead of anchor layers  
-- Distance-based OOD detection instead of cosine similarity
-- Hyperbolic contrastive loss instead of MSCAL loss
+Uses Busemann function with ideal prototypes on boundary for OOD detection.
+Prototypes live on the Poincaré ball boundary (‖p‖ = 1 for c=1).
 """
 
 import torch
@@ -19,732 +15,438 @@ import copy
 from typing import List, Optional, Tuple, Union, Sequence
 from mmengine.config import ConfigDict
 from mmengine.structures import InstanceData
-from mmdet.models.utils import (multi_apply, unpack_gt_instances,
-                                filter_scores_and_topk)
+from mmdet.models.utils import unpack_gt_instances, filter_scores_and_topk
 from mmyolo.models.utils import gt_instances_preprocess
 from mmengine.dist import get_dist_info
 
-# Hyperbolic imports
-from .hyperbolic import HyperbolicProjector, dist_matrix, expmap0, project, poincare_mean
-from .hyperbolic.projector import HyperbolicContrastiveLoss
+from .hyperbolic import HyperbolicProjector, busemann
+from .hyperbolic.projector import HorosphericalLoss
 
 
 def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=False):
     """
-    Load checkpoint for hyperbolic model.
+    Load checkpoint for horospherical model.
     
     Handles:
-    - Text embeddings (frozen_embeddings, embeddings) - same as OVOW
-    - Hyperbolic prototypes (frozen_prototypes, prototype_tangent)
-    - HyperbolicProjector weights
-    
-    Parameters
-    ----------
-    model : HypCustomYoloWorld
-        Model to load weights into
-    checkpoint_path : str
-        Path to checkpoint
-    prev_classes : int
-        Number of previously introduced classes (to freeze)
-    current_classes : int
-        Number of current classes being trained
-    eval : bool
-        If True, load for evaluation (load all prototypes)
+    - Text embeddings (frozen_embeddings, embeddings)
+    - Prototype directions + biases (frozen_directions, frozen_biases, trainable)
     """
     checkpoint = torch.load(checkpoint_path, map_location='cuda')
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
     
-    # Handle both checkpoint formats
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    else:
-        state_dict = checkpoint
-    
-    # Load everything except embeddings and prototypes (handle separately)
-    exclude_keys = ['embeddings', 'frozen_embeddings', 'prototype_tangent', 'frozen_prototypes']
+    # Keys to handle separately
+    exclude_keys = ['embeddings', 'frozen_embeddings', 
+                    'frozen_directions', 'frozen_biases',
+                    'prototype_direction', 'prototype_bias']
     partial_state_dict = {k: v for k, v in state_dict.items() 
                           if not any(ex in k for ex in exclude_keys)}
     model.load_state_dict(partial_state_dict, strict=False)
     
     if eval:
-        # Evaluation mode: load all prototypes and embeddings as-is
-        if state_dict.get('frozen_embeddings') is not None:
-            model.frozen_embeddings = nn.Parameter(state_dict['frozen_embeddings'])
-        else:
-            model.frozen_embeddings = None
-            
-        if state_dict.get('embeddings') is not None:
-            model.embeddings = nn.Parameter(state_dict['embeddings'])
-        else:
-            model.embeddings = None
-            
-        # Load prototypes
-        if state_dict.get('frozen_prototypes') is not None:
-            model.frozen_prototypes = nn.Parameter(state_dict['frozen_prototypes'])
-        else:
-            model.frozen_prototypes = None
-            
-        if state_dict.get('hyp_projector.prototype_tangent') is not None:
-            model.hyp_projector.prototype_tangent = nn.Parameter(
-                state_dict['hyp_projector.prototype_tangent']
-            )
+        # Evaluation: load all embeddings and prototypes
+        model.frozen_embeddings = nn.Parameter(state_dict['frozen_embeddings']) if state_dict.get('frozen_embeddings') is not None else None
+        model.embeddings = nn.Parameter(state_dict['embeddings']) if state_dict.get('embeddings') is not None else None
+        
+        # Load frozen prototypes
+        model.frozen_directions = nn.Parameter(state_dict['frozen_directions']) if state_dict.get('frozen_directions') is not None else None
+        model.frozen_biases = nn.Parameter(state_dict['frozen_biases']) if state_dict.get('frozen_biases') is not None else None
+        
+        # Load trainable prototypes
+        if state_dict.get('hyp_projector.classifier.prototype_direction') is not None:
+            model.hyp_projector.classifier.prototype_direction = nn.Parameter(
+                state_dict['hyp_projector.classifier.prototype_direction'])
+            model.hyp_projector.classifier.prototype_bias = nn.Parameter(
+                state_dict['hyp_projector.classifier.prototype_bias'])
         return model
     
     # Training mode
     if prev_classes == 0:
-        # T1: No previous classes, train from scratch
-        return model
+        return model  # T1: train from scratch
     
-    # T2+: Merge previous prototypes into frozen, init new trainable ones
-    # Handle text embeddings (same as OVOW)
+    # T2+: Handle text embeddings
     part_a = state_dict.get('frozen_embeddings')
     part_b = state_dict.get('embeddings')
     if part_a is not None and part_b is not None:
         freeze_emb = torch.cat([part_a, part_b], dim=1)
-    elif part_a is None:
-        freeze_emb = part_b
     else:
-        freeze_emb = part_a
+        freeze_emb = part_a if part_a is not None else part_b
     
     if freeze_emb is not None:
-        length = freeze_emb.shape[1]
         model.frozen_embeddings = nn.Parameter(freeze_emb)
-        model.embeddings = nn.Parameter(model.text_feats[:, length:, :])
+        model.embeddings = nn.Parameter(model.text_feats[:, freeze_emb.shape[1]:, :])
     
-    # Handle prototypes
-    proto_a = state_dict.get('frozen_prototypes')
-    proto_b = state_dict.get('hyp_projector.prototype_tangent')
+    # T2+: Handle prototypes (directions + biases)
+    dir_a = state_dict.get('frozen_directions')
+    dir_b = state_dict.get('hyp_projector.classifier.prototype_direction')
+    bias_a = state_dict.get('frozen_biases')
+    bias_b = state_dict.get('hyp_projector.classifier.prototype_bias')
     
-    if proto_a is not None and proto_b is not None:
-        freeze_proto = torch.cat([proto_a, proto_b], dim=0)
-    elif proto_a is None:
-        freeze_proto = proto_b
+    if dir_a is not None and dir_b is not None:
+        freeze_dirs = torch.cat([dir_a, dir_b], dim=0)
+        freeze_biases = torch.cat([bias_a, bias_b], dim=0)
     else:
-        freeze_proto = proto_a
+        freeze_dirs = dir_a if dir_a is not None else dir_b
+        freeze_biases = bias_a if bias_a is not None else bias_b
     
-    if freeze_proto is not None:
-        model.frozen_prototypes = nn.Parameter(freeze_proto)
-        # Initialize new prototypes for current classes
-        model.hyp_projector.prototype_tangent = nn.Parameter(
-            torch.randn(current_classes, model.hyp_projector.out_dim) * 0.01
-        )
+    if freeze_dirs is not None:
+        model.frozen_directions = nn.Parameter(freeze_dirs)
+        model.frozen_biases = nn.Parameter(freeze_biases)
+        # Initialize new trainable prototypes
+        model.hyp_projector.classifier.prototype_direction = nn.Parameter(
+            torch.randn(current_classes, model.hyp_projector.out_dim))
+        model.hyp_projector.classifier.prototype_bias = nn.Parameter(
+            torch.zeros(current_classes))
     
     return model
 
 
 class HypCustomYoloWorld(nn.Module):
     """
-    Hyperbolic YOLO World for Open-World Object Detection.
+    Hyperbolic YOLO World with Horospherical Classification.
     
     Architecture:
-    - Wraps YOLO-World backbone/neck/head (frozen)
-    - Adds HyperbolicProjector for visual features → Poincaré ball
-    - Learnable prototypes in Poincaré ball for each class
-    - Distance-based OOD detection at inference
-    
-    Parameters
-    ----------
-    yolo_world_model : nn.Module
-        Pre-trained YOLO-World model
-    unknown_index : int
-        Index for unknown class (= num_known_classes)
-    hyp_c : float
-        Poincaré ball curvature (default: 0.1)
-    hyp_dim : int
-        Hyperbolic embedding dimension (default: 256)
-    clip_r : float
-        Clip radius for ToPoincare (default: 2.3)
-    temperature : float
-        Temperature for contrastive loss (default: 0.1)
-    separation_weight : float
-        Weight for inter-prototype separation loss (default: 0.5)
-    boundary_weight : float
-        Weight for boundary push loss (default: 0.1)
-    min_proto_dist : float
-        Minimum desired distance between prototypes (default: 2.0)
-    target_norm : float
-        Target norm for prototypes (default: 0.9)
+    - Wraps frozen YOLO-World backbone/neck/head
+    - HyperbolicProjector: FPN → Poincaré ball
+    - HorosphericalClassifier: Busemann scores for classification
+    - OOD detection: max horosphere score < threshold → unknown
     """
     
     def __init__(
         self,
         yolo_world_model,
         unknown_index,
-        hyp_c=0.1,
+        hyp_c=1.0,
         hyp_dim=256,
-        clip_r=2.3,
-        temperature=0.1,
-        separation_weight=0.5,
-        boundary_weight=0.1,
-        min_proto_dist=2.0,
-        target_norm=0.9
+        clip_r=0.95,
     ):
-        super(HypCustomYoloWorld, self).__init__()
+        super().__init__()
         
-        # Store parent model components
         self.parent = yolo_world_model
         self.bbox_head = yolo_world_model.bbox_head
         self.unknown_index = unknown_index
-        
-        # Hyperbolic parameters
         self.hyp_c = hyp_c
         self.hyp_dim = hyp_dim
-        self.clip_r = clip_r
-        self.temperature = temperature
         
-        # For TAL assignment labels
+        # TAL assignment labels
         self.tmp_labels = None
         
-        # Text embeddings (like OVOW)
+        # Text embeddings
         self.frozen_embeddings = None
         self.embeddings = None
         
         # Frozen prototypes from previous tasks (T2+)
-        self.frozen_prototypes = None
+        self.frozen_directions = None
+        self.frozen_biases = None
         
-        # Initialize components
-        self._initialize_text_embedding()
-        self._initialize_hyperbolic_projector()
+        self._init_text_embedding()
+        self._init_hyperbolic_projector(clip_r)
         
-        # Loss function with prototype separation
-        self.hyp_loss_fn = HyperbolicContrastiveLoss(
-            temperature=temperature,
-            curvature=hyp_c,
-            separation_weight=separation_weight,
-            boundary_weight=boundary_weight,
-            min_proto_dist=min_proto_dist,
-            target_norm=target_norm
-        )
+        # Loss function
+        self.hyp_loss_fn = HorosphericalLoss(curvature=hyp_c)
     
-    def _initialize_text_embedding(self):
-        """Initialize text embeddings from parent model."""
+    def _init_text_embedding(self):
         with torch.no_grad():
             self.texts = copy.deepcopy(self.parent.texts)
             self.text_feats = self.parent.text_feats.clone()
             self.embeddings = nn.Parameter(self.text_feats)
     
-    def _initialize_hyperbolic_projector(self):
-        """Initialize hyperbolic projector with prototypes."""
+    def _init_hyperbolic_projector(self, clip_r):
         self.hyp_projector = HyperbolicProjector(
-            in_dims=[384, 768, 768],  # YOLO-World XL FPN dims
+            in_dims=[384, 768, 768],
             out_dim=self.hyp_dim,
             curvature=self.hyp_c,
             num_classes=self.unknown_index,
-            clip_r=self.clip_r,
+            clip_r=clip_r,
             riemannian=True
         )
     
-    def update_unknown_index(self, unknown_index):
-        """Update the unknown class index."""
-        self.unknown_index = unknown_index
-    
     @property
     def prototypes(self):
-        """
-        Get all prototypes (frozen + trainable) in Poincaré ball.
-        
-        Returns
-        -------
-        tensor
-            Prototypes of shape (K, hyp_dim) in Poincaré ball
-        """
-        # Get trainable prototypes from projector
-        trainable_protos = self.hyp_projector.prototypes  # Already in ball
-        
-        if self.frozen_prototypes is not None:
-            # Project frozen prototypes to ball (stored in tangent space)
-            frozen_protos = expmap0(self.frozen_prototypes, c=self.hyp_c)
-            frozen_protos = project(frozen_protos, c=self.hyp_c)
-            return torch.cat([frozen_protos, trainable_protos], dim=0)
-        
-        return trainable_protos
+        """All prototypes (frozen + trainable) on boundary."""
+        trainable = self.hyp_projector.prototypes
+        if self.frozen_directions is not None:
+            R = 1.0 / (self.hyp_c ** 0.5)
+            frozen = F.normalize(self.frozen_directions, dim=-1) * R
+            return torch.cat([frozen, trainable], dim=0)
+        return trainable
+    
+    @property
+    def prototype_biases(self):
+        """All biases (frozen + trainable)."""
+        trainable = self.hyp_projector.prototype_bias
+        if self.frozen_biases is not None:
+            return torch.cat([self.frozen_biases, trainable], dim=0)
+        return trainable
     
     def add_generic_text(self, class_names, generic_prompt='object', alpha=0.05):
-        """
-        Add generic 'object' embedding for OOD detection.
-        Same as OVOW but using distance-based approach.
-        """
+        """Add generic 'object' embedding for unknown class."""
         if len(class_names) <= self.unknown_index:
             class_names.append(generic_prompt)
-        classnames = [class_names]
-        self.parent.reparameterize(classnames)
+        self.parent.reparameterize([class_names])
         
         with torch.no_grad():
             self.texts = copy.deepcopy(self.parent.texts)
             self.text_feats = self.parent.text_feats.clone()
             
-            part_a = self.frozen_embeddings
-            part_b = self.embeddings
-            if part_a is not None and part_b is not None:
-                freeze = torch.cat([part_a, part_b], dim=1)
-            elif part_a is None:
-                freeze = part_b
+            # Merge embeddings
+            if self.frozen_embeddings is not None and self.embeddings is not None:
+                freeze = torch.cat([self.frozen_embeddings, self.embeddings], dim=1)
             else:
-                freeze = part_a
+                freeze = self.frozen_embeddings if self.frozen_embeddings is not None else self.embeddings
             
-            generic_embedding = self.text_feats[:, self.unknown_index, :]
-            
+            generic = self.text_feats[:, self.unknown_index, :]
             if alpha != 0:
-                normalized_embedding = F.normalize(freeze, p=2, dim=2)
-                normalized_embedding = normalized_embedding.mean(dim=1)
-                generic_embedding = generic_embedding - alpha * normalized_embedding
+                mean_emb = F.normalize(freeze, p=2, dim=2).mean(dim=1)
+                generic = generic - alpha * mean_emb
             
-            freeze = torch.cat([freeze, generic_embedding.unsqueeze(0)], dim=1)
-            self.frozen_embeddings = nn.Parameter(freeze)
+            self.frozen_embeddings = nn.Parameter(torch.cat([freeze, generic.unsqueeze(1)], dim=1))
             self.embeddings = None
     
     def extract_feat(self, batch_inputs: Tensor, batch_data_samples: SampleList):
-        """
-        Extract features and compute hyperbolic embeddings.
-        
-        Returns
-        -------
-        img_feats : tuple
-            FPN features from backbone/neck
-        txt_feats : tensor
-            Text embeddings
-        hyp_embeddings : tensor
-            Hyperbolic embeddings of shape (B, N_anchors, hyp_dim)
-        """
-        # Get text features
+        """Extract FPN features and project to Poincaré ball."""
+        # Text features
         if self.frozen_embeddings is not None and self.embeddings is not None:
             txt_feats = torch.cat([self.frozen_embeddings, self.embeddings], dim=1)
-        elif self.embeddings is not None:
-            txt_feats = self.embeddings
         else:
-            txt_feats = self.frozen_embeddings
+            txt_feats = self.embeddings if self.embeddings is not None else self.frozen_embeddings
         
-        # Extract image features
+        # Image features
         img_feats = self.parent.backbone.forward_image(batch_inputs)
         txt_feats = txt_feats.repeat(img_feats[0].shape[0], 1, 1)
         
-        # Apply neck
         if self.parent.with_neck:
-            if self.parent.mm_neck:
-                img_feats = self.parent.neck(img_feats, txt_feats)
-            else:
-                img_feats = self.parent.neck(img_feats)
+            img_feats = self.parent.neck(img_feats, txt_feats) if self.parent.mm_neck else self.parent.neck(img_feats)
         
-        # Compute hyperbolic embeddings
-        hyp_embeddings = self.hyp_projector(img_feats)  # (B, N_anchors, hyp_dim)
-        
+        # Project to Poincaré ball
+        hyp_embeddings = self.hyp_projector(img_feats)
         return img_feats, txt_feats, hyp_embeddings
     
-    def hyperbolic_contrastive_loss(self, hyp_embeddings: Tensor) -> Tensor:
-        """
-        Compute hyperbolic contrastive loss.
+    def compute_horosphere_scores(self, hyp_embeddings):
+        """Compute horospherical scores using all prototypes."""
+        # Get all prototypes and biases
+        protos = self.prototypes
+        biases = self.prototype_biases
         
-        Uses TAL assignments (self.tmp_labels) to supervise which prototype
-        each anchor should be close to.
-        
-        Parameters
-        ----------
-        hyp_embeddings : tensor
-            Hyperbolic embeddings of shape (B, N_anchors, hyp_dim)
-        
-        Returns
-        -------
-        tensor
-            Scalar loss value
-        """
+        # Compute Busemann function
+        if hyp_embeddings.dim() == 3:
+            B, N, D = hyp_embeddings.shape
+            x_flat = hyp_embeddings.reshape(B * N, D)
+            B_vals = busemann(protos, x_flat, c=self.hyp_c)
+            scores = (-B_vals + biases).reshape(B, N, -1)
+        else:
+            B_vals = busemann(protos, hyp_embeddings, c=self.hyp_c)
+            scores = -B_vals + biases
+        return scores
+    
+    def horospherical_loss(self, hyp_embeddings):
+        """Compute horospherical CE loss."""
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0)
-        
-        return self.hyp_loss_fn(hyp_embeddings, self.tmp_labels, self.prototypes)
+        scores = self.compute_horosphere_scores(hyp_embeddings)
+        return self.hyp_loss_fn(scores, self.tmp_labels)
     
-    def hyperbolic_loss_with_breakdown(self, hyp_embeddings: Tensor):
-        """
-        Compute hyperbolic loss with detailed breakdown for logging.
-        
-        Returns
-        -------
-        total_loss : tensor
-        loss_dict : dict with individual components
-        """
+    def horospherical_loss_with_breakdown(self, hyp_embeddings):
+        """Loss with diagnostics."""
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0), {}
-        
-        return self.hyp_loss_fn.forward_with_breakdown(
-            hyp_embeddings, self.tmp_labels, self.prototypes
-        )
+        scores = self.compute_horosphere_scores(hyp_embeddings)
+        return self.hyp_loss_fn.forward_with_breakdown(scores, self.tmp_labels, self.hyp_projector.classifier)
     
     def head_loss(self, batch_inputs: Tensor, batch_data_samples: SampleList):
-        """
-        Calculate losses from a batch of inputs.
-        
-        Returns
-        -------
-        head_losses : dict
-            YOLO detection losses (cls, bbox, dfl)
-        hyp_loss : tensor
-            Hyperbolic contrastive loss
-        """
+        """Compute YOLO + horospherical losses."""
         self.bbox_head.num_classes = self.text_feats[0].shape[0]
         self.bbox_head.assigner.num_classes = self.text_feats[0].shape[0]
         
         img_feats, txt_feats, hyp_embeddings = self.extract_feat(batch_inputs, batch_data_samples)
-        
         self.tmp_labels = None
         head_losses = self.bbox_head_loss(img_feats, txt_feats, batch_data_samples)
-        hyp_loss = self.hyperbolic_contrastive_loss(hyp_embeddings)
-        
+        hyp_loss = self.horospherical_loss(hyp_embeddings)
         return head_losses, hyp_loss
     
     def head_loss_with_breakdown(self, batch_inputs: Tensor, batch_data_samples: SampleList):
-        """
-        Calculate losses with hyperbolic breakdown for detailed logging.
-        
-        Returns
-        -------
-        head_losses : dict
-        hyp_loss : tensor
-        hyp_breakdown : dict with individual loss components
-        """
+        """Losses with detailed breakdown."""
         self.bbox_head.num_classes = self.text_feats[0].shape[0]
         self.bbox_head.assigner.num_classes = self.text_feats[0].shape[0]
         
         img_feats, txt_feats, hyp_embeddings = self.extract_feat(batch_inputs, batch_data_samples)
-        
         self.tmp_labels = None
         head_losses = self.bbox_head_loss(img_feats, txt_feats, batch_data_samples)
-        hyp_loss, hyp_breakdown = self.hyperbolic_loss_with_breakdown(hyp_embeddings)
-        
+        hyp_loss, hyp_breakdown = self.horospherical_loss_with_breakdown(hyp_embeddings)
         return head_losses, hyp_loss, hyp_breakdown
     
-    def bbox_head_loss(self, img_feats: Tuple[Tensor], txt_feats: Tensor,
-                       batch_data_samples: Union[list, dict]) -> dict:
-        """Perform forward propagation and loss calculation."""
-        batch_gt_instances, batch_gt_instances_ignore, batch_img_metas = unpack_gt_instances(
-            batch_data_samples
-        )
+    def bbox_head_loss(self, img_feats, txt_feats, batch_data_samples):
+        """YOLO detection loss (extracts TAL assignments for hyp loss)."""
+        batch_gt_instances, _, batch_img_metas = unpack_gt_instances(batch_data_samples)
         outs = self.bbox_head(img_feats, txt_feats)
-        losses = self.dev_loss_by_feat(outs[0], outs[1], outs[2], 
-                                       batch_gt_instances, batch_img_metas)
-        return losses
+        return self.compute_loss(outs[0], outs[1], outs[2], batch_gt_instances, batch_img_metas)
     
-    def dev_loss_by_feat(
-            self,
-            cls_scores: Sequence[Tensor],
-            bbox_preds: Sequence[Tensor],
-            bbox_dist_preds: Sequence[Tensor],
-            batch_gt_instances: Sequence[InstanceData],
-            batch_img_metas: Sequence[dict]) -> dict:
-        """Compute YOLO losses and extract TAL assignments for hyperbolic loss."""
+    def compute_loss(self, cls_scores, bbox_preds, bbox_dist_preds, batch_gt_instances, batch_img_metas):
+        """YOLO loss computation with TAL assignment extraction."""
         num_imgs = len(batch_img_metas)
-
-        current_featmap_sizes = [cls_score.shape[2:] for cls_score in cls_scores]
-        if current_featmap_sizes != self.bbox_head.featmap_sizes_train:
-            self.bbox_head.featmap_sizes_train = current_featmap_sizes
-            mlvl_priors_with_stride = self.bbox_head.prior_generator.grid_priors(
-                self.bbox_head.featmap_sizes_train,
-                dtype=cls_scores[0].dtype,
-                device=cls_scores[0].device,
-                with_stride=True
-            )
-            self.bbox_head.num_level_priors = [len(n) for n in mlvl_priors_with_stride]
-            self.bbox_head.flatten_priors_train = torch.cat(mlvl_priors_with_stride, dim=0)
+        
+        # Update feature map sizes
+        current_sizes = [s.shape[2:] for s in cls_scores]
+        if current_sizes != self.bbox_head.featmap_sizes_train:
+            self.bbox_head.featmap_sizes_train = current_sizes
+            priors = self.bbox_head.prior_generator.grid_priors(
+                current_sizes, dtype=cls_scores[0].dtype, device=cls_scores[0].device, with_stride=True)
+            self.bbox_head.num_level_priors = [len(p) for p in priors]
+            self.bbox_head.flatten_priors_train = torch.cat(priors, dim=0)
             self.bbox_head.stride_tensor = self.bbox_head.flatten_priors_train[..., [2]]
-
+        
+        # Prepare GT
         gt_info = gt_instances_preprocess(batch_gt_instances, num_imgs)
-        gt_labels = gt_info[:, :, :1]
-        gt_bboxes = gt_info[:, :, 1:]
-        pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
-
-        flatten_cls_preds = [
-            cls_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, self.bbox_head.num_classes)
-            for cls_pred in cls_scores
-        ]
-        flatten_pred_bboxes = [
-            bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
-            for bbox_pred in bbox_preds
-        ]
-        flatten_pred_dists = [
-            bbox_pred_org.reshape(num_imgs, -1, self.bbox_head.head_module.reg_max * 4)
-            for bbox_pred_org in bbox_dist_preds
-        ]
-
-        flatten_dist_preds = torch.cat(flatten_pred_dists, dim=1)
-        flatten_cls_preds = torch.cat(flatten_cls_preds, dim=1)
-        flatten_pred_bboxes = torch.cat(flatten_pred_bboxes, dim=1)
-        flatten_pred_bboxes = self.bbox_head.bbox_coder.decode(
-            self.bbox_head.flatten_priors_train[..., :2], flatten_pred_bboxes,
-            self.bbox_head.stride_tensor[..., 0]
-        )
-
-        assigned_result = self.bbox_head.assigner(
-            (flatten_pred_bboxes.detach()).type(gt_bboxes.dtype),
-            flatten_cls_preds.detach().sigmoid(), self.bbox_head.flatten_priors_train,
-            gt_labels, gt_bboxes, pad_bbox_flag
-        )
-
-        assigned_bboxes = assigned_result['assigned_bboxes']
-        assigned_scores = assigned_result['assigned_scores']
-        fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
-
-        # Extract TAL assignments for hyperbolic loss
-        max_values, max_indices = assigned_scores.max(dim=2)
-        max_indices[max_values <= 0] = -1  # Background
-        self.tmp_labels = max_indices
-
-        assigned_scores_sum = assigned_scores.sum().clamp(min=1)
-
-        loss_cls = self.bbox_head.loss_cls(flatten_cls_preds, assigned_scores).sum()
-        loss_cls /= assigned_scores_sum
-
-        assigned_bboxes /= self.bbox_head.stride_tensor
-        flatten_pred_bboxes /= self.bbox_head.stride_tensor
-
-        num_pos = fg_mask_pre_prior.sum()
+        gt_labels, gt_bboxes = gt_info[:, :, :1], gt_info[:, :, 1:]
+        pad_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
+        
+        # Flatten predictions
+        flat_cls = torch.cat([s.permute(0,2,3,1).reshape(num_imgs, -1, self.bbox_head.num_classes) for s in cls_scores], 1)
+        flat_bbox = torch.cat([b.permute(0,2,3,1).reshape(num_imgs, -1, 4) for b in bbox_preds], 1)
+        flat_dist = torch.cat([d.reshape(num_imgs, -1, self.bbox_head.head_module.reg_max * 4) for d in bbox_dist_preds], 1)
+        
+        flat_bbox = self.bbox_head.bbox_coder.decode(
+            self.bbox_head.flatten_priors_train[..., :2], flat_bbox, self.bbox_head.stride_tensor[..., 0])
+        
+        # TAL assignment
+        assigned = self.bbox_head.assigner(
+            flat_bbox.detach().type(gt_bboxes.dtype), flat_cls.detach().sigmoid(),
+            self.bbox_head.flatten_priors_train, gt_labels, gt_bboxes, pad_flag)
+        
+        # Extract labels for hyperbolic loss
+        max_vals, max_idx = assigned['assigned_scores'].max(dim=2)
+        max_idx[max_vals <= 0] = -1
+        self.tmp_labels = max_idx
+        
+        # Compute losses
+        scores_sum = assigned['assigned_scores'].sum().clamp(min=1)
+        loss_cls = self.bbox_head.loss_cls(flat_cls, assigned['assigned_scores']).sum() / scores_sum
+        
+        flat_bbox /= self.bbox_head.stride_tensor
+        assigned['assigned_bboxes'] /= self.bbox_head.stride_tensor
+        
+        fg_mask = assigned['fg_mask_pre_prior']
+        num_pos = fg_mask.sum()
+        
         if num_pos > 0:
-            prior_bbox_mask = fg_mask_pre_prior.unsqueeze(-1).repeat([1, 1, 4])
-            pred_bboxes_pos = torch.masked_select(
-                flatten_pred_bboxes, prior_bbox_mask).reshape([-1, 4])
-            assigned_bboxes_pos = torch.masked_select(
-                assigned_bboxes, prior_bbox_mask).reshape([-1, 4])
-            bbox_weight = torch.masked_select(
-                assigned_scores.sum(-1), fg_mask_pre_prior).unsqueeze(-1)
-            loss_bbox = self.bbox_head.loss_bbox(
-                pred_bboxes_pos, assigned_bboxes_pos,
-                weight=bbox_weight) / assigned_scores_sum
-
-            pred_dist_pos = flatten_dist_preds[fg_mask_pre_prior]
-            assigned_ltrb = self.bbox_head.bbox_coder.encode(
+            mask4 = fg_mask.unsqueeze(-1).repeat(1, 1, 4)
+            pred_pos = flat_bbox[mask4].reshape(-1, 4)
+            target_pos = assigned['assigned_bboxes'][mask4].reshape(-1, 4)
+            weight = assigned['assigned_scores'].sum(-1)[fg_mask].unsqueeze(-1)
+            
+            loss_bbox = self.bbox_head.loss_bbox(pred_pos, target_pos, weight=weight) / scores_sum
+            
+            dist_pos = flat_dist[fg_mask]
+            ltrb = self.bbox_head.bbox_coder.encode(
                 self.bbox_head.flatten_priors_train[..., :2] / self.bbox_head.stride_tensor,
-                assigned_bboxes,
-                max_dis=self.bbox_head.head_module.reg_max - 1,
-                eps=0.01
-            )
-            assigned_ltrb_pos = torch.masked_select(
-                assigned_ltrb, prior_bbox_mask).reshape([-1, 4])
+                assigned['assigned_bboxes'], max_dis=self.bbox_head.head_module.reg_max - 1, eps=0.01)
+            ltrb_pos = ltrb[mask4].reshape(-1, 4)
             loss_dfl = self.bbox_head.loss_dfl(
-                pred_dist_pos.reshape(-1, self.bbox_head.head_module.reg_max),
-                assigned_ltrb_pos.reshape(-1),
-                weight=bbox_weight.expand(-1, 4).reshape(-1),
-                avg_factor=assigned_scores_sum
-            )
+                dist_pos.reshape(-1, self.bbox_head.head_module.reg_max),
+                ltrb_pos.reshape(-1), weight=weight.expand(-1, 4).reshape(-1), avg_factor=scores_sum)
         else:
-            loss_bbox = flatten_pred_bboxes.sum() * 0
-            loss_dfl = flatten_pred_bboxes.sum() * 0
+            loss_bbox = flat_bbox.sum() * 0
+            loss_dfl = flat_bbox.sum() * 0
         
-        if self.bbox_head.world_size == -1:
-            _, world_size = get_dist_info()
-        else:
-            world_size = self.bbox_head.world_size
-        
-        return dict(
-            loss_cls=loss_cls * num_imgs * world_size,
-            loss_bbox=loss_bbox * num_imgs * world_size,
-            loss_dfl=loss_dfl * num_imgs * world_size
-        )
+        world_size = get_dist_info()[1] if self.bbox_head.world_size == -1 else self.bbox_head.world_size
+        scale = num_imgs * world_size
+        return dict(loss_cls=loss_cls * scale, loss_bbox=loss_bbox * scale, loss_dfl=loss_dfl * scale)
     
-    def predict(self, batch_inputs: Tensor, batch_data_samples: SampleList,
-                rescale: bool = True) -> SampleList:
-        """
-        Predict results with hyperbolic OOD detection.
-        
-        Returns predictions with hyp_distances field for OOD scoring.
-        """
+    def predict(self, batch_inputs: Tensor, batch_data_samples: SampleList, rescale=True):
+        """Inference with horospherical OOD detection."""
         img_feats, txt_feats, hyp_embeddings = self.extract_feat(batch_inputs, batch_data_samples)
-        
         self.parent.bbox_head.num_classes = txt_feats[0].shape[0]
-        results_list = self.bbox_head_pred(
-            img_feats, txt_feats, batch_data_samples, 
-            hyp_embeddings, rescale=rescale
-        )
         
-        batch_data_samples = self.parent.add_pred_to_datasample(
-            batch_data_samples, results_list
-        )
-        return batch_data_samples
+        results = self.predict_by_feat(img_feats, txt_feats, batch_data_samples, hyp_embeddings, rescale)
+        return self.parent.add_pred_to_datasample(batch_data_samples, results)
     
-    def bbox_head_pred(self, img_feats: Tuple[Tensor], txt_feats: Tensor,
-                       batch_data_samples: SampleList, hyp_embeddings: Tensor,
-                       rescale: bool = False) -> InstanceList:
-        """Perform prediction with hyperbolic distance computation."""
-        batch_img_metas = [data_samples.metainfo for data_samples in batch_data_samples]
+    def predict_by_feat(self, img_feats, txt_feats, batch_data_samples, hyp_embeddings, rescale=False):
+        """Prediction with horosphere scoring."""
+        batch_img_metas = [d.metainfo for d in batch_data_samples]
         outs = self.bbox_head(img_feats, txt_feats)
-        predictions = self.bbox_head_predict_by_feat(
-            *outs, 
-            hyp_embeddings=hyp_embeddings,
-            batch_img_metas=batch_img_metas,
-            rescale=rescale
-        )
-        return predictions
-    
-    def bbox_head_predict_by_feat(
-            self,
-            cls_scores: List[Tensor],
-            bbox_preds: List[Tensor],
-            objectnesses: Optional[List[Tensor]] = None,
-            batch_img_metas: Optional[List[dict]] = None,
-            cfg: Optional[ConfigDict] = None,
-            hyp_embeddings: Optional[Tensor] = None,
-            rescale: bool = True,
-            with_nms: bool = True) -> List[InstanceData]:
-        """Predict with hyperbolic distance computation for OOD detection."""
-        assert len(cls_scores) == len(bbox_preds)
         
-        with_objectnesses = objectnesses is not None
-        if with_objectnesses:
-            assert len(cls_scores) == len(objectnesses)
-
-        cfg = self.bbox_head.test_cfg if cfg is None else cfg
-        cfg = copy.deepcopy(cfg)
-
-        multi_label = cfg.multi_label
-        multi_label &= self.bbox_head.num_classes > 1
-        cfg.multi_label = multi_label
-
+        cfg = copy.deepcopy(self.bbox_head.test_cfg)
+        cfg.multi_label = cfg.multi_label and self.bbox_head.num_classes > 1
         num_imgs = len(batch_img_metas)
-        featmap_sizes = [cls_score.shape[2:] for cls_score in cls_scores]
-
-        if featmap_sizes != self.bbox_head.featmap_sizes:
-            self.bbox_head.mlvl_priors = self.bbox_head.prior_generator.grid_priors(
-                featmap_sizes,
-                dtype=cls_scores[0].dtype,
-                device=cls_scores[0].device
-            )
-            self.bbox_head.featmap_sizes = featmap_sizes
-        flatten_priors = torch.cat(self.bbox_head.mlvl_priors)
-
-        mlvl_strides = [
-            flatten_priors.new_full(
-                (featmap_size.numel() * self.bbox_head.num_base_priors,), stride)
-            for featmap_size, stride in zip(featmap_sizes, self.bbox_head.featmap_strides)
-        ]
-        flatten_stride = torch.cat(mlvl_strides)
-
-        flatten_cls_scores = [
-            cls_score.permute(0, 2, 3, 1).reshape(num_imgs, -1, self.bbox_head.num_classes)
-            for cls_score in cls_scores
-        ]
-        flatten_bbox_preds = [
-            bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
-            for bbox_pred in bbox_preds
-        ]
-
-        flatten_cls_scores = torch.cat(flatten_cls_scores, dim=1).sigmoid()
-        flatten_bbox_preds = torch.cat(flatten_bbox_preds, dim=1)
-        flatten_decoded_bboxes = self.bbox_head.bbox_coder.decode(
-            flatten_priors[None], flatten_bbox_preds, flatten_stride
-        )
-
-        if with_objectnesses:
-            flatten_objectness = [
-                objectness.permute(0, 2, 3, 1).reshape(num_imgs, -1)
-                for objectness in objectnesses
-            ]
-            flatten_objectness = torch.cat(flatten_objectness, dim=1).sigmoid()
-        else:
-            flatten_objectness = [None for _ in range(num_imgs)]
-
-        results_list = []
-        for batch_idx, (bboxes, scores, objectness, img_meta) in enumerate(
-                zip(flatten_decoded_bboxes, flatten_cls_scores, 
-                    flatten_objectness, batch_img_metas)):
-            
-            ori_shape = img_meta['ori_shape']
-            scale_factor = img_meta['scale_factor']
-            pad_param = img_meta.get('pad_param', None)
-
-            score_thr = cfg.get('score_thr', -1)
-            if objectness is not None and score_thr > 0 and not cfg.get('yolox_style', False):
-                conf_inds = objectness > score_thr
-                bboxes = bboxes[conf_inds, :]
-                scores = scores[conf_inds, :]
-                objectness = objectness[conf_inds]
-                # Also filter hyperbolic embeddings
-                if hyp_embeddings is not None:
-                    batch_hyp_emb = hyp_embeddings[batch_idx][conf_inds]
-                else:
-                    batch_hyp_emb = None
-            else:
-                batch_hyp_emb = hyp_embeddings[batch_idx] if hyp_embeddings is not None else None
-
-            if objectness is not None:
-                scores *= objectness[:, None]
-
-            if scores.shape[0] == 0:
-                empty_results = InstanceData()
-                empty_results.bboxes = bboxes
-                empty_results.scores = scores[:, 0]
-                empty_results.labels = scores[:, 0].int()
-                empty_results.hyp_distances = scores[:, 0]
-                results_list.append(empty_results)
-                continue
-
-            nms_pre = cfg.get('nms_pre', 100000)
-
-            if cfg.multi_label is False:
-                scores, labels = scores.max(1, keepdim=True)
-                scores, _, keep_idxs, results = filter_scores_and_topk(
-                    scores, score_thr, nms_pre,
-                    results=dict(labels=labels[:, 0])
-                )
-                labels = results['labels']
-            else:
-                scores, labels, keep_idxs, _ = filter_scores_and_topk(
-                    scores, score_thr, nms_pre
-                )
-            
-            # Get hyperbolic distances for kept predictions
-            if batch_hyp_emb is not None:
-                kept_hyp_emb = batch_hyp_emb[keep_idxs]  # (N_kept, hyp_dim)
-                # Compute distance to all prototypes
-                distances = dist_matrix(kept_hyp_emb, self.prototypes, c=self.hyp_c)
-                min_distances = distances.min(dim=-1).values  # (N_kept,)
-            else:
-                min_distances = scores.new_zeros(scores.shape[0])
-
-            results = InstanceData(
-                scores=scores,
-                labels=labels,
-                bboxes=bboxes[keep_idxs],
-                hyp_distances=min_distances
-            )
-
-            if rescale:
-                if pad_param is not None:
-                    results.bboxes -= results.bboxes.new_tensor([
-                        pad_param[2], pad_param[0], pad_param[2], pad_param[0]
-                    ])
-                results.bboxes /= results.bboxes.new_tensor(scale_factor).repeat((1, 2))
-
-            if cfg.get('yolox_style', False):
-                cfg.max_per_img = len(results)
-
-            results = self.bbox_head._bbox_post_process(
-                results=results, cfg=cfg, rescale=False, 
-                with_nms=with_nms, img_meta=img_meta
-            )
-            results.bboxes[:, 0::2].clamp_(0, ori_shape[1])
-            results.bboxes[:, 1::2].clamp_(0, ori_shape[0])
-
-            results_list.append(results)
         
-        return results_list
+        # Setup priors
+        sizes = [s.shape[2:] for s in outs[0]]
+        if sizes != self.bbox_head.featmap_sizes:
+            self.bbox_head.mlvl_priors = self.bbox_head.prior_generator.grid_priors(
+                sizes, dtype=outs[0][0].dtype, device=outs[0][0].device)
+            self.bbox_head.featmap_sizes = sizes
+        
+        priors = torch.cat(self.bbox_head.mlvl_priors)
+        strides = torch.cat([priors.new_full((s.numel() * self.bbox_head.num_base_priors,), st)
+                            for s, st in zip(sizes, self.bbox_head.featmap_strides)])
+        
+        # Flatten predictions
+        flat_cls = torch.cat([s.permute(0,2,3,1).reshape(num_imgs, -1, self.bbox_head.num_classes) for s in outs[0]], 1).sigmoid()
+        flat_bbox = torch.cat([b.permute(0,2,3,1).reshape(num_imgs, -1, 4) for b in outs[1]], 1)
+        flat_bbox = self.bbox_head.bbox_coder.decode(priors[None], flat_bbox, strides)
+        
+        flat_obj = None
+        if outs[2] is not None:
+            flat_obj = torch.cat([o.permute(0,2,3,1).reshape(num_imgs, -1) for o in outs[2]], 1).sigmoid()
+        
+        results = []
+        for idx, (bboxes, scores, img_meta) in enumerate(zip(flat_bbox, flat_cls, batch_img_metas)):
+            obj = flat_obj[idx] if flat_obj is not None else None
+            hyp_emb = hyp_embeddings[idx]
+            
+            # Score threshold filter
+            if obj is not None and cfg.get('score_thr', -1) > 0 and not cfg.get('yolox_style', False):
+                mask = obj > cfg.score_thr
+                bboxes, scores, obj, hyp_emb = bboxes[mask], scores[mask], obj[mask], hyp_emb[mask]
+            
+            if obj is not None:
+                scores = scores * obj[:, None]
+            
+            if scores.shape[0] == 0:
+                empty = InstanceData(bboxes=bboxes, scores=scores[:, 0], labels=scores[:, 0].int(), ood_scores=scores[:, 0])
+                results.append(empty)
+                continue
+            
+            # Top-k selection
+            if not cfg.multi_label:
+                scores, labels = scores.max(1, keepdim=True)
+                scores, _, keep, res = filter_scores_and_topk(scores, cfg.score_thr, cfg.get('nms_pre', 100000), dict(labels=labels[:, 0]))
+                labels = res['labels']
+            else:
+                scores, labels, keep, _ = filter_scores_and_topk(scores, cfg.score_thr, cfg.get('nms_pre', 100000))
+            
+            # Compute OOD scores (negative max horosphere score)
+            kept_emb = hyp_emb[keep]
+            horo_scores = self.compute_horosphere_scores(kept_emb)  # (N, K)
+            ood_scores = -horo_scores.max(dim=-1).values  # Higher = more OOD
+            
+            result = InstanceData(scores=scores, labels=labels, bboxes=bboxes[keep], ood_scores=ood_scores)
+            
+            # Rescale
+            if rescale:
+                pad = img_meta.get('pad_param')
+                if pad is not None:
+                    result.bboxes -= result.bboxes.new_tensor([pad[2], pad[0], pad[2], pad[0]])
+                result.bboxes /= result.bboxes.new_tensor(img_meta['scale_factor']).repeat(1, 2)
+            
+            if cfg.get('yolox_style', False):
+                cfg.max_per_img = len(result)
+            
+            result = self.bbox_head._bbox_post_process(result, cfg, rescale=False, with_nms=True, img_meta=img_meta)
+            result.bboxes[:, 0::2].clamp_(0, img_meta['ori_shape'][1])
+            result.bboxes[:, 1::2].clamp_(0, img_meta['ori_shape'][0])
+            results.append(result)
+        
+        return results
     
     def enable_projector_grad(self, index):
-        """
-        Enable gradients for trainable components.
-        
-        For T1 (index=0): Train ALL projector parameters (Conv + prototypes)
-        For T2+ (index>0): Freeze Conv layers, only train prototypes
-        
-        Parameters
-        ----------
-        index : int
-            Number of previously introduced classes (0 for T1)
-        """
+        """Enable gradients for training."""
         if index == 0:
-            # T1: Train everything in projector
-            for param in self.hyp_projector.parameters():
-                param.requires_grad = True
-            print(f"  [T1] Training ALL projector parameters")
+            # T1: Train all projector params
+            for p in self.hyp_projector.parameters():
+                p.requires_grad = True
+            print("  [T1] Training ALL projector parameters")
         else:
-            # T2+: Freeze Conv layers, only train prototypes
-            for name, param in self.hyp_projector.named_parameters():
-                if 'prototype_tangent' in name:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
-            print(f"  [T2+] Freezing projector Conv, training only prototypes")
+            # T2+: Freeze Conv, train only classifier
+            for name, p in self.hyp_projector.named_parameters():
+                p.requires_grad = 'classifier' in name
+            print("  [T2+] Training only classifier (directions + biases)")

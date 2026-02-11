@@ -1,15 +1,18 @@
 """
-Standalone calibration script for hyperbolic OOD thresholds.
+Calibration script for horospherical OOD thresholds.
 
-Run this AFTER training completes to compute per-class distance thresholds.
-Can be run on any saved checkpoint.
+Run this AFTER training to compute the OOD threshold based on max horosphere scores.
+For horospherical classifiers: max_score < threshold → unknown
+
+Key difference from distance-based:
+- OLD: min_distance > threshold → unknown (higher = more OOD)
+- NEW: max_score < threshold → unknown (lower = more OOD)
 
 Usage:
     python calibrate.py --task IDD/t1 --ckpt IDD/t1/hyperbolic/model_final.pth
 """
 
 import os
-import sys
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -18,7 +21,6 @@ from core import add_config
 from core.util.model_ema import add_model_ema_configs
 from core.pascal_voc import register_pascal_voc, inital_prompts
 from core.hyp_customyoloworld import HypCustomYoloWorld, load_hyp_ckpt
-from core.hyperbolic import dist_matrix
 
 from mmengine.config import Config
 from mmengine.runner import Runner
@@ -75,9 +77,14 @@ def get_anchor_centers(h, w, device):
 
 
 @torch.no_grad()
-def calibrate_thresholds(model, train_loader, num_classes, percentile=99):
+def calibrate_thresholds(model, train_loader, num_classes, percentile=1):
     """
-    Calibration pass: collect distance statistics for adaptive OOD thresholds.
+    Calibration pass: collect max horosphere score statistics for OOD threshold.
+    
+    For horospherical approach:
+    - Collect max_score = max_k(ξ_k(x)) for each GT embedding
+    - OOD threshold = percentile(max_scores) - margin
+    - Detection: max_score < threshold → unknown
     
     Parameters
     ----------
@@ -88,33 +95,35 @@ def calibrate_thresholds(model, train_loader, num_classes, percentile=99):
     num_classes : int
         Number of known classes
     percentile : int
-        Percentile for threshold (99 = use 99th percentile of distances)
+        Low percentile for threshold (1 = use 1st percentile as lower bound)
+        Since known class samples should have HIGH scores, we use low percentile
     
     Returns
     -------
     dict
-        Calibration results including per-class thresholds
+        Calibration results including global threshold
     """
     print(f"\n{'='*60}")
-    print(f"CALIBRATION: Computing OOD Thresholds")
+    print(f"HOROSPHERICAL CALIBRATION: Computing OOD Threshold")
     print(f"{'='*60}")
     
     model.eval()
     
-    # Per-class distance lists
-    class_distances = [[] for _ in range(num_classes)]
+    # Collect all max scores
+    all_max_scores = []
+    class_scores = [[] for _ in range(num_classes)]
     samples_per_class = [0] * num_classes
     
-    print(f"  Collecting distances from training set...")
+    print(f"  Collecting max horosphere scores from training set...")
     
     for batch_idx, batch in enumerate(tqdm(train_loader, desc="Calibration")):
         try:
             data_batch = model.parent.data_preprocessor(batch)
             
-            # Get FPN features (use forward_image!)
+            # Get FPN features
             x = model.parent.backbone.forward_image(data_batch['inputs'])
             
-            # Apply neck (handle mm_neck)
+            # Apply neck
             if model.parent.with_neck:
                 if model.parent.mm_neck:
                     txt_feats = model.frozen_embeddings if model.frozen_embeddings is not None else model.embeddings
@@ -129,8 +138,6 @@ def calibrate_thresholds(model, train_loader, num_classes, percentile=99):
             # Get anchor grid
             h, w = data_batch['inputs'].shape[-2:]
             anchor_centers = get_anchor_centers(h, w, device=hyp_embeddings.device)
-            
-            prototypes = model.prototypes  # (K, dim)
             
             # Process each image
             for b_idx, data_sample in enumerate(data_batch['data_samples']):
@@ -159,59 +166,76 @@ def calibrate_thresholds(model, train_loader, num_classes, percentile=99):
                     # Get embedding
                     emb = hyp_embeddings[b_idx, nearest_idx]
                     
-                    # Compute distance to assigned prototype
-                    dist_to_own_proto = dist_matrix(
-                        emb.unsqueeze(0), 
-                        prototypes[cls_id:cls_id+1], 
-                        c=model.hyp_c
-                    ).item()
+                    # Compute horosphere scores and get max
+                    scores = model.compute_horosphere_scores(emb.unsqueeze(0))  # (1, K)
+                    max_score = scores.max().item()
                     
-                    class_distances[cls_id].append(dist_to_own_proto)
+                    all_max_scores.append(max_score)
+                    class_scores[cls_id].append(max_score)
                     samples_per_class[cls_id] += 1
                     
         except Exception as e:
             if batch_idx == 0:
                 print(f"  Warning in batch {batch_idx}: {e}")
+                import traceback
+                traceback.print_exc()
             continue
     
-    # Compute thresholds
-    print(f"\n  Computing thresholds (percentile={percentile})...")
+    # Compute threshold
+    print(f"\n  Computing threshold (percentile={percentile})...")
     
-    thresholds = torch.zeros(num_classes)
+    all_max_scores = np.array(all_max_scores)
+    
+    # For known classes, max_score should be HIGH
+    # OOD threshold = low percentile of max_scores - margin
+    # Unknown samples should have max_score BELOW this threshold
+    low_percentile_score = np.percentile(all_max_scores, percentile)
+    margin = 0.5  # Safety margin
+    global_threshold = low_percentile_score - margin
+    
+    print(f"\n  Score distribution for known classes:")
+    print(f"    Total samples: {len(all_max_scores)}")
+    print(f"    Min score: {all_max_scores.min():.4f}")
+    print(f"    Max score: {all_max_scores.max():.4f}")
+    print(f"    Mean score: {all_max_scores.mean():.4f}")
+    print(f"    Std score: {all_max_scores.std():.4f}")
+    print(f"    {percentile}th percentile: {low_percentile_score:.4f}")
+    print(f"    Global OOD threshold: {global_threshold:.4f}")
+    
+    # Per-class statistics
     stats = {}
-    
+    print(f"\n  Per-class statistics:")
     for c in range(num_classes):
-        if len(class_distances[c]) > 0:
-            dists = np.array(class_distances[c])
-            thresholds[c] = np.percentile(dists, percentile)
+        if len(class_scores[c]) > 0:
+            scores = np.array(class_scores[c])
             stats[c] = {
-                'count': len(dists),
-                'min': float(dists.min()),
-                'max': float(dists.max()),
-                'mean': float(dists.mean()),
-                'std': float(dists.std()),
-                f'p{percentile}': float(thresholds[c])
+                'count': len(scores),
+                'min': float(scores.min()),
+                'max': float(scores.max()),
+                'mean': float(scores.mean()),
+                'std': float(scores.std()),
             }
-            print(f"    Class {c}: count={len(dists)}, "
-                  f"min={dists.min():.4f}, max={dists.max():.4f}, "
-                  f"mean={dists.mean():.4f}, threshold={thresholds[c]:.4f}")
+            print(f"    Class {c}: count={len(scores)}, "
+                  f"min={scores.min():.4f}, max={scores.max():.4f}, "
+                  f"mean={scores.mean():.4f}")
         else:
-            thresholds[c] = 5.0  # fallback
-            stats[c] = {'count': 0, 'threshold': 5.0}
-            print(f"    Class {c}: NO SAMPLES - using fallback threshold=5.0")
-    
-    # Global threshold (max of all class thresholds with margin)
-    global_threshold = thresholds.max().item() * 1.1
-    print(f"\n  Global OOD threshold (max + 10% margin): {global_threshold:.4f}")
+            stats[c] = {'count': 0}
+            print(f"    Class {c}: NO SAMPLES")
     
     calibration_results = {
-        'class_thresholds': thresholds,
         'global_threshold': global_threshold,
+        'low_percentile_score': low_percentile_score,
         'percentile': percentile,
+        'margin': margin,
+        'all_scores_mean': float(all_max_scores.mean()),
+        'all_scores_std': float(all_max_scores.std()),
         'stats': stats,
         'num_classes': num_classes
     }
     
+    print(f"\n{'='*60}")
+    print(f"  RECOMMENDATION: Use --ood_threshold {global_threshold:.4f}")
+    print(f"  Detection rule: max_score < {global_threshold:.4f} → unknown")
     print(f"{'='*60}")
     
     return calibration_results
@@ -221,11 +245,10 @@ if __name__ == "__main__":
     parser0 = default_argument_parser()
     parser0.add_argument("--task", default="IDD/t1")
     parser0.add_argument("--ckpt", required=True, help="Path to checkpoint to calibrate")
-    parser0.add_argument("--hyp_c", type=float, default=0.1)
+    parser0.add_argument("--hyp_c", type=float, default=1.0)  # Changed to c=1.0
     parser0.add_argument("--hyp_dim", type=int, default=256)
-    parser0.add_argument("--clip_r", type=float, default=2.3)
-    parser0.add_argument("--temperature", type=float, default=0.1)
-    parser0.add_argument("--percentile", type=int, default=99, help="Percentile for threshold")
+    parser0.add_argument("--clip_r", type=float, default=0.95)  # Changed for c=1.0
+    parser0.add_argument("--percentile", type=int, default=1, help="Low percentile for threshold")
     parser0.add_argument("--output_dir", default=None, help="Output directory (default: same as checkpoint)")
     
     args = parser0.parse_args()
@@ -254,6 +277,7 @@ if __name__ == "__main__":
     print(f"  Task: {args.task}")
     print(f"  Checkpoint: {args.ckpt}")
     print(f"  Classes: {class_names}")
+    print(f"  Curvature: {args.hyp_c}")
     print(f"  Percentile: {args.percentile}")
 
     # Initialize YOLO-World
@@ -263,7 +287,7 @@ if __name__ == "__main__":
     runner.model.reparameterize(classnames)
     runner.model.eval()
 
-    # Use train loader for calibration (has GT boxes)
+    # Use train loader for calibration
     train_loader = Runner.build_dataloader(cfgY.trlder)
 
     # Build hyperbolic model
@@ -272,8 +296,7 @@ if __name__ == "__main__":
         unknown_index,
         hyp_c=args.hyp_c,
         hyp_dim=args.hyp_dim,
-        clip_r=args.clip_r,
-        temperature=args.temperature
+        clip_r=args.clip_r
     )
     
     with torch.no_grad():
@@ -289,8 +312,9 @@ if __name__ == "__main__":
     model.eval()
     
     print(f"\n=== Model Info ===")
+    print(f"  num_classes: {model.num_classes}")
     print(f"  Prototypes shape: {model.prototypes.shape}")
-    print(f"  Prototype norms: {model.prototypes.norm(dim=-1)}")
+    print(f"  Prototype norms (should be ~1.0): {model.prototypes.norm(dim=-1)}")
     
     # Run calibration
     calibration_results = calibrate_thresholds(
@@ -307,10 +331,9 @@ if __name__ == "__main__":
     torch.save(calibration_results, calibration_path)
     print(f"\n✓ Saved calibration to: {calibration_path}")
     
-    # Update checkpoint with thresholds
+    # Update checkpoint with threshold
     checkpoint = torch.load(args.ckpt, map_location='cpu')
-    checkpoint['class_thresholds'] = calibration_results['class_thresholds']
-    checkpoint['global_threshold'] = calibration_results['global_threshold']
+    checkpoint['ood_threshold'] = calibration_results['global_threshold']
     
     # Save updated checkpoint
     ckpt_name = os.path.basename(args.ckpt).replace('.pth', '_calibrated.pth')
@@ -319,5 +342,5 @@ if __name__ == "__main__":
     print(f"✓ Saved calibrated checkpoint to: {calibrated_ckpt_path}")
     
     print(f"\n=== Calibration Complete ===")
-    print(f"  Global OOD threshold: {calibration_results['global_threshold']:.4f}")
-    print(f"  Use this threshold in test_hyp.py with --ood_threshold {calibration_results['global_threshold']:.4f}")
+    print(f"  OOD threshold: {calibration_results['global_threshold']:.4f}")
+    print(f"  Use: python test_hyp.py --ood_threshold {calibration_results['global_threshold']:.4f}")
