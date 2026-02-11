@@ -18,7 +18,6 @@ weight_decay = 0.0125
 train_batch_size_per_gpu = 8  # Smaller batch = more gradient updates per epoch
 affine_scale = 0.5
 max_aspect_ratio = 120
-text_model_name = '../pretrained_models/clip-vit-base-patch32-projection'
 text_model_name = 'openai/clip-vit-base-patch32'
 ood_threshold = 4.0  # Same as T1
 
@@ -40,7 +39,7 @@ hyp_config = dict(
     init_protos='init_protos_t2.pt',
     
     # Previous task checkpoint (T1 model)
-    prev_ckpt='IDD/t1/horospherical/model_best.pth',
+    prev_ckpt='IDD_HYP/t1/horospherical/model_best.pth',
     
     # OOD detection threshold (for inference)
     ood_threshold=0.0,       # Adjust after calibration

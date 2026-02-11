@@ -5,7 +5,7 @@ custom_imports = dict(imports=['yolo_world'],
 
 # hyper-parameters
 num_classes = 1203
-num_training_classes = 80
+num_training_classes = 9  # IDD base classes (not COCO's 80)
 max_epochs = 50  # Maximum training epochs (matched to nu-OWODB)
 close_mosaic_epochs = 2
 save_epoch_intervals = 2
@@ -17,7 +17,6 @@ weight_decay = 0.0125
 train_batch_size_per_gpu = 32
 affine_scale = 0.5
 max_aspect_ratio = 120
-text_model_name = '../pretrained_models/clip-vit-base-patch32-projection'
 text_model_name = 'openai/clip-vit-base-patch32'
 ood_threshold = 4.0  # Adjusted for IDD
 
@@ -115,7 +114,7 @@ train_pipeline = [
     dict(
         meta_keys=(
             'img_id',
-            'img_c',
+            'img_path',
             'ori_shape',
             'img_shape',
             'scale_factor',
