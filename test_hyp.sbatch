@@ -15,8 +15,8 @@
 # Hyperbolic YOLO-World Evaluation
 # ============================================================================
 
-TASK="IDD/t1"
-CKPT="IDD/t1/hyperbolic_sep/model_final.pth"
+TASK="IDD_HYP/t1"
+CKPT="IDD_HYP/t1/horospherical/model_5.pth"
 
 # Hyperbolic hyperparameters (must match training)
 # NOTE: For horospherical classifiers, c=1.0 (ball radius=1) is standard
@@ -67,7 +67,7 @@ echo "Starting EVALUATION"
 echo "=========================================="
 
 python test_hyp.py \
-    --config-file configs/IDD/base.yaml \
+    --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $CKPT \
     --hyp_c $HYP_C \

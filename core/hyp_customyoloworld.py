@@ -139,6 +139,9 @@ class HypCustomYoloWorld(nn.Module):
         self.hyp_c = hyp_c
         self.hyp_dim = hyp_dim
         
+        # num_classes for visualization script compatibility
+        self.num_classes = unknown_index
+        
         # TAL assignment labels
         self.tmp_labels = None
         
@@ -420,8 +423,9 @@ class HypCustomYoloWorld(nn.Module):
         flat_bbox = torch.cat([b.permute(0,2,3,1).reshape(num_imgs, -1, 4) for b in outs[1]], 1)
         flat_bbox = self.bbox_head.bbox_coder.decode(priors[None], flat_bbox, strides)
         
+        # Note: during inference, head returns only (cls, bbox), no objectness
         flat_obj = None
-        if outs[2] is not None:
+        if len(outs) > 2 and outs[2] is not None:
             flat_obj = torch.cat([o.permute(0,2,3,1).reshape(num_imgs, -1) for o in outs[2]], 1).sigmoid()
         
         results = []

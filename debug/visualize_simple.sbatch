@@ -15,8 +15,8 @@
 # Simple Poincaré Visualization
 # ============================================================================
 
-TASK="IDD/t1"
-CKPT="IDD/t1/hyperbolic/model_0.pth"
+TASK="IDD_HYP/t1"
+CKPT="IDD_HYP/t1/horospherical/model_5.pth"
 
 echo "=========================================="
 echo "POINCARÉ VISUALIZATION"
@@ -51,12 +51,12 @@ cd /home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2
 mkdir -p visualizations
 
 python debug/visualize_simple.py \
-    --config-file configs/IDD/base.yaml \
+    --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $CKPT \
-    --hyp_c 0.1 \
+    --hyp_c 1.0 \
     --hyp_dim 256 \
-    --clip_r 2.3 \
+    --clip_r 0.95 \
     --output_dir visualizations \
     --num_batches 50 \
     --samples_per_class 50

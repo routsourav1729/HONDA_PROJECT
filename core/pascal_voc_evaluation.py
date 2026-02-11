@@ -94,7 +94,7 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
             
             ood_scores = None
             if use_ood_score:
-                ood_scores = instances.ood_score.tolist()
+                ood_scores = instances.ood_scores.tolist()  # Use plural: ood_scores
             else:
                 ood_scores = instances.scores.tolist()
 

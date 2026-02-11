@@ -77,16 +77,22 @@ if __name__ == "__main__":
 
     task_name, split_name = args.task.split('/')
     
+    # Handle IDD_HYP -> IDD for dataset registration
+    # Config is in IDD_HYP but dataset is registered as IDD
+    base_dataset = task_name.replace('_HYP', '')
+    
     # Dataset key
     if split_name in ['t2', 't3', 't4']:
-        dataset_key = f"{task_name}_T{split_name[1].upper()}"
+        dataset_key = f"{base_dataset}_T{split_name[1].upper()}"
     else:
-        dataset_key = task_name
+        dataset_key = base_dataset
     
     print(f"\n=== Evaluation ===")
     print(f"Task: {args.task}, Dataset: {dataset_key}")
     
-    data_register = Register('./datasets/', args.task, cfg, dataset_key)
+    # Use base_dataset path for data registration
+    data_split = f"{base_dataset}/{split_name}"
+    data_register = Register('./datasets/', data_split, cfg, dataset_key)
     data_register.register_dataset()
 
     class_names = list(inital_prompts()[dataset_key])
