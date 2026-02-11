@@ -97,6 +97,7 @@ if __name__ == "__main__":
     parser.add_argument("--hyp_dim", type=int, default=256, help="Embedding dimension")
     parser.add_argument("--clip_r", type=float, default=0.95, help="Clip radius for ToPoincare")
     parser.add_argument("--hyp_loss_weight", type=float, default=1.0, help="Horospherical loss weight")
+    parser.add_argument("--dispersion_weight", type=float, default=0.1, help="Prototype dispersion loss weight")
     
     args = parser.parse_args()
     print("Command Line Args:", args)
@@ -195,7 +196,7 @@ if __name__ == "__main__":
     # Training loop
     for epoch in range(start_epoch, cfgY.max_epochs):
         print(f"\n=== Epoch {epoch} ===")
-        epoch_loss = {'cls': 0, 'dfl': 0, 'bbox': 0, 'horo': 0}
+        epoch_loss = {'cls': 0, 'dfl': 0, 'bbox': 0, 'horo': 0, 'disp': 0}
         steps = 0
         
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}"):
@@ -208,26 +209,32 @@ if __name__ == "__main__":
                 head_losses, hyp_loss = model.head_loss(data['inputs'], data['data_samples'])
                 breakdown = None
             
-            loss = head_losses['loss_cls'] + head_losses['loss_dfl'] + head_losses['loss_bbox'] + args.hyp_loss_weight * hyp_loss
+            # Add dispersion loss to prevent prototype direction collapse
+            disp_loss = model.hyp_projector.classifier.angular_dispersion_loss()
+            
+            loss = (head_losses['loss_cls'] + head_losses['loss_dfl'] + head_losses['loss_bbox'] 
+                    + args.hyp_loss_weight * hyp_loss 
+                    + args.dispersion_weight * disp_loss)
             loss.backward()
             
             epoch_loss['cls'] += head_losses['loss_cls'].item()
             epoch_loss['dfl'] += head_losses['loss_dfl'].item()
             epoch_loss['bbox'] += head_losses['loss_bbox'].item()
             epoch_loss['horo'] += hyp_loss.item()
+            epoch_loss['disp'] += disp_loss.item()
             
             if steps % 50 == 0:
                 print(f"  step {steps}: cls={head_losses['loss_cls'].item():.4f} "
-                      f"bbox={head_losses['loss_bbox'].item():.4f} horo={hyp_loss.item():.4f}")
+                      f"bbox={head_losses['loss_bbox'].item():.4f} horo={hyp_loss.item():.4f} disp={disp_loss.item():.4f}")
                 if breakdown:
-                    print(f"    [Proto] bias_mean={breakdown.get('bias_mean', 0):.3f}")
+                    print(f"    [Proto] bias_mean={breakdown.get('bias_mean', 0):.3f} num_protos={breakdown.get('num_prototypes', 0)}")
             
             optimizer.step()
             steps += 1
         
         # Epoch summary
         n = max(steps, 1)
-        print(f"✓ Epoch {epoch} done | Avg: cls={epoch_loss['cls']/n:.4f} bbox={epoch_loss['bbox']/n:.4f} horo={epoch_loss['horo']/n:.4f}")
+        print(f"✓ Epoch {epoch} done | Avg: cls={epoch_loss['cls']/n:.4f} bbox={epoch_loss['bbox']/n:.4f} horo={epoch_loss['horo']/n:.4f} disp={epoch_loss['disp']/n:.4f}")
         
         # Save checkpoints
         if epoch % 5 == 0:

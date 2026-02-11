@@ -92,6 +92,35 @@ class HorosphericalClassifier(nn.Module):
         scores = self.busemann_scores(x)
         max_scores = scores.max(dim=-1).values
         return -max_scores
+    
+    def angular_dispersion_loss(self):
+        """
+        Dispersion regularizer: penalizes prototype directions being too similar.
+        
+        Encourages prototype directions to spread out on the unit sphere.
+        Loss = mean(max(cos_sim - margin, 0)^2) for off-diagonal pairs.
+        
+        Returns
+        -------
+        tensor
+            Scalar dispersion loss
+        """
+        # Get normalized directions
+        directions = F.normalize(self.prototype_direction, dim=-1)  # (K, D)
+        
+        # Pairwise cosine similarities
+        cos_sim = directions @ directions.T  # (K, K)
+        
+        # Mask diagonal
+        K = directions.shape[0]
+        mask = ~torch.eye(K, dtype=torch.bool, device=directions.device)
+        off_diag = cos_sim[mask]
+        
+        # Hinge loss: penalize similarities above margin (e.g., 0.5)
+        margin = 0.5
+        violations = F.relu(off_diag - margin)
+        
+        return violations.pow(2).mean()
 
 
 class HorosphericalLoss(nn.Module):
@@ -145,18 +174,37 @@ class HorosphericalLoss(nn.Module):
         
         return F.cross_entropy(valid_scores, valid_labels, label_smoothing=self.label_smoothing)
     
-    def forward_with_breakdown(self, scores, labels, classifier):
-        """Same as forward but returns diagnostic info."""
+    def forward_with_breakdown(self, scores, labels, all_prototypes=None, all_biases=None):
+        """
+        Same as forward but returns diagnostic info.
+        
+        Parameters
+        ----------
+        scores : tensor
+            Horospherical scores
+        labels : tensor
+            Class labels
+        all_prototypes : tensor, optional
+            Full prototypes (frozen + trainable) for T2+ stats
+        all_biases : tensor, optional
+            Full biases (frozen + trainable) for T2+ stats
+        """
         loss = self.forward(scores, labels)
         
-        biases = classifier.prototype_bias
-        proto_norms = classifier.prototypes.norm(dim=-1)
+        # Use provided full prototypes/biases if available (for T2+ accuracy)
+        if all_biases is not None:
+            biases = all_biases
+            proto_norms = all_prototypes.norm(dim=-1) if all_prototypes is not None else biases.new_zeros(len(biases))
+        else:
+            biases = scores.new_zeros(1)  # Fallback
+            proto_norms = scores.new_zeros(1)
         
         loss_dict = {
             'horo_ce_loss': loss.item(),
             'bias_mean': biases.mean().item(),
             'bias_std': biases.std().item() if len(biases) > 1 else 0.0,
             'proto_norm_mean': proto_norms.mean().item(),
+            'num_prototypes': len(biases),
         }
         return loss, loss_dict
 

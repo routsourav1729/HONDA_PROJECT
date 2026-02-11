@@ -19,13 +19,14 @@ TASK="IDD/t1"
 CKPT="IDD/t1/hyperbolic_sep/model_final.pth"
 
 # Hyperbolic hyperparameters (must match training)
-HYP_C=0.1
+# NOTE: For horospherical classifiers, c=1.0 (ball radius=1) is standard
+HYP_C=1.0
 HYP_DIM=256
-CLIP_R=2.3
-# OOD threshold - hyperbolic distances are typically 2.0-3.0
-# Higher threshold = fewer unknowns (more permissive)
-# Lower threshold = more unknowns (more strict)
-OOD_THRESHOLD=5
+CLIP_R=0.95
+# OOD threshold - for horospherical: higher ood_score = more OOD
+# ood_score = -max(horosphere_score), so positive threshold is reasonable
+# Lower threshold = more unknowns (stricter), Higher = fewer unknowns (permissive)
+OOD_THRESHOLD=0.0
 
 echo "=========================================="
 echo "HYPERBOLIC YOLO-WORLD EVALUATION"

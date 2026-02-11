@@ -28,26 +28,18 @@ TASK="IDD/t1"
 PRETRAINED_CKPT="yolo_world_v2_xl_obj365v1_goldg_cc3mlite_pretrain-5daf1395.pth"
 
 # Hyperbolic hyperparameters - EDIT THESE
-HYP_C=0.1           # Poincaré ball curvature (ball radius = 1/sqrt(c) = 3.16)
+# NOTE: For horospherical classifiers, c=1.0 (ball radius=1) is standard
+HYP_C=1.0           # Poincaré ball curvature (ball radius = 1/sqrt(c) = 1.0)
 HYP_DIM=256         # Embedding dimension
-CLIP_R=2.3          # Clip radius
-TEMPERATURE=0.1     # Contrastive loss temperature
+CLIP_R=0.95         # Clip radius (must be < 1.0 for c=1.0)
 HYP_LOSS_WEIGHT=1.0 # Weight for hyperbolic loss
 
-# Prototype separation hyperparameters - keeps prototypes spread apart
-# separation_weight: 0.1 is conservative, 0.5 is aggressive
-# min_proto_dist: minimum pairwise distance between prototypes (in hyperbolic space)
-SEPARATION_WEIGHT=0.1   # Weight for separation loss (0=disabled)
-MIN_PROTO_DIST=1.5      # Minimum distance between prototypes
-
-# Boundary push hyperparameters - pushes prototypes toward ball boundary
-# boundary_weight: 0.1 is conservative
-# target_norm: FRACTION of ball radius (0.9 = 90% toward boundary = 2.85 for c=0.1)
-BOUNDARY_WEIGHT=0.1     # Weight for boundary push loss (0=disabled)
-TARGET_NORM=0.9         # Target = 90% of ball radius
+# Prototype dispersion hyperparameters (Issue #9: keeps prototype directions spread)
+# dispersion_weight: 0.1-0.5 recommended, prevents direction collapse
+DISPERSION_WEIGHT=0.1   # Weight for angular dispersion loss (0=disabled)
 
 # Experiment name (from argument or default)
-EXP_NAME=${1:-hyperbolic_sep}
+EXP_NAME=${1:-hyperbolic_horo}
 
 echo "=========================================="
 echo "HYPERBOLIC YOLO-WORLD TRAINING"
@@ -64,12 +56,9 @@ echo "  Output dir: $TASK/$EXP_NAME"
 echo ""
 echo "Hyperbolic params:"
 echo "  c=$HYP_C (ball_radius=$(python3 -c "import math; print(f'{1/math.sqrt($HYP_C):.2f}')"))"
-echo "  dim=$HYP_DIM, clip_r=$CLIP_R"
-echo "  temperature=$TEMPERATURE, loss_weight=$HYP_LOSS_WEIGHT"
-echo "Separation params:"
-echo "  separation_weight=$SEPARATION_WEIGHT, min_proto_dist=$MIN_PROTO_DIST"
-echo "Boundary params:"
-echo "  boundary_weight=$BOUNDARY_WEIGHT, target_norm=$TARGET_NORM (fraction of radius)"
+echo "  dim=$HYP_DIM, clip_r=$CLIP_R, loss_weight=$HYP_LOSS_WEIGHT"
+echo "Dispersion params:"
+echo "  dispersion_weight=$DISPERSION_WEIGHT"
 echo "=========================================="
 
 # Activate conda environment
@@ -120,16 +109,5 @@ python dev_hyp.py \
     --hyp_c $HYP_C \
     --hyp_dim $HYP_DIM \
     --clip_r $CLIP_R \
-    --temperature $TEMPERATURE \
     --hyp_loss_weight $HYP_LOSS_WEIGHT \
-    --separation_weight $SEPARATION_WEIGHT \
-    --min_proto_dist $MIN_PROTO_DIST \
-    --boundary_weight $BOUNDARY_WEIGHT \
-    --target_norm $TARGET_NORM \
-    --exp_name $EXP_NAME
-
-echo ""
-echo "=========================================="
-echo "Job finished at: $(date)"
-echo "Models saved to: $TASK/$EXP_NAME"
-echo "=========================================="
+    --dispersion_weight $DISPERSION_WEIGHT \

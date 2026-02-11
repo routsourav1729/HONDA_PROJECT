@@ -136,11 +136,10 @@ if __name__ == "__main__":
             
             # OOD detection via horosphere scores
             # ood_scores = -max_k(horosphere_score) → higher = more OOD
+            # Detection: ood_score > threshold → unknown
             if hasattr(pred, 'ood_scores'):
-                # Relabel as unknown if OOD score > threshold
-                # (equivalent to max_horosphere_score < -threshold)
                 for k in range(len(pred.ood_scores)):
-                    if pred.ood_scores[k] > -args.ood_threshold:
+                    if pred.ood_scores[k] > args.ood_threshold:
                         pred.labels[k] = unknown_index
             
             # NMS

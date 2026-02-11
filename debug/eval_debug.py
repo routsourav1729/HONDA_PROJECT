@@ -65,29 +65,24 @@ def setup(args):
 
 
 def compute_distance_stats(model, test_loader, num_batches=20):
-    """Compute detailed statistics about hyperbolic distances."""
+    """Compute detailed statistics about horosphere scores (OOD detection)."""
     print("\n" + "="*60)
-    print("COMPUTING DISTANCE STATISTICS")
+    print("COMPUTING OOD SCORE STATISTICS (HOROSPHERICAL)")
     print("="*60)
     
-    all_min_distances = []
+    all_ood_scores = []
     all_scores = []
     all_labels_before_ood = []
     
     model.eval()
     
-    for i, batch in enumerate(tqdm(test_loader, desc="Computing distances")):
+    for i, batch in enumerate(tqdm(test_loader, desc="Computing OOD scores")):
         if i >= num_batches:
             break
             
         data_batch = model.parent.data_preprocessor(batch)
         
         with torch.no_grad():
-            # Get FPN features and hyperbolic embeddings
-            img_feats, txt_feats, hyp_embeddings = model.extract_feat(
-                data_batch['inputs'], data_batch['data_samples']
-            )
-            
             # Get predictions (before OOD relabeling)
             outputs = model.predict(data_batch['inputs'], data_batch['data_samples'])
             
@@ -96,31 +91,31 @@ def compute_distance_stats(model, test_loader, num_batches=20):
                 if len(pred.scores) == 0:
                     continue
                 
-                # Collect stats
-                if hasattr(pred, 'hyp_distances'):
-                    all_min_distances.extend(pred.hyp_distances.cpu().tolist())
+                # Collect stats - use ood_scores (horospherical)
+                if hasattr(pred, 'ood_scores'):
+                    all_ood_scores.extend(pred.ood_scores.cpu().tolist())
                     all_scores.extend(pred.scores.cpu().tolist())
                     all_labels_before_ood.extend(pred.labels.cpu().tolist())
     
-    if len(all_min_distances) == 0:
+    if len(all_ood_scores) == 0:
         print("WARNING: No predictions collected!")
         return
     
-    distances = np.array(all_min_distances)
+    ood_scores = np.array(all_ood_scores)
     scores = np.array(all_scores)
     labels = np.array(all_labels_before_ood)
     
-    print(f"\nTotal predictions analyzed: {len(distances)}")
-    print(f"\n--- Distance Statistics ---")
-    print(f"  Min distance: {distances.min():.4f}")
-    print(f"  Max distance: {distances.max():.4f}")
-    print(f"  Mean distance: {distances.mean():.4f}")
-    print(f"  Std distance: {distances.std():.4f}")
-    print(f"  Percentiles: 10%={np.percentile(distances, 10):.4f}, "
-          f"50%={np.percentile(distances, 50):.4f}, "
-          f"90%={np.percentile(distances, 90):.4f}")
+    print(f"\nTotal predictions analyzed: {len(ood_scores)}")
+    print(f"\n--- OOD Score Statistics (higher = more OOD) ---")
+    print(f"  Min: {ood_scores.min():.4f}")
+    print(f"  Max: {ood_scores.max():.4f}")
+    print(f"  Mean: {ood_scores.mean():.4f}")
+    print(f"  Std: {ood_scores.std():.4f}")
+    print(f"  Percentiles: 10%={np.percentile(ood_scores, 10):.4f}, "
+          f"50%={np.percentile(ood_scores, 50):.4f}, "
+          f"90%={np.percentile(ood_scores, 90):.4f}")
     
-    print(f"\n--- Score Statistics ---")
+    print(f"\n--- Detection Score Statistics ---")
     print(f"  Min score: {scores.min():.4f}")
     print(f"  Max score: {scores.max():.4f}")
     print(f"  Mean score: {scores.mean():.4f}")
@@ -130,13 +125,13 @@ def compute_distance_stats(model, test_loader, num_batches=20):
     for lbl, cnt in zip(unique, counts):
         print(f"  Label {lbl}: {cnt} predictions")
     
-    # Suggest thresholds
-    print(f"\n--- Suggested OOD Thresholds ---")
-    for p in [50, 70, 80, 90, 95]:
-        thresh = np.percentile(distances, p)
+    # Suggest thresholds (for ood_scores: higher = more OOD)
+    print(f"\n--- Suggested OOD Thresholds (ood_score > threshold → unknown) ---")
+    for p in [90, 95, 99]:
+        thresh = np.percentile(ood_scores, p)
         print(f"  {p}th percentile: {thresh:.4f}")
     
-    return distances, scores, labels
+    return ood_scores, scores, labels
 
 
 def eval_with_ood_mode(model, test_loader, evaluator, unknown_index, ood_threshold, mode='full'):
@@ -170,27 +165,21 @@ def eval_with_ood_mode(model, test_loader, evaluator, unknown_index, ood_thresho
             pred = output.pred_instances
             
             if mode == 'full':
-                # Normal OOD detection
-                if hasattr(pred, 'hyp_distances'):
-                    for k in range(len(pred.hyp_distances)):
-                        if pred.hyp_distances[k] > ood_threshold:
+                # Normal OOD detection using horosphere scores
+                # ood_scores = -max(horosphere_score), higher = more OOD
+                if hasattr(pred, 'ood_scores'):
+                    for k in range(len(pred.ood_scores)):
+                        if pred.ood_scores[k] > ood_threshold:
                             pred.labels[k] = unknown_index
                             total_ood += 1
-                    pred.ood_score = pred.hyp_distances
-                else:
-                    pred.ood_score = torch.zeros_like(pred.scores)
                     
             elif mode == 'no_ood':
                 # Don't change any labels - test pure YOLO predictions
-                if hasattr(pred, 'hyp_distances'):
-                    pred.ood_score = pred.hyp_distances
-                else:
-                    pred.ood_score = torch.zeros_like(pred.scores)
+                pass
                     
             elif mode == 'all_ood':
                 # Mark everything as unknown
                 pred.labels[:] = unknown_index
-                pred.ood_score = torch.ones_like(pred.scores)
                 total_ood += len(pred.labels)
             
             total_preds += len(pred.labels)

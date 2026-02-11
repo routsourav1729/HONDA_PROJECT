@@ -44,12 +44,12 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
     
     if eval:
         # Evaluation: load all embeddings and prototypes
-        model.frozen_embeddings = nn.Parameter(state_dict['frozen_embeddings']) if state_dict.get('frozen_embeddings') is not None else None
-        model.embeddings = nn.Parameter(state_dict['embeddings']) if state_dict.get('embeddings') is not None else None
+        model.frozen_embeddings = nn.Parameter(state_dict['frozen_embeddings'], requires_grad=False) if state_dict.get('frozen_embeddings') is not None else None
+        model.embeddings = nn.Parameter(state_dict['embeddings'], requires_grad=False) if state_dict.get('embeddings') is not None else None
         
-        # Load frozen prototypes
-        model.frozen_directions = nn.Parameter(state_dict['frozen_directions']) if state_dict.get('frozen_directions') is not None else None
-        model.frozen_biases = nn.Parameter(state_dict['frozen_biases']) if state_dict.get('frozen_biases') is not None else None
+        # Load frozen prototypes (requires_grad=False since we're in eval)
+        model.frozen_directions = nn.Parameter(state_dict['frozen_directions'], requires_grad=False) if state_dict.get('frozen_directions') is not None else None
+        model.frozen_biases = nn.Parameter(state_dict['frozen_biases'], requires_grad=False) if state_dict.get('frozen_biases') is not None else None
         
         # Load trainable prototypes
         if state_dict.get('hyp_projector.classifier.prototype_direction') is not None:
@@ -89,8 +89,9 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
         freeze_biases = bias_a if bias_a is not None else bias_b
     
     if freeze_dirs is not None:
-        model.frozen_directions = nn.Parameter(freeze_dirs)
-        model.frozen_biases = nn.Parameter(freeze_biases)
+        # Frozen prototypes should not require gradients
+        model.frozen_directions = nn.Parameter(freeze_dirs, requires_grad=False)
+        model.frozen_biases = nn.Parameter(freeze_biases, requires_grad=False)
         # Initialize new trainable prototypes
         model.hyp_projector.classifier.prototype_direction = nn.Parameter(
             torch.randn(current_classes, model.hyp_projector.out_dim))
@@ -250,7 +251,12 @@ class HypCustomYoloWorld(nn.Module):
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0), {}
         scores = self.compute_horosphere_scores(hyp_embeddings)
-        return self.hyp_loss_fn.forward_with_breakdown(scores, self.tmp_labels, self.hyp_projector.classifier)
+        # Pass full prototypes/biases for accurate breakdown at T2+
+        return self.hyp_loss_fn.forward_with_breakdown(
+            scores, self.tmp_labels, 
+            all_prototypes=self.prototypes, 
+            all_biases=self.prototype_biases
+        )
     
     def head_loss(self, batch_inputs: Tensor, batch_data_samples: SampleList):
         """Compute YOLO + horospherical losses."""
