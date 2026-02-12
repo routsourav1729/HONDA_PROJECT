@@ -15,8 +15,11 @@
 # Poincaré Ball Visualization
 # ============================================================================
 
-TASK="IDD/t1"
-CKPT="IDD/t1/hyperbolic_sep/model_final.pth"
+# Base directory
+BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
+
+TASK="$BASE_DIR/IDD_HYP/t1"
+CKPT="$BASE_DIR/IDD_HYP/t1/horospherical/model_latest.pth"
 
 echo "=========================================="
 echo "POINCARÉ BALL VISUALIZATION"
@@ -33,7 +36,10 @@ conda activate ovow2
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # Set PYTHONPATH
-export PYTHONPATH=/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2/YOLO-World:$PYTHONPATH
+export PYTHONPATH=$BASE_DIR/YOLO-World:$PYTHONPATH
+
+# Change to working directory
+cd $BASE_DIR
 
 # Configure offline CLIP cache
 export HF_HOME=/home/agipml/sourav.rout/ALL_FILES/hypyolo/clip_cache
@@ -56,7 +62,7 @@ echo "Starting VISUALIZATION"
 echo "=========================================="
 
 python debug/visualize_simple.py \
-    --config-file configs/IDD/base.yaml \
+    --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $CKPT \
     --hyp_c 0.1 \

@@ -99,6 +99,7 @@ if __name__ == "__main__":
     parser.add_argument("--hyp_loss_weight", type=float, default=None, help="Override hyp_loss_weight from config")
     parser.add_argument("--dispersion_weight", type=float, default=None, help="Override dispersion_weight from config")
     parser.add_argument("--init_protos", type=str, default=None, help="Override init_protos from config")
+    parser.add_argument("--wandb", action="store_true", help="Enable WandB")
     
     args = parser.parse_args()
     print("Command Line Args:", args)
@@ -233,6 +234,11 @@ if __name__ == "__main__":
     )
     print(f"Optimizer: AdamW, LR={cfgY.base_lr}")
 
+    wb = None
+    if args.wandb:
+        from wandb_config import WandbLogger
+        wb = WandbLogger(name=f"{args.task.replace('/', '_')}_{args.exp_name}", config={'lr': cfgY.base_lr, 'c': hyp_c})
+
     start_epoch = 0
     if args.resume_from:
         start_epoch = load_checkpoint(model, optimizer, args.resume_from)
@@ -241,6 +247,7 @@ if __name__ == "__main__":
     save_dir = os.path.join(args.task, args.exp_name if args.exp_name else "horospherical")
     print(f"\nSave directory: {save_dir}")
     
+    gs = 0
     # Training loop
     for epoch in range(start_epoch, cfgY.max_epochs):
         print(f"\n=== Epoch {epoch} ===")
@@ -273,10 +280,44 @@ if __name__ == "__main__":
                 print(f"  step {steps}: cls={head_losses['loss_cls'].item():.4f} "
                       f"bbox={head_losses['loss_bbox'].item():.4f} horo={hyp_loss.item():.4f}")
                 if breakdown:
-                    print(f"    [Proto] bias_mean={breakdown.get('bias_mean', 0):.3f} num_protos={breakdown.get('num_prototypes', 0)}")
+                    # Log detailed breakdown for debugging
+                    bias_mean = breakdown.get('bias_mean', 0)
+                    bias_std = breakdown.get('bias_std', 0)
+                    ce_loss = breakdown.get('horo_ce_loss', 0)
+                    disp_loss = breakdown.get('horo_disp_loss', 0)
+                    proto_norm = breakdown.get('proto_norm_mean', 0)
+                    print(f"    [Proto] bias_mean={bias_mean:.3f} bias_std={bias_std:.3f} "
+                          f"ce={ce_loss:.4f} disp={disp_loss:.4f} norm={proto_norm:.3f}")
+                if wb:
+                    log_dict = {
+                        'cls': head_losses['loss_cls'].item(), 
+                        'bbox': head_losses['loss_bbox'].item(), 
+                        'horo': hyp_loss.item()
+                    }
+                    if breakdown:
+                        log_dict.update({
+                            'bias_mean': breakdown.get('bias_mean', 0),
+                            'bias_std': breakdown.get('bias_std', 0),
+                            'horo_ce': breakdown.get('horo_ce_loss', 0),
+                            'horo_disp': breakdown.get('horo_disp_loss', 0),
+                            'proto_norm': breakdown.get('proto_norm_mean', 0),
+                            'pos_score': breakdown.get('pos_score_mean', 0),
+                            'max_score': breakdown.get('max_score_mean', 0),
+                        })
+                    wb.log(log_dict, step=gs)
+            
+            # Log gradient stats every 500 steps to monitor learning
+            if steps % 500 == 0 and steps > 0:
+                bias_param = model.hyp_projector.prototype_bias
+                dir_param = model.hyp_projector.prototype_direction
+                if bias_param.grad is not None:
+                    bias_grad_norm = bias_param.grad.norm().item()
+                    dir_grad_norm = dir_param.grad.norm().item() if dir_param.grad is not None else 0
+                    print(f"    [Grads] bias_grad={bias_grad_norm:.6f} dir_grad={dir_grad_norm:.6f}")
             
             optimizer.step()
             steps += 1
+            gs += 1
         
         # Epoch summary
         n = max(steps, 1)
@@ -289,3 +330,5 @@ if __name__ == "__main__":
     
     save_model(model, optimizer, 'final', save_dir)
     print("\n=== Training Complete ===")
+    if wb:
+        wb.finish()

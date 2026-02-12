@@ -285,6 +285,29 @@ class HorosphericalLoss(nn.Module):
             biases = scores.new_zeros(1)  # Fallback
             proto_norms = scores.new_zeros(1)
         
+        # Score statistics for debugging OOD detection  
+        with torch.no_grad():
+            if valid.sum() > 0:
+                valid_scores = scores_flat[valid]
+                valid_labels = labels_flat[valid]
+                
+                # Scores for correct class
+                pos_scores = valid_scores[torch.arange(len(valid_labels)), valid_labels]
+                # Max score across all classes
+                max_scores = valid_scores.max(dim=-1).values
+                
+                score_stats = {
+                    'pos_score_mean': pos_scores.mean().item(),
+                    'pos_score_std': pos_scores.std().item() if len(pos_scores) > 1 else 0.0,
+                    'max_score_mean': max_scores.mean().item(),
+                    'score_margin': (max_scores - pos_scores).mean().item(),  # 0 if correct class has max
+                }
+            else:
+                score_stats = {
+                    'pos_score_mean': 0.0, 'pos_score_std': 0.0,
+                    'max_score_mean': 0.0, 'score_margin': 0.0
+                }
+        
         loss_dict = {
             'horo_ce_loss': ce_loss_val,
             'horo_disp_loss': disp_loss_val,
@@ -294,6 +317,7 @@ class HorosphericalLoss(nn.Module):
             'bias_std': biases.std().item() if len(biases) > 1 else 0.0,
             'proto_norm_mean': proto_norms.mean().item(),
             'num_prototypes': len(biases),
+            **score_stats,  # Include score statistics
         }
         return loss, loss_dict
 

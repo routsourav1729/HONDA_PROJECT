@@ -15,8 +15,11 @@
 # Simple Poincaré Visualization
 # ============================================================================
 
+# Base directory
+BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
+
 TASK="IDD_HYP/t1"
-CKPT="IDD_HYP/t1/horospherical/model_5.pth"
+CKPT="$BASE_DIR/IDD_HYP/t1/horospherical/model_latest.pth"
 
 echo "=========================================="
 echo "POINCARÉ VISUALIZATION"

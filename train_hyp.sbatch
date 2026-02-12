@@ -14,16 +14,14 @@
 # ============================================================================
 # Hyperbolic YOLO-World Training - SBATCH Script
 # ============================================================================
-# All hyperbolic parameters are now in config files (configs/IDD/t1.py, t2.py)!
-# 
 # Usage:
-#   sbatch train_hyp.sbatch             # T1 training
-#   sbatch train_hyp.sbatch t2          # T2 training (auto-loads T1 checkpoint)
-#   sbatch train_hyp.sbatch t1 my_exp   # T1 with custom exp name
+#   sbatch train_hyp.sbatch              # T1 training
+#   sbatch train_hyp.sbatch t2           # T2 training
+#   sbatch train_hyp.sbatch t1 my_exp    # Custom exp name
 # ============================================================================
 
 # Arguments
-SPLIT=${1:-t1}       # t1 or t2
+SPLIT=${1:-t1}
 EXP_NAME=${2:-horospherical}
 
 TASK="IDD_HYP/$SPLIT"
@@ -85,9 +83,16 @@ echo "=========================================="
 echo "Starting TRAINING"
 echo "=========================================="
 
-# Run training (all hyp params read from config!)
 python dev_hyp.py \
     --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $PRETRAINED_CKPT \
-    --exp_name $EXP_NAME
+    --exp_name $EXP_NAME \
+    --wandb
+
+echo ""
+echo "=========================================="
+echo "Job finished at: $(date)"
+echo "To sync WandB: ./sync_wandb.sh"
+echo "=========================================="
+
