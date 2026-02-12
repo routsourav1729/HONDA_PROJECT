@@ -135,9 +135,12 @@ class HorosphericalClassifier(nn.Module):
 
 class HorosphericalLoss(nn.Module):
     """
-    Cross-entropy loss over horospherical scores with optional direction dispersion.
+    Cross-entropy loss over horospherical scores with regularization.
     
-    L = CE(scores, labels) + dispersion_weight * dispersion_loss
+    L = CE(scores, labels) 
+        + dispersion_weight * dispersion_loss    (push prototypes apart)
+        + bias_reg_weight * ||biases||^2          (keep horospheres tight)
+        + compactness_weight * compactness_loss    (pull knowns into their horosphere)
     
     Parameters
     ----------
@@ -147,13 +150,20 @@ class HorosphericalLoss(nn.Module):
         Label smoothing factor (default: 0.0)
     dispersion_weight : float
         Weight for direction dispersion loss (default: 0.1)
+    bias_reg_weight : float
+        L2 penalty on prototype biases to prevent horosphere inflation (default: 0.1)
+    compactness_weight : float
+        Weight for intra-class compactness loss (default: 0.0)
     """
     
-    def __init__(self, curvature=1.0, label_smoothing=0.0, dispersion_weight=0.1):
+    def __init__(self, curvature=1.0, label_smoothing=0.0, dispersion_weight=0.1,
+                 bias_reg_weight=0.1, compactness_weight=0.0):
         super().__init__()
         self.c = curvature
         self.label_smoothing = label_smoothing
         self.dispersion_weight = dispersion_weight
+        self.bias_reg_weight = bias_reg_weight
+        self.compactness_weight = compactness_weight
     
     def direction_dispersion_loss(self, prototype_direction, frozen_directions=None):
         """
@@ -186,7 +196,44 @@ class HorosphericalLoss(nn.Module):
         
         return self_disp
     
-    def forward(self, scores, labels, prototype_direction=None, frozen_directions=None):
+    def bias_regularization(self, prototype_bias, frozen_biases=None):
+        """
+        L2 penalty on prototype biases to keep horospheres tight.
+        
+        Large positive biases inflate horospheres, causing unknowns to be 
+        absorbed. This penalizes all biases, especially large positive ones.
+        """
+        reg = prototype_bias.pow(2).mean()
+        if frozen_biases is not None and frozen_biases.numel() > 0:
+            reg = reg + frozen_biases.pow(2).mean()
+        return reg
+    
+    def compactness_loss(self, scores, labels):
+        """
+        Encourage high horosphere scores for correctly assigned anchors.
+        
+        For each assigned anchor, maximize its score for the GT class.
+        This tightens known clusters, making the boundary more discriminative.
+        
+        L_compact = mean(max(margin - score_gt, 0))
+        """
+        valid = labels >= 0
+        if valid.sum() == 0:
+            return scores.new_tensor(0.0)
+        
+        valid_scores = scores[valid]  # (N_valid, K)
+        valid_labels = labels[valid]  # (N_valid,)
+        
+        # Get score for the GT class
+        gt_scores = valid_scores[torch.arange(len(valid_labels), device=labels.device), valid_labels]
+        
+        # Hinge: penalize when GT score < margin (want high scores for correct class)
+        margin = 2.0  
+        compact = F.relu(margin - gt_scores)
+        return compact.mean()
+    
+    def forward(self, scores, labels, prototype_direction=None, frozen_directions=None,
+                prototype_bias=None, frozen_biases=None):
         """
         Compute cross-entropy loss over horospherical scores.
         
@@ -200,11 +247,15 @@ class HorosphericalLoss(nn.Module):
             Raw prototype directions for dispersion loss
         frozen_directions : tensor (K_frozen, D), optional
             Frozen directions from previous tasks for cross-dispersion (T2+)
+        prototype_bias : tensor (K,), optional
+            Prototype biases for L2 regularization
+        frozen_biases : tensor (K_frozen,), optional
+            Frozen biases for regularization
         
         Returns
         -------
         tensor
-            Scalar loss (CE + dispersion)
+            Scalar loss (CE + dispersion + bias_reg + compactness)
         """
         # Flatten if batched
         if scores.dim() == 3:
@@ -221,15 +272,29 @@ class HorosphericalLoss(nn.Module):
             valid_labels = labels[valid]
             ce_loss = F.cross_entropy(valid_scores, valid_labels, label_smoothing=self.label_smoothing)
         
-        # Add dispersion loss if directions provided (includes cross-dispersion for T2+)
+        # Dispersion loss (push prototype directions apart)
         disp_loss = scores.new_tensor(0.0)
         if prototype_direction is not None and self.dispersion_weight > 0:
             disp_loss = self.direction_dispersion_loss(prototype_direction, frozen_directions)
         
-        return ce_loss + self.dispersion_weight * disp_loss
+        # Bias L2 regularization (keep horospheres tight)
+        bias_loss = scores.new_tensor(0.0)
+        if prototype_bias is not None and self.bias_reg_weight > 0:
+            bias_loss = self.bias_regularization(prototype_bias, frozen_biases)
+        
+        # Compactness loss (pull knowns into their prototype)
+        compact_loss = scores.new_tensor(0.0)
+        if self.compactness_weight > 0:
+            compact_loss = self.compactness_loss(scores, labels)
+        
+        return (ce_loss 
+                + self.dispersion_weight * disp_loss 
+                + self.bias_reg_weight * bias_loss
+                + self.compactness_weight * compact_loss)
     
     def forward_with_breakdown(self, scores, labels, all_prototypes=None, all_biases=None,
-                                  prototype_direction=None, frozen_directions=None):
+                                  prototype_direction=None, frozen_directions=None,
+                                  prototype_bias=None, frozen_biases=None):
         """
         Same as forward but returns diagnostic info.
         
@@ -247,9 +312,14 @@ class HorosphericalLoss(nn.Module):
             Trainable directions for dispersion
         frozen_directions : tensor, optional
             Frozen directions for cross-dispersion (T2+)
+        prototype_bias : tensor, optional
+            Trainable biases for L2 regularization
+        frozen_biases : tensor, optional
+            Frozen biases for regularization
         """
-        # Compute full loss (CE + dispersion)
-        loss = self.forward(scores, labels, prototype_direction, frozen_directions)
+        # Compute full loss (CE + dispersion + bias_reg + compactness)
+        loss = self.forward(scores, labels, prototype_direction, frozen_directions,
+                            prototype_bias, frozen_biases)
         
         # Compute individual components for breakdown
         # CE loss
@@ -275,6 +345,19 @@ class HorosphericalLoss(nn.Module):
         if prototype_direction is not None and self.dispersion_weight > 0:
             disp_loss_val = self.direction_dispersion_loss(
                 prototype_direction, frozen_directions
+            ).item()
+        
+        # Bias regularization loss
+        bias_reg_val = 0.0
+        if prototype_bias is not None and self.bias_reg_weight > 0:
+            bias_reg_val = self.bias_regularization(prototype_bias, frozen_biases).item()
+        
+        # Compactness loss
+        compact_val = 0.0
+        if self.compactness_weight > 0:
+            compact_val = self.compactness_loss(
+                scores_flat if scores.dim() <= 2 else scores.reshape(-1, scores.shape[-1]), 
+                labels_flat if labels.dim() <= 1 else labels.reshape(-1)
             ).item()
         
         # Use provided full prototypes/biases if available (for T2+ accuracy)
@@ -312,9 +395,15 @@ class HorosphericalLoss(nn.Module):
             'horo_ce_loss': ce_loss_val,
             'horo_disp_loss': disp_loss_val,
             'horo_disp_weighted': self.dispersion_weight * disp_loss_val,
+            'horo_bias_reg': bias_reg_val,
+            'horo_bias_reg_weighted': self.bias_reg_weight * bias_reg_val,
+            'horo_compact_loss': compact_val,
+            'horo_compact_weighted': self.compactness_weight * compact_val,
             'horo_total_loss': loss.item(),
             'bias_mean': biases.mean().item(),
             'bias_std': biases.std().item() if len(biases) > 1 else 0.0,
+            'bias_max': biases.max().item(),
+            'bias_min': biases.min().item(),
             'proto_norm_mean': proto_norms.mean().item(),
             'num_prototypes': len(biases),
             **score_stats,  # Include score statistics

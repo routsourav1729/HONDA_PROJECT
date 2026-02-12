@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=vis_simple
-#SBATCH --output=slurm_logs/vis_simple_%j.out
-#SBATCH --error=slurm_logs/vis_simple_%j.err
+#SBATCH --job-name=analyze_unk
+#SBATCH --output=slurm_logs/analyze_unk_%j.out
+#SBATCH --error=slurm_logs/analyze_unk_%j.err
 #SBATCH --partition=l40
 #SBATCH --qos=l40
 #SBATCH --nodes=1
@@ -9,20 +9,20 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
-#SBATCH --time=00:30:00
+#SBATCH --time=01:00:00
 
 # ============================================================================
-# Simple Poincaré Visualization
+# Unknown Embedding Analysis
+# Projects all test embeddings (known + unknown) and computes stats
 # ============================================================================
 
-# Base directory
 BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
 TASK="IDD_HYP/t1"
-CKPT="$BASE_DIR/IDD_HYP/t1/horospherical/model_latest.pth"
+CKPT="$BASE_DIR/IDD_HYP/t1/horospherical/model_45.pth"
 
 echo "=========================================="
-echo "POINCARÉ VISUALIZATION"
+echo "UNKNOWN EMBEDDING ANALYSIS"
 echo "=========================================="
 echo "Job started at: $(date)"
 echo "Checkpoint: $CKPT"
@@ -53,7 +53,7 @@ cd /home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2
 
 mkdir -p visualizations
 
-python debug/visualize_simple.py \
+python debug/analyze_unknowns.py \
     --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $CKPT \
@@ -61,7 +61,7 @@ python debug/visualize_simple.py \
     --hyp_dim 256 \
     --clip_r 0.95 \
     --output_dir visualizations \
-    --num_batches 50 \
+    --num_batches 150 \
     --samples_per_class 500
 
 echo ""

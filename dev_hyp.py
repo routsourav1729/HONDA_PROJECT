@@ -98,6 +98,8 @@ if __name__ == "__main__":
     parser.add_argument("--clip_r", type=float, default=None, help="Override clip_r from config")
     parser.add_argument("--hyp_loss_weight", type=float, default=None, help="Override hyp_loss_weight from config")
     parser.add_argument("--dispersion_weight", type=float, default=None, help="Override dispersion_weight from config")
+    parser.add_argument("--bias_reg_weight", type=float, default=None, help="Override bias_reg_weight from config")
+    parser.add_argument("--compactness_weight", type=float, default=None, help="Override compactness_weight from config")
     parser.add_argument("--init_protos", type=str, default=None, help="Override init_protos from config")
     parser.add_argument("--wandb", action="store_true", help="Enable WandB")
     
@@ -166,6 +168,8 @@ if __name__ == "__main__":
     clip_r = args.clip_r if args.clip_r is not None else hyp_cfg.get('clip_r', 0.95)
     hyp_loss_weight = args.hyp_loss_weight if args.hyp_loss_weight is not None else hyp_cfg.get('hyp_loss_weight', 1.0)
     dispersion_weight = args.dispersion_weight if args.dispersion_weight is not None else hyp_cfg.get('dispersion_weight', 0.0)
+    bias_reg_weight = args.bias_reg_weight if args.bias_reg_weight is not None else hyp_cfg.get('bias_reg_weight', 0.0)
+    compactness_weight = args.compactness_weight if args.compactness_weight is not None else hyp_cfg.get('compactness_weight', 0.0)
     init_protos_path = args.init_protos if args.init_protos is not None else hyp_cfg.get('init_protos', '')
     prev_ckpt = args.ckpt if args.ckpt else hyp_cfg.get('prev_ckpt', '')
     
@@ -175,6 +179,8 @@ if __name__ == "__main__":
     print(f"  clip_r: {clip_r}")
     print(f"  hyp_loss_weight: {hyp_loss_weight}")
     print(f"  dispersion_weight: {dispersion_weight}")
+    print(f"  bias_reg_weight: {bias_reg_weight}")
+    print(f"  compactness_weight: {compactness_weight}")
     print(f"  init_protos: {init_protos_path}")
     if cfg.TEST.PREV_INTRODUCED_CLS > 0:
         print(f"  prev_ckpt (T2+): {prev_ckpt}")
@@ -201,7 +207,9 @@ if __name__ == "__main__":
         runner.model, unknown_index,
         hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
         init_prototypes=init_prototypes,
-        dispersion_weight=dispersion_weight
+        dispersion_weight=dispersion_weight,
+        bias_reg_weight=bias_reg_weight,
+        compactness_weight=compactness_weight
     )
     
     if args.resume_from:
@@ -283,11 +291,14 @@ if __name__ == "__main__":
                     # Log detailed breakdown for debugging
                     bias_mean = breakdown.get('bias_mean', 0)
                     bias_std = breakdown.get('bias_std', 0)
+                    bias_max = breakdown.get('bias_max', 0)
                     ce_loss = breakdown.get('horo_ce_loss', 0)
                     disp_loss = breakdown.get('horo_disp_loss', 0)
+                    bias_reg = breakdown.get('horo_bias_reg', 0)
+                    compact_loss = breakdown.get('horo_compact_loss', 0)
                     proto_norm = breakdown.get('proto_norm_mean', 0)
-                    print(f"    [Proto] bias_mean={bias_mean:.3f} bias_std={bias_std:.3f} "
-                          f"ce={ce_loss:.4f} disp={disp_loss:.4f} norm={proto_norm:.3f}")
+                    print(f"    [Proto] bias_mean={bias_mean:.3f} bias_max={bias_max:.3f} bias_std={bias_std:.3f} "
+                          f"ce={ce_loss:.4f} disp={disp_loss:.4f} bias_reg={bias_reg:.4f} compact={compact_loss:.4f}")
                 if wb:
                     log_dict = {
                         'cls': head_losses['loss_cls'].item(), 

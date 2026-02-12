@@ -130,6 +130,8 @@ class HypCustomYoloWorld(nn.Module):
         clip_r=0.95,
         init_prototypes=None,  # Pre-computed from init_prototypes.py
         dispersion_weight=0.1,
+        bias_reg_weight=0.1,
+        compactness_weight=0.0,
     ):
         super().__init__()
         
@@ -157,8 +159,13 @@ class HypCustomYoloWorld(nn.Module):
         self._init_text_embedding()
         self._init_hyperbolic_projector(clip_r, init_prototypes)
         
-        # Loss function with dispersion
-        self.hyp_loss_fn = HorosphericalLoss(curvature=hyp_c, dispersion_weight=dispersion_weight)
+        # Loss function with all regularization terms
+        self.hyp_loss_fn = HorosphericalLoss(
+            curvature=hyp_c, 
+            dispersion_weight=dispersion_weight,
+            bias_reg_weight=bias_reg_weight,
+            compactness_weight=compactness_weight
+        )
     
     def _init_text_embedding(self):
         with torch.no_grad():
@@ -266,15 +273,18 @@ class HypCustomYoloWorld(nn.Module):
         return scores
     
     def horospherical_loss(self, hyp_embeddings):
-        """Compute horospherical CE loss with dispersion regularization."""
+        """Compute horospherical CE loss with dispersion + bias regularization."""
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0)
         scores = self.compute_horosphere_scores(hyp_embeddings)
         # Pass prototype_direction + frozen_directions for dispersion loss (including cross-dispersion at T2+)
+        # Pass prototype_bias + frozen_biases for bias L2 regularization
         return self.hyp_loss_fn(
             scores, self.tmp_labels,
             prototype_direction=self.hyp_projector.prototype_direction,
-            frozen_directions=self.frozen_directions
+            frozen_directions=self.frozen_directions,
+            prototype_bias=self.hyp_projector.prototype_bias,
+            frozen_biases=self.frozen_biases
         )
     
     def horospherical_loss_with_breakdown(self, hyp_embeddings):
@@ -288,7 +298,9 @@ class HypCustomYoloWorld(nn.Module):
             all_prototypes=self.prototypes, 
             all_biases=self.prototype_biases,
             prototype_direction=self.hyp_projector.prototype_direction,
-            frozen_directions=self.frozen_directions
+            frozen_directions=self.frozen_directions,
+            prototype_bias=self.hyp_projector.prototype_bias,
+            frozen_biases=self.frozen_biases
         )
     
     def head_loss(self, batch_inputs: Tensor, batch_data_samples: SampleList):
@@ -471,22 +483,8 @@ class HypCustomYoloWorld(nn.Module):
             if cfg.get('yolox_style', False):
                 cfg.max_per_img = len(result)
             
-            # Save ood_scores before post-process (NMS may drop them)
-            pre_nms_ood_scores = result.ood_scores.clone()
-            pre_nms_bboxes = result.bboxes.clone()
-            
+            # NMS + post-process (InstanceData preserves ood_scores through indexing)
             result = self.bbox_head._bbox_post_process(result, cfg, rescale=False, with_nms=True, img_meta=img_meta)
-            
-            # Restore ood_scores if lost during post-process
-            if not hasattr(result, 'ood_scores') or result.ood_scores is None:
-                # Match kept boxes to original boxes via IoU
-                from torchvision.ops import box_iou
-                if len(result.bboxes) > 0 and len(pre_nms_bboxes) > 0:
-                    iou = box_iou(result.bboxes, pre_nms_bboxes)
-                    matched_idx = iou.argmax(dim=1)
-                    result.ood_scores = pre_nms_ood_scores[matched_idx]
-                else:
-                    result.ood_scores = result.scores.new_zeros(len(result.scores))
             
             result.bboxes[:, 0::2].clamp_(0, img_meta['ori_shape'][1])
             result.bboxes[:, 1::2].clamp_(0, img_meta['ori_shape'][0])

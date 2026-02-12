@@ -146,9 +146,11 @@ env_cfg = dict(
     dist_cfg=dict(backend='nccl'),
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0))
 hyp_config = dict(
-    clip_r=0.95,
+    bias_reg_weight=0.1,
+    clip_r=2.0,
+    compactness_weight=0.05,
     curvature=1.0,
-    dispersion_weight=0.0,
+    dispersion_weight=0.1,
     embed_dim=256,
     hyp_loss_weight=1.0,
     init_protos='init_protos_t1.pt',
@@ -202,7 +204,7 @@ last_transform = [
         ),
         type='mmdet.PackDetInputs'),
 ]
-load_from = None
+load_from = 'yolo_world_v2_xl_obj365v1_goldg_cc3mlite_pretrain-5daf1395.pth'
 log_level = 'INFO'
 log_processor = dict(by_epoch=True, type='LogProcessor', window_size=50)
 loss_bbox_weight = 7.5

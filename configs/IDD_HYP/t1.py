@@ -27,11 +27,13 @@ hyp_config = dict(
     # Poincaré ball parameters
     curvature=1.0,           # c=1.0 means ball radius R=1/√c=1.0
     embed_dim=256,           # Hyperbolic embedding dimension
-    clip_r=0.95,             # Clip radius for ToPoincare (must be < R)
+    clip_r=2.0,              # Increased from 0.95: allow norm variation for OOD discrimination
     
     # Loss weights
     hyp_loss_weight=1.0,     # Weight for horospherical CE loss
-    dispersion_weight=0.0,   # T1: no dispersion needed (prototypes pre-separated)
+    dispersion_weight=0.1,   # Push prototype directions apart (was 0.0)
+    bias_reg_weight=0.1,     # L2 penalty on biases: prevent horosphere inflation
+    compactness_weight=0.05, # Pull known embeddings into their prototype horosphere
     
     # Prototype initialization (REQUIRED!)
     # Run: python init_prototypes.py --classes "car,motorcycle,..." --output init_protos_t1.pt

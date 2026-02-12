@@ -8,7 +8,6 @@ Objects with low max horosphere score → classified as unknown.
 import os
 import torch
 from tqdm import tqdm
-from torchvision.ops import nms
 
 from core import add_config
 from core.util.model_ema import add_model_ema_configs
@@ -149,9 +148,8 @@ if __name__ == "__main__":
                     if pred.ood_scores[k] > args.ood_threshold:
                         pred.labels[k] = unknown_index
             
-            # NMS
-            keep = nms(pred.bboxes, pred.scores, iou_threshold=0.5)
-            preds.append(pred[keep])
+            # NMS already applied inside model.predict() via _bbox_post_process
+            preds.append(pred)
         
         evaluator.process_mm(batch['data_samples'], preds, unknown_index, use_ood_score=True)
     
