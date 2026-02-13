@@ -19,7 +19,7 @@
 BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
 TASK="IDD_HYP/t1"
-CKPT="$BASE_DIR/IDD_HYP/t1/horospherical/model_45.pth"
+CKPT="$BASE_DIR/IDD_HYP/t1/horospherical_v2/model_25.pth"
 
 echo "=========================================="
 echo "UNKNOWN EMBEDDING ANALYSIS"

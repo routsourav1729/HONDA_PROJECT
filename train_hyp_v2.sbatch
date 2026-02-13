@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --time=26:00:00
 
 # ============================================================================
 # Hyperbolic YOLO-World V2 Training - With Regularization Fixes
@@ -66,6 +66,9 @@ export HF_HUB_OFFLINE=1
 
 # Disable tokenizers parallelism warning
 export TOKENIZERS_PARALLELISM=false
+
+# CRITICAL: Disable Python output buffering so we can see progress in slurm logs
+export PYTHONUNBUFFERED=1
 
 # Verify environment
 echo ""
