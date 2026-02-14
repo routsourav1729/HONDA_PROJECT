@@ -136,10 +136,6 @@ def main():
     test_time = time.time() - start
     print(f"  Completed in {test_time:.2f} seconds")
     
-    # Print results
-    print_stats(train_stats, "TRAIN SPLIT STATISTICS")
-    print_stats(test_stats, "TEST SPLIT STATISTICS")
-    
     # Combined stats
     combined_stats = defaultdict(int)
     for cls_name, count in train_stats.items():
@@ -147,14 +143,36 @@ def main():
     for cls_name, count in test_stats.items():
         combined_stats[cls_name] += count
     
-    print_stats(dict(combined_stats), "COMBINED (TRAIN + TEST) STATISTICS")
+    # Print combined table
+    print(f"\n{'='*72}")
+    print("FINAL CLASS DISTRIBUTION")
+    print(f"{'='*72}")
+    
+    all_classes = sorted(combined_stats.keys(), key=lambda c: combined_stats[c], reverse=True)
+    
+    print(f"\n{'Class':<22s} {'Train':>10s} {'Test':>10s} {'Combined':>10s} {'Test%':>7s}")
+    print("-" * 72)
+    
+    for cls in all_classes:
+        train_count = train_stats.get(cls, 0)
+        test_count = test_stats.get(cls, 0)
+        combined = combined_stats[cls]
+        test_pct = (test_count / combined * 100) if combined > 0 else 0
+        print(f"{cls:<22s} {train_count:>10,} {test_count:>10,} {combined:>10,} {test_pct:>6.1f}%")
+    
+    total_train = sum(train_stats.values())
+    total_test = sum(test_stats.values())
+    total_combined = sum(combined_stats.values())
+    
+    print("-" * 72)
+    print(f"{'TOTAL':<22s} {total_train:>10,} {total_test:>10,} {total_combined:>10,}")
     
     # Summary
-    print(f"\n{'='*60}")
+    print(f"\n{'='*72}")
     print("SUMMARY")
-    print(f"{'='*60}")
-    print(f"Train: {sum(train_stats.values()):,} objects, {len(train_stats)} classes")
-    print(f"Test:  {sum(test_stats.values()):,} objects, {len(test_stats)} classes")
+    print(f"{'='*72}")
+    print(f"Train: {total_train:,} objects, {len(train_stats)} classes")
+    print(f"Test:  {total_test:,} objects, {len(test_stats)} classes")
     print(f"Total time: {train_time + test_time:.2f} seconds")
     
     # Class comparison

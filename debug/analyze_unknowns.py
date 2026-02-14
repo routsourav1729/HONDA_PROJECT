@@ -153,9 +153,10 @@ def parse_all_xml_boxes(dataset_root, img_id, known_set):
 
 
 def collect_all_embeddings(model, data_loader, known_class_names, dataset_root,
-                           hyp_c, num_batches=100, samples_per_class=500):
+                           hyp_c):
     """
     Collect hyperbolic embeddings for BOTH known and unknown GT boxes.
+    Iterates through the ENTIRE dataloader — no subsampling.
 
     KEY INSIGHT: The mmengine YOLO dataloader only returns gt_instances for
     the 9 known classes. Unknown class objects are SILENTLY DROPPED.
@@ -170,11 +171,11 @@ def collect_all_embeddings(model, data_loader, known_class_names, dataset_root,
     This gives us true unknown subclass names (bus, truck, animal, etc.)
     rather than a single 'unknown' label.
     """
+    total_images = len(data_loader.dataset) if hasattr(data_loader, 'dataset') else '?'
     print(f"\n{'='*60}")
-    print(f"COLLECTING EMBEDDINGS (bypassing dataloader class filter)")
+    print(f"COLLECTING EMBEDDINGS — FULL DATASET (no subsampling)")
     print(f"  Known classes: {known_class_names}")
-    print(f"  Samples per class target: {samples_per_class}")
-    print(f"  Max batches: {num_batches}")
+    print(f"  Total images in dataloader: {total_images}")
     print(f"  Dataset root: {dataset_root}")
     print(f"{'='*60}")
 
@@ -182,11 +183,9 @@ def collect_all_embeddings(model, data_loader, known_class_names, dataset_root,
     known_set = set(known_class_names)
 
     class_data = defaultdict(lambda: {
-        'embeddings': [],
         'horo_scores_all': [],
         'max_horo_score': [],
         'assigned_proto': [],
-        'poincare_dists': [],
         'min_poincare_dist': [],
         'nearest_proto': [],
         'embedding_norm': [],
@@ -200,18 +199,13 @@ def collect_all_embeddings(model, data_loader, known_class_names, dataset_root,
     proto_inside = prototypes * 0.99
 
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(data_loader, desc="Collecting", total=num_batches)):
-            if i >= num_batches:
-                break
-
-            unk_count = sum(v for k, v in samples_count.items() if k not in known_set)
-            known_full = all(
-                samples_count.get(k, 0) >= samples_per_class for k in known_class_names
-            )
-            if known_full and unk_count >= samples_per_class * 3:
-                print(f"\n  Early stop at batch {i}: enough samples")
-                break
-
+        for i, batch in enumerate(tqdm(data_loader, desc="Collecting (full dataset)")):
+            # Log progress every 500 batches
+            if i > 0 and i % 500 == 0:
+                unk_total = sum(v for k, v in samples_count.items() if k not in known_set)
+                known_total = sum(v for k, v in samples_count.items() if k in known_set)
+                n_classes = len(samples_count)
+                tqdm.write(f"  [batch {i}] {n_classes} classes seen | known={known_total} | unknown={unk_total}")
             try:
                 data_batch = model.parent.data_preprocessor(batch)
 
@@ -250,9 +244,6 @@ def collect_all_embeddings(model, data_loader, known_class_names, dataset_root,
                         is_known = box_info['is_known']
                         cls_key = cls_name
 
-                        if samples_count[cls_key] >= samples_per_class:
-                            continue
-
                         ox1, oy1, ox2, oy2 = box_info['bbox']
 
                         # Map original coords to preprocessed image coords
@@ -287,11 +278,10 @@ def collect_all_embeddings(model, data_loader, known_class_names, dataset_root,
                         max_horo, assigned = horo_scores.max(dim=0)
                         min_dist, nearest = p_dists.min(dim=0)
 
-                        class_data[cls_key]['embeddings'].append(emb.cpu())
+                        # Skip raw embedding/poincare_dists storage to save memory on full dataset
                         class_data[cls_key]['horo_scores_all'].append(horo_scores.cpu())
                         class_data[cls_key]['max_horo_score'].append(max_horo.item())
                         class_data[cls_key]['assigned_proto'].append(assigned.item())
-                        class_data[cls_key]['poincare_dists'].append(p_dists.cpu())
                         class_data[cls_key]['min_poincare_dist'].append(min_dist.item())
                         class_data[cls_key]['nearest_proto'].append(nearest.item())
                         class_data[cls_key]['embedding_norm'].append(emb.norm().item())
@@ -783,8 +773,6 @@ if __name__ == "__main__":
     parser.add_argument("--hyp_dim", type=int, default=256)
     parser.add_argument("--clip_r", type=float, default=0.95)
     parser.add_argument("--output_dir", default="visualizations")
-    parser.add_argument("--num_batches", type=int, default=100)
-    parser.add_argument("--samples_per_class", type=int, default=500)
 
     args = parser.parse_args()
     print("Command Line Args:", args)
@@ -848,13 +836,11 @@ if __name__ == "__main__":
     print(f"  Biases: {[f'{b:.4f}' for b in biases.cpu().tolist()]}")
     print(f"  Classes: {known_class_names}")
 
-    # Collect embeddings — parses XML directly to get all boxes
+    # Collect embeddings — parses XML directly to get ALL boxes (full dataset)
     class_data, samples_count = collect_all_embeddings(
         model, test_loader, known_class_names,
         dataset_root='./datasets',
         hyp_c=args.hyp_c,
-        num_batches=args.num_batches,
-        samples_per_class=args.samples_per_class,
     )
 
     if not class_data:

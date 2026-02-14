@@ -62,6 +62,11 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
                 state_dict['hyp_projector.classifier.prototype_direction'])
             model.hyp_projector.classifier.prototype_bias = nn.Parameter(
                 state_dict['hyp_projector.classifier.prototype_bias'])
+            norms = F.normalize(model.hyp_projector.classifier.prototype_direction, dim=-1).norm(dim=-1)
+            print(f"  ✓ Prototypes loaded from checkpoint ({model.hyp_projector.classifier.num_classes} classes)")
+            print(f"    Biases: {[f'{b:.4f}' for b in model.hyp_projector.classifier.prototype_bias.tolist()]}")
+        else:
+            print(f"  ⚠ WARNING: No prototype_direction found in checkpoint — using random init!")
         return model
     
     # Training mode

@@ -42,15 +42,15 @@ class HorosphericalClassifier(nn.Module):
         self.embed_dim = embed_dim
         
         # Ideal prototype directions (normalized to boundary at runtime)
-        # Should be initialized from init_prototypes.py output!
+        # When loading from checkpoint, init_directions is None here but
+        # prototypes will be overwritten by load_hyp_ckpt() afterwards.
         if init_directions is not None:
             assert init_directions.shape == (num_classes, embed_dim), \
                 f"init_directions shape mismatch: {init_directions.shape} vs ({num_classes}, {embed_dim})"
             self.prototype_direction = nn.Parameter(init_directions.clone())
             print(f"  ✓ Prototype directions initialized from pre-computed tensor")
         else:
-            # Random fallback - only for testing!
-            print(f"  ⚠ WARNING: Random prototype initialization (use init_prototypes.py for training!)")
+            # Placeholder — will be overwritten if loading from checkpoint
             self.prototype_direction = nn.Parameter(torch.randn(num_classes, embed_dim))
         
         # Learnable bias per class - controls horosphere position

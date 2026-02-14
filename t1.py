@@ -204,7 +204,7 @@ last_transform = [
         ),
         type='mmdet.PackDetInputs'),
 ]
-load_from = 'yolo_world_v2_xl_obj365v1_goldg_cc3mlite_pretrain-5daf1395.pth'
+load_from = None
 log_level = 'INFO'
 log_processor = dict(by_epoch=True, type='LogProcessor', window_size=50)
 loss_bbox_weight = 7.5
