@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
-#SBATCH --time=01:00:00
+#SBATCH --time=04:00:00
 
 # ============================================================================
 # Unknown Embedding Analysis
@@ -60,9 +60,7 @@ python debug/analyze_unknowns.py \
     --hyp_c 1.0 \
     --hyp_dim 256 \
     --clip_r 0.95 \
-    --output_dir visualizations \
-    --num_batches 150 \
-    --samples_per_class 500
+    --output_dir visualizations
 
 echo ""
 echo "=========================================="
