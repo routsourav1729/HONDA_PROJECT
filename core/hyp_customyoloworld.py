@@ -474,9 +474,15 @@ class HypCustomYoloWorld(nn.Module):
             # Compute OOD scores (negative max horosphere score)
             kept_emb = hyp_emb[keep]
             horo_scores = self.compute_horosphere_scores(kept_emb)  # (N, K)
-            ood_scores = -horo_scores.max(dim=-1).values  # Higher = more OOD
+            max_horo, assigned_proto = horo_scores.max(dim=-1)  # max score & which prototype
+            ood_scores = -max_horo  # Higher = more OOD
             
-            result = InstanceData(scores=scores, labels=labels, bboxes=bboxes[keep], ood_scores=ood_scores)
+            result = InstanceData(
+                scores=scores, labels=labels, bboxes=bboxes[keep],
+                ood_scores=ood_scores,
+                horo_max_scores=max_horo,       # max horosphere score per detection
+                horo_assigned_proto=assigned_proto,  # which prototype gave max score
+            )
             
             # Rescale
             if rescale:

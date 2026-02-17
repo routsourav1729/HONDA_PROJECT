@@ -1,28 +1,29 @@
 #!/bin/bash
-#SBATCH --job-name=vis_simple
-#SBATCH --output=slurm_logs/vis_simple_%j.out
-#SBATCH --error=slurm_logs/vis_simple_%j.err
-#SBATCH --partition=dgx
-#SBATCH --qos=dgx
+#SBATCH --job-name=adaptive_thr
+#SBATCH --output=slurm_logs/adaptive_thr_%j.out
+#SBATCH --error=slurm_logs/adaptive_thr_%j.err
+#SBATCH --partition=l40
+#SBATCH --qos=l40
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
-#SBATCH --mem=32G
-#SBATCH --time=04:00:00
+#SBATCH --mem=48G
+#SBATCH --time=06:00:00
 
 # ============================================================================
-# Simple Poincaré Visualization
+# Adaptive Per-Prototype Threshold Analysis
+# Phase 1: Calibrate from TRAIN data (compute per-class mean/std)
+# Phase 2: Evaluate on TEST data with multiple alphas
 # ============================================================================
 
-# Base directory
 BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
 TASK="IDD_HYP/t1"
 CKPT="$BASE_DIR/IDD_HYP/t1/horospherical_v2/model_30.pth"
 
 echo "=========================================="
-echo "POINCARÉ VISUALIZATION"
+echo "ADAPTIVE THRESHOLD ANALYSIS"
 echo "=========================================="
 echo "Job started at: $(date)"
 echo "Checkpoint: $CKPT"
@@ -51,16 +52,16 @@ export TOKENIZERS_PARALLELISM=false
 
 cd /home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2
 
-mkdir -p visualizations
+mkdir -p visualizations/adaptive
 
-python debug/visualize_simple.py \
+python debug/adaptive_threshold_analysis.py \
     --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $CKPT \
     --hyp_c 1.0 \
     --hyp_dim 256 \
     --clip_r 0.95 \
-    --output_dir visualizations
+    --output_dir visualizations/adaptive
 
 echo ""
 echo "=========================================="

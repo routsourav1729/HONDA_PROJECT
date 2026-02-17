@@ -16,17 +16,25 @@
 # ============================================================================
 
 TASK="IDD_HYP/t1"
-CKPT="IDD_HYP/t1/horospherical/model_5.pth"
+CKPT="IDD_HYP/t1/horospherical_v2/model_30.pth"
 
 # Hyperbolic hyperparameters (must match training)
 # NOTE: For horospherical classifiers, c=1.0 (ball radius=1) is standard
 HYP_C=1.0
 HYP_DIM=256
 CLIP_R=0.95
-# OOD threshold - for horospherical: higher ood_score = more OOD
-# ood_score = -max(horosphere_score), so positive threshold is reasonable
-# Lower threshold = more unknowns (stricter), Higher = fewer unknowns (permissive)
+
+# ---- OOD Strategy (choose one) ----
+# Option A: Global threshold (legacy)
+#   OOD_THRESHOLD=0.0
+#   ADAPTIVE_ARGS=""
+
+# Option B: Adaptive per-prototype threshold (recommended)
+#   Uses calibration stats from debug/adaptive_threshold_analysis.py
 OOD_THRESHOLD=0.0
+ADAPTIVE_JSON="visualizations/adaptive/adaptive_stats_model_30.json"
+ALPHA=0.75
+ADAPTIVE_ARGS="--adaptive_threshold $ADAPTIVE_JSON --alpha $ALPHA"
 
 echo "=========================================="
 echo "HYPERBOLIC YOLO-WORLD EVALUATION"
@@ -73,7 +81,8 @@ python test_hyp.py \
     --hyp_c $HYP_C \
     --hyp_dim $HYP_DIM \
     --clip_r $CLIP_R \
-    --ood_threshold $OOD_THRESHOLD
+    --ood_threshold $OOD_THRESHOLD \
+    $ADAPTIVE_ARGS
 
 echo ""
 echo "=========================================="
