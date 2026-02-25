@@ -27,7 +27,9 @@ hyp_config = dict(
     # Poincaré ball parameters
     curvature=1.0,           # c=1.0 means ball radius R=1/√c=1.0
     embed_dim=256,           # Hyperbolic embedding dimension
-    clip_r=2.0,              # Increased from 0.95: allow norm variation for OOD discrimination
+    # clip_r controls max Euclidean norm before expmap0.
+    # tanh(clip_r) = max Poincaré norm. 3.0 → 0.995, giving full radial discrimination.
+    clip_r=3.0,
     
     # Loss weights
     hyp_loss_weight=1.0,     # Weight for horospherical CE loss

@@ -206,6 +206,10 @@ def main():
                         help='Iterations for uniform direction generation')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--base_protos', type=str, default='',
+                        help='Path to T1 checkpoint. If provided, extracts only novel directions.')
+    parser.add_argument('--num_base', type=int, default=0,
+                        help='Number of base classes (first N in --classes). Requires --base_protos.')
     args = parser.parse_args()
     
     # Parse class names
@@ -260,8 +264,26 @@ def main():
         'assignment': torch.tensor(assignment),
         'out_dim': D,
         'prompt_template': args.prompt_template,
+        'mode': 'all',
     }
-    
+
+    # T2+ mode: extract novel-only directions
+    if args.base_protos and args.num_base > 0:
+        print(f"\n=== T2 Mode: Extracting novel directions only ===")
+        ckpt = torch.load(args.base_protos, map_location='cpu')
+        state = ckpt.get('model_state_dict', ckpt)
+        base_dir_key = next((k for k in state if 'prototype_direction' in k), None)
+        assert base_dir_key is not None, f"No prototype_direction found in {args.base_protos}"
+        trained_base = F.normalize(state[base_dir_key][:args.num_base], dim=-1)
+        novel_directions = init_directions[args.num_base:]
+        cross_sim = (novel_directions @ trained_base.T).abs()
+        print(f"  Base: {args.num_base}, Novel: {novel_directions.shape[0]}")
+        print(f"  Cross |cos_sim|: max={cross_sim.max():.4f}, mean={cross_sim.mean():.4f}")
+        save_dict['init_directions'] = novel_directions
+        save_dict['base_directions'] = trained_base
+        save_dict['num_base'] = args.num_base
+        save_dict['mode'] = 'novel_only'
+
     torch.save(save_dict, args.output)
     print(f"\n✓ Saved to: {args.output}")
     print(f"  init_directions shape: {init_directions.shape}")

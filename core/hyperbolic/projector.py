@@ -103,34 +103,21 @@ class HorosphericalClassifier(nn.Module):
         max_scores = scores.max(dim=-1).values
         return -max_scores
     
-    def angular_dispersion_loss(self):
+    def uniform_dispersion_loss(self):
         """
-        Dispersion regularizer: penalizes prototype directions being too similar.
-        
-        Encourages prototype directions to spread out on the unit sphere.
-        Loss = mean(max(cos_sim - margin, 0)^2) for off-diagonal pairs.
-        
-        Returns
-        -------
-        tensor
-            Scalar dispersion loss
+        Uniform loss (Wang & Isola 2020 / Berg et al. IJCV 2025 Eq. 17).
+
+        L_unif = log( mean_{i≠j} exp(-||p_i - p_j||^2) )
+
+        Continuous gradient on ALL pairs; strongest for closest prototypes.
         """
-        # Get normalized directions
         directions = F.normalize(self.prototype_direction, dim=-1)  # (K, D)
-        
-        # Pairwise cosine similarities
-        cos_sim = directions @ directions.T  # (K, K)
-        
-        # Mask diagonal
         K = directions.shape[0]
+        if K <= 1:
+            return directions.new_tensor(0.0)
+        dist_sq = torch.cdist(directions, directions).pow(2)  # (K, K)
         mask = ~torch.eye(K, dtype=torch.bool, device=directions.device)
-        off_diag = cos_sim[mask]
-        
-        # Hinge loss: penalize similarities above margin (e.g., 0.5)
-        margin = 0.5
-        violations = F.relu(off_diag - margin)
-        
-        return violations.pow(2).mean()
+        return torch.log(torch.exp(-dist_sq[mask]).mean())
 
 
 class HorosphericalLoss(nn.Module):
@@ -167,34 +154,20 @@ class HorosphericalLoss(nn.Module):
     
     def direction_dispersion_loss(self, prototype_direction, frozen_directions=None):
         """
-        Penalize cosine similarity between prototype directions.
-        
-        For T2+, also includes cross-similarity between new and frozen directions
-        to prevent new prototypes from collapsing onto frozen ones.
-        
-        Parameters
-        ----------
-        prototype_direction : tensor (K_new, D)
-            Trainable prototype directions
-        frozen_directions : tensor (K_frozen, D), optional
-            Frozen directions from previous tasks (T2+)
+        Uniform loss (Wang & Isola 2020 / Berg et al. IJCV 2025 Eq. 17).
+        Continuous repulsion on ALL pairs; includes cross-repulsion at T2+.
         """
         dirs = F.normalize(prototype_direction, dim=-1)  # (K_new, D)
-        
-        # Self-dispersion among trainable prototypes
-        sim = dirs @ dirs.T  # (K_new, K_new)
-        K = dirs.shape[0]
-        mask = ~torch.eye(K, dtype=torch.bool, device=dirs.device)
-        self_disp = sim[mask].pow(2).mean() if K > 1 else dirs.new_tensor(0.0)
-        
-        # Cross-dispersion with frozen (T2+)
         if frozen_directions is not None and frozen_directions.numel() > 0:
-            frozen = F.normalize(frozen_directions, dim=-1)  # (K_frozen, D)
-            cross_sim = dirs @ frozen.T  # (K_new, K_frozen)
-            cross_disp = cross_sim.pow(2).mean()
-            return self_disp + cross_disp
-        
-        return self_disp
+            all_dirs = torch.cat([dirs, F.normalize(frozen_directions, dim=-1)], dim=0)
+        else:
+            all_dirs = dirs
+        K = all_dirs.shape[0]
+        if K <= 1:
+            return dirs.new_tensor(0.0)
+        dist_sq = torch.cdist(all_dirs, all_dirs).pow(2)
+        mask = ~torch.eye(K, dtype=torch.bool, device=dirs.device)
+        return torch.log(torch.exp(-dist_sq[mask]).mean())
     
     def bias_regularization(self, prototype_bias, frozen_biases=None):
         """
@@ -452,24 +425,27 @@ class HyperbolicProjector(nn.Module):
         self.num_classes = num_classes
         self.clip_r = clip_r
         
-        # Per-scale Conv projectors
+        # Per-scale depthwise-separable projectors
         self.proj_p3 = nn.Sequential(
-            nn.Conv2d(in_dims[0], in_dims[0], kernel_size=1, bias=False),
+            nn.Conv2d(in_dims[0], in_dims[0], kernel_size=3, padding=1,
+                      groups=in_dims[0], bias=False),
             nn.SyncBatchNorm(in_dims[0]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_dims[0], out_dim, kernel_size=1, bias=False)
+            nn.GELU(),
+            nn.Conv2d(in_dims[0], out_dim, kernel_size=1, bias=False),
         )
         self.proj_p4 = nn.Sequential(
-            nn.Conv2d(in_dims[1], in_dims[1], kernel_size=1, bias=False),
+            nn.Conv2d(in_dims[1], in_dims[1], kernel_size=3, padding=1,
+                      groups=in_dims[1], bias=False),
             nn.SyncBatchNorm(in_dims[1]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_dims[1], out_dim, kernel_size=1, bias=False)
+            nn.GELU(),
+            nn.Conv2d(in_dims[1], out_dim, kernel_size=1, bias=False),
         )
         self.proj_p5 = nn.Sequential(
-            nn.Conv2d(in_dims[2], in_dims[2], kernel_size=1, bias=False),
+            nn.Conv2d(in_dims[2], in_dims[2], kernel_size=3, padding=1,
+                      groups=in_dims[2], bias=False),
             nn.SyncBatchNorm(in_dims[2]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_dims[2], out_dim, kernel_size=1, bias=False)
+            nn.GELU(),
+            nn.Conv2d(in_dims[2], out_dim, kernel_size=1, bias=False),
         )
         
         # ToPoincare layer
@@ -503,6 +479,9 @@ class HyperbolicProjector(nn.Module):
             elif isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+        # Near-zero init for final pointwise conv → embeddings start near origin
+        for proj in (self.proj_p3, self.proj_p4, self.proj_p5):
+            nn.init.normal_(proj[-1].weight, mean=0, std=0.01)
     
     @property
     def prototypes(self):

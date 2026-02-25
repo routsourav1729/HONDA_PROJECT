@@ -145,27 +145,26 @@ else:
 
 print("    ✓ Gradients flow correctly")
 
-# 8. Test dispersion loss
-print("\n[8] Testing angular dispersion loss...")
-disp_loss = projector.classifier.angular_dispersion_loss()
-print(f"    Dispersion loss: {disp_loss.item():.6f}")
-assert disp_loss.item() >= 0, "Dispersion loss should be non-negative"
+# 8. Test uniform dispersion loss
+print("\n[8] Testing uniform dispersion loss...")
+disp_loss = projector.classifier.uniform_dispersion_loss()
+print(f"    Dispersion loss: {disp_loss.item():.6f} (negative = well-separated)")
+assert not torch.isnan(disp_loss), "Dispersion loss is NaN!"
 
 # Force some prototypes to be similar to test gradient
 with torch.no_grad():
     projector.classifier.prototype_direction.data[0] = projector.classifier.prototype_direction.data[1] * 0.9
 
-disp_loss_forced = projector.classifier.angular_dispersion_loss()
+disp_loss_forced = projector.classifier.uniform_dispersion_loss()
 print(f"    Dispersion loss (forced similar protos): {disp_loss_forced.item():.6f}")
+assert disp_loss_forced > disp_loss, "Forced-similar protos should increase (less negative) loss"
 
 projector.zero_grad()
 disp_loss_forced.backward()
 disp_grad = projector.classifier.prototype_direction.grad
-if disp_grad is not None and disp_grad.norm() > 0:
-    print(f"    Dispersion grad norm: {disp_grad.norm():.6f}")
-else:
-    print(f"    Dispersion grad norm: 0 (no violations above margin)")
-print("    ✓ Dispersion loss correct")
+assert disp_grad is not None and disp_grad.norm() > 0, "No gradient from uniform dispersion!"
+print(f"    Dispersion grad norm: {disp_grad.norm():.6f}")
+print("    ✓ Uniform dispersion loss correct")
 
 # 9. Test edge cases
 print("\n[9] Testing edge cases...")

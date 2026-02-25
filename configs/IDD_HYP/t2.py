@@ -28,7 +28,7 @@ hyp_config = dict(
     # Poincaré ball parameters (MUST match T1!)
     curvature=1.0,           # c=1.0 means ball radius R=1/√c=1.0
     embed_dim=256,           # Hyperbolic embedding dimension
-    clip_r=0.95,             # Clip radius for ToPoincare (must be < R)
+    clip_r=3.0,              # Must match T1
     
     # Loss weights
     hyp_loss_weight=1.0,     # Weight for horospherical CE loss
@@ -118,7 +118,7 @@ train_pipeline = [
     dict(
         meta_keys=(
             'img_id',
-            'img_c',
+            'img_path',
             'ori_shape',
             'img_shape',
             'scale_factor',

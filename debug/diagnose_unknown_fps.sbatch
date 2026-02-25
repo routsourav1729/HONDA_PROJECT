@@ -2,10 +2,12 @@
 #SBATCH --job-name=diagnose_unk
 #SBATCH --output=slurm_logs/diagnose_unk_%j.out
 #SBATCH --error=slurm_logs/diagnose_unk_%j.err
-#SBATCH --partition=cpu
+#SBATCH --partition=l40
+#SBATCH --qos=l40
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:1
 #SBATCH --mem=16G
 #SBATCH --time=00:30:00
 

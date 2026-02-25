@@ -66,6 +66,9 @@ export HF_HUB_OFFLINE=1
 # Disable tokenizers parallelism warning
 export TOKENIZERS_PARALLELISM=false
 
+# Ensure real-time output in slurm logs
+export PYTHONUNBUFFERED=1
+
 # Verify environment
 echo ""
 echo "Environment Information:"
