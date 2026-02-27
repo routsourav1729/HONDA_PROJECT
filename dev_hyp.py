@@ -6,14 +6,17 @@ Uses HypCustomYoloWorld with horospherical classification.
 """
 
 import os
+import time
 import torch
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from core import DatasetMapper, add_config
 from core.util.model_ema import add_model_ema_configs
 from core.pascal_voc import register_pascal_voc, inital_prompts
 from core.hyp_customyoloworld import HypCustomYoloWorld, load_hyp_ckpt
+from core.calibrate_thresholds import calibrate
 from core.eval_utils import Trainer
 
 from mmengine.config import Config
@@ -56,14 +59,20 @@ def setup(args):
     return cfg
 
 
-def save_model(model, optimizer, epoch, save_dir, file_name="model", actual_epoch=None):
+def save_model(model, optimizer, epoch, save_dir, file_name="model",
+               actual_epoch=None, adaptive_stats=None, hyp_config=None):
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f"{file_name}_{epoch}.pth")
-    torch.save({
+    save_dict = {
         'epoch': actual_epoch if actual_epoch is not None else epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-    }, path)
+    }
+    if adaptive_stats is not None:
+        save_dict['adaptive_stats'] = adaptive_stats
+    if hyp_config is not None:
+        save_dict['hyp_config'] = hyp_config
+    torch.save(save_dict, path)
     print(f"Model saved to {path}")
 
 
@@ -235,12 +244,15 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Trainable: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
     
-    # Optimizer
+    # Optimizer + LR schedule
+    PROTO_FREEZE_EPOCHS = 0  # Co-train prototypes from epoch 0 (freeze caused cold-start trap)
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfgY.base_lr, weight_decay=cfgY.weight_decay
     )
-    print(f"Optimizer: AdamW, LR={cfgY.base_lr}")
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfgY.max_epochs, eta_min=1e-6)
+    print(f"Optimizer: AdamW, LR={cfgY.base_lr}, CosineAnnealing to 1e-6")
+    print(f"Prototype freeze: epochs 0-{PROTO_FREEZE_EPOCHS - 1}")
 
     wb = None
     if args.wandb:
@@ -258,7 +270,20 @@ if __name__ == "__main__":
     gs = 0
     # Training loop
     for epoch in range(start_epoch, cfgY.max_epochs):
+        epoch_start = time.time()
         print(f"\n=== Epoch {epoch} ===")
+
+        # Prototype freeze/unfreeze
+        if epoch < PROTO_FREEZE_EPOCHS:
+            model.hyp_projector.classifier.prototype_direction.requires_grad_(False)
+            model.hyp_projector.classifier.prototype_bias.requires_grad_(False)
+            if epoch == start_epoch:
+                print(f"  [Prototype FROZEN] epochs 0-{PROTO_FREEZE_EPOCHS - 1}")
+        elif epoch == PROTO_FREEZE_EPOCHS:
+            model.hyp_projector.classifier.prototype_direction.requires_grad_(True)
+            model.hyp_projector.classifier.prototype_bias.requires_grad_(True)
+            print(f"  [Prototype UNFROZEN] from epoch {epoch}")
+
         epoch_loss = {'cls': 0, 'dfl': 0, 'bbox': 0, 'horo': 0}
         steps = 0
         
@@ -330,16 +355,42 @@ if __name__ == "__main__":
             steps += 1
             gs += 1
         
+        # LR schedule step
+        scheduler.step()
+
         # Epoch summary
         n = max(steps, 1)
-        print(f"✓ Epoch {epoch} done | Avg: cls={epoch_loss['cls']/n:.4f} bbox={epoch_loss['bbox']/n:.4f} horo={epoch_loss['horo']/n:.4f}")
+        epoch_time = time.time() - epoch_start
+        print(f"✓ Epoch {epoch} done ({epoch_time/60:.1f} min) | Avg: cls={epoch_loss['cls']/n:.4f} bbox={epoch_loss['bbox']/n:.4f} horo={epoch_loss['horo']/n:.4f}")
+        print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
         
         # Save checkpoints
         if epoch % 5 == 0:
             save_model(model, optimizer, epoch, save_dir)
         save_model(model, optimizer, 'latest', save_dir, actual_epoch=epoch)
     
-    save_model(model, optimizer, 'final', save_dir)
+    # =========================================================================
+    # Post-training: calibrate adaptive thresholds (model already in GPU)
+    # =========================================================================
+    print("\n=== Calibrating Adaptive Thresholds (post-training) ===")
+    adaptive_stats = calibrate(
+        model, train_loader, class_names,
+        dataset_root='./datasets',
+        hyp_c=hyp_c,
+    )
+
+    # Store hyp config so test_hyp.py can auto-configure
+    hyp_config_dict = {
+        'curvature': hyp_c,
+        'embed_dim': hyp_dim,
+        'clip_r': clip_r,
+    }
+
+    # Save final checkpoint WITH embedded thresholds + config
+    save_model(model, optimizer, 'final', save_dir,
+               adaptive_stats=adaptive_stats, hyp_config=hyp_config_dict)
     print("\n=== Training Complete ===")
+    print(f"  Adaptive thresholds embedded in model_final.pth")
+    print(f"  hyp_config: c={hyp_c}, dim={hyp_dim}, clip_r={clip_r}")
     if wb:
         wb.finish()

@@ -20,7 +20,8 @@
 BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
 TASK="IDD_HYP/t1"
-CKPT="$BASE_DIR/IDD_HYP/t1/horospherical_v2/model_30.pth"
+# Change this to match the model you want to calibrate!
+CKPT="$BASE_DIR/IDD_HYP/t1/horospherical_15epoch/model_final.pth"
 
 echo "=========================================="
 echo "ADAPTIVE THRESHOLD ANALYSIS"
@@ -60,7 +61,7 @@ python debug/adaptive_threshold_analysis.py \
     --ckpt $CKPT \
     --hyp_c 1.0 \
     --hyp_dim 256 \
-    --clip_r 0.95 \
+    --clip_r 3.0 \
     --output_dir visualizations/adaptive
 
 echo ""

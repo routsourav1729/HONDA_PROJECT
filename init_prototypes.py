@@ -12,15 +12,15 @@ Steps:
 4. Save the assigned directions for use in training
 
 Usage:
-    # For T1 (9 classes):
+    # For T1 (8 classes):
     python init_prototypes.py \
-        --classes "car,motorcycle,rider,person,autorickshaw,traffic sign,traffic light,pole,bicycle" \
+        --classes "car,motorcycle,rider,person,autorickshaw,bicycle,traffic sign,traffic light" \
         --out_dim 256 \
         --output init_protos_t1.pt
     
     # For T2 (14 classes):
     python init_prototypes.py \
-        --classes "car,motorcycle,rider,person,autorickshaw,traffic sign,traffic light,pole,bicycle,bus,truck,tanker_vehicle,tractor,street_cart" \
+        --classes "car,motorcycle,rider,person,autorickshaw,bicycle,traffic sign,traffic light,bus,truck,tanker_vehicle,crane_truck,street_cart,excavator" \
         --out_dim 256 \
         --output init_protos_t2.pt
 """

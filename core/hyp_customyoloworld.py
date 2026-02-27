@@ -282,8 +282,6 @@ class HypCustomYoloWorld(nn.Module):
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0)
         scores = self.compute_horosphere_scores(hyp_embeddings)
-        # Pass prototype_direction + frozen_directions for dispersion loss (including cross-dispersion at T2+)
-        # Pass prototype_bias + frozen_biases for bias L2 regularization
         return self.hyp_loss_fn(
             scores, self.tmp_labels,
             prototype_direction=self.hyp_projector.prototype_direction,
@@ -297,7 +295,6 @@ class HypCustomYoloWorld(nn.Module):
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0), {}
         scores = self.compute_horosphere_scores(hyp_embeddings)
-        # Pass full prototypes/biases + directions for accurate breakdown at T2+
         return self.hyp_loss_fn.forward_with_breakdown(
             scores, self.tmp_labels, 
             all_prototypes=self.prototypes, 

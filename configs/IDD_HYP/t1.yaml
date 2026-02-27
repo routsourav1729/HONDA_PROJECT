@@ -5,7 +5,7 @@ MODEL:
     DEPTH: 50
     STRIDE_IN_1X1: False
   NUM_PROPOSALS: 500
-  NUM_CLASSES: 10                    # 9 known + 1 unknown for IDD T1                  
+  NUM_CLASSES: 9                     # 8 known + 1 unknown for IDD T1                  
 DATASETS:
   TRAIN: ("my_train",)
   TEST: ("my_val",)
@@ -15,7 +15,7 @@ SOLVER:
 TEST:
   EVAL_PERIOD: 20000
   PREV_INTRODUCED_CLS: 0
-  CUR_INTRODUCED_CLS: 9              # 9 base classes for IDD T1
+  CUR_INTRODUCED_CLS: 8              # 8 base classes for IDD T1
 INPUT:
   CROP:
     ENABLED: True

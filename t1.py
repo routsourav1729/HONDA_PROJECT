@@ -88,7 +88,7 @@ custom_hooks = [
         type='EMAHook',
         update_buffers=True),
     dict(
-        switch_epoch=48,
+        switch_epoch=23,
         switch_pipeline=[
             dict(backend_args=None, type='LoadImageFromFile'),
             dict(scale=(
@@ -134,7 +134,7 @@ default_hooks = dict(
     logger=dict(interval=50, type='LoggerHook'),
     param_scheduler=dict(
         lr_factor=0.01,
-        max_epochs=50,
+        max_epochs=25,
         scheduler_type='linear',
         type='YOLOv5ParamSchedulerHook'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
@@ -147,8 +147,8 @@ env_cfg = dict(
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0))
 hyp_config = dict(
     bias_reg_weight=0.1,
-    clip_r=2.0,
-    compactness_weight=0.05,
+    clip_r=3.0,
+    compactness_weight=0.0,
     curvature=1.0,
     dispersion_weight=0.1,
     embed_dim=256,
@@ -212,7 +212,7 @@ loss_cls_weight = 0.5
 loss_dfl_weight = 0.375
 lr_factor = 0.01
 max_aspect_ratio = 120
-max_epochs = 50
+max_epochs = 25
 max_keep_ckpts = 2
 mixup_prob = 0.15
 model = dict(
@@ -526,11 +526,11 @@ train_batch_size_per_gpu = 32
 train_cfg = dict(
     dynamic_intervals=[
         (
-            48,
+            23,
             1,
         ),
     ],
-    max_epochs=50,
+    max_epochs=25,
     type='EpochBasedTrainLoop',
     val_interval=10)
 train_data_prefix = 'train2017/'
@@ -775,8 +775,8 @@ trlder = dict(
                 type='mmdet.PackDetInputs'),
         ],
         type='YOLOv5VOCDataset'),
-    num_workers=2,
-    persistent_workers=False,
+    num_workers=8,
+    persistent_workers=True,
     pin_memory=True,
     sampler=dict(shuffle=True, type='DefaultSampler'))
 tta_model = dict(

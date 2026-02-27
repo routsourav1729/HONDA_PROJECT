@@ -5,8 +5,8 @@ custom_imports = dict(imports=['yolo_world'],
 
 # hyper-parameters
 num_classes = 1203
-num_training_classes = 9  # IDD base classes (not COCO's 80)
-max_epochs = 50  # Maximum training epochs (matched to nu-OWODB)
+num_training_classes = 8  # IDD base classes (not COCO's 80)
+max_epochs = 25  # 25 epochs for full convergence
 close_mosaic_epochs = 2
 save_epoch_intervals = 2
 text_channels = 512
@@ -35,7 +35,7 @@ hyp_config = dict(
     hyp_loss_weight=1.0,     # Weight for horospherical CE loss
     dispersion_weight=0.1,   # Push prototype directions apart (was 0.0)
     bias_reg_weight=0.1,     # L2 penalty on biases: prevent horosphere inflation
-    compactness_weight=0.05, # Pull known embeddings into their prototype horosphere
+    compactness_weight=0.0,  # OFF: CE already handles this; compactness inflated biases
     
     # Prototype initialization (REQUIRED!)
     # Run: python init_prototypes.py --classes "car,motorcycle,..." --output init_protos_t1.pt
@@ -135,17 +135,16 @@ test_pipeline = [
                     'scale_factor', 'pad_param'))
 ]
 
-# IDD T1 classes - 9 base classes
+# IDD T1 classes - 8 base classes
 classes = (
     "car",
     "motorcycle",
     "rider",
     "person",
     "autorickshaw",
+    "bicycle",
     "traffic sign",
     "traffic light",
-    "pole",
-    "bicycle"
 )
 
 voc_dataset_eval = dict(
@@ -195,8 +194,8 @@ trlder = dict(
                 type='mmdet.PackDetInputs'),
         ],
         type='YOLOv5VOCDataset'),
-        num_workers=2,
-        persistent_workers=False,
+        num_workers=8,
+        persistent_workers=True,
         pin_memory=True,
         sampler=dict(shuffle=True, type='DefaultSampler')
         )

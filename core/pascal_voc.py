@@ -165,8 +165,8 @@ VOC_COCO_CLASS_NAMES["nu-prompt"] = tuple(
 # =============================================================================
 # IDD Open World Detection Configuration
 # =============================================================================
-# Base T1 (9 classes): Known classes trained in first task
-# Novel T2 (5 classes): Few-shot classes introduced in second task  
+# Base T1 (8 classes): Known classes trained in first task
+# Novel T2 (6 classes): Few-shot classes introduced in second task  
 # Unknown (6 classes): Remain unknown throughout training
 # =============================================================================
 
@@ -176,10 +176,9 @@ IDD_T1_CLASS_NAMES = [
     "rider",
     "person",
     "autorickshaw",
+    "bicycle",
     "traffic sign",
     "traffic light",
-    "pole",
-    "bicycle"
 ]
 VOC_COCO_CLASS_NAMES["IDD"] = tuple(itertools.chain(IDD_T1_CLASS_NAMES, UNK_CLASS))
 
@@ -189,14 +188,15 @@ IDD_T2_CLASS_NAMES = [
     "bus",
     "truck",
     "tanker_vehicle",
-    "tractor",
-    "street_cart"
+    "crane_truck",
+    "street_cart",
+    "excavator",
 ]
 # T2 = base classes (T1) + novel classes (T2) + unknown
 VOC_COCO_CLASS_NAMES["IDD_T2"] = tuple(itertools.chain(IDD_T1_CLASS_NAMES, IDD_T2_CLASS_NAMES, UNK_CLASS))
 
 # Classes that remain UNKNOWN throughout evaluation:
-# animal, pull_cart, road_roller, concrete_mixer, crane_truck, excavator
+# animal, pull_cart, road_roller, pole, tractor, concrete_mixer
 # These will be detected as "unknown" by the OOD detector
 
 def load_voc_instances(dirname: str, split: str, class_names: Union[List[str], Tuple[str, ...]], cfg):

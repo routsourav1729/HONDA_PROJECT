@@ -479,9 +479,9 @@ class HyperbolicProjector(nn.Module):
             elif isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-        # Near-zero init for final pointwise conv → embeddings start near origin
-        for proj in (self.proj_p3, self.proj_p4, self.proj_p5):
-            nn.init.normal_(proj[-1].weight, mean=0, std=0.01)
+        # Standard Kaiming init for all convs (no near-zero override)
+        # Near-zero init caused cold-start trap: embeddings near origin
+        # are equidistant from all boundary prototypes → no gradient signal
     
     @property
     def prototypes(self):

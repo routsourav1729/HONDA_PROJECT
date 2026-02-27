@@ -4,9 +4,9 @@ custom_imports = dict(imports=['yolo_world'],
                       allow_failed_imports=False)
 
 # hyper-parameters for few-shot fine-tuning
-# IDD T2: 9 base + 5 novel = 14 known classes (+1 unknown for test)
+# IDD T2: 8 base + 6 novel = 14 known classes (+1 unknown for test)
 num_classes = 1203  # For test-time text prompting
-num_training_classes = 15  # 15 classes for training (9 base + 5 novel + 1 unknown)
+num_training_classes = 15  # 15 classes for training (8 base + 6 novel + 1 unknown)
 max_epochs = 50  # Same as nu-OWODB reference
 close_mosaic_epochs = 2
 save_epoch_intervals = 2
@@ -34,8 +34,8 @@ hyp_config = dict(
     hyp_loss_weight=1.0,     # Weight for horospherical CE loss
     dispersion_weight=0.1,   # T2: enable cross-dispersion to separate new from frozen
     
-    # Prototype initialization for NEW classes (5 novel)
-    # Run: python init_prototypes.py --classes "truck,bus,train,animal,caravan" --output init_protos_t2.pt
+    # Prototype initialization for NEW classes (6 novel)
+    # Run: python init_prototypes.py --classes "bus,truck,tanker_vehicle,crane_truck,street_cart,excavator" --output init_protos_t2.pt
     init_protos='init_protos_t2.pt',
     
     # Previous task checkpoint (T1 model)
@@ -134,7 +134,7 @@ test_pipeline = [
                     'scale_factor', 'pad_param'))
 ]
 
-# IDD T2 classes: 9 base + 5 novel + 1 unknown = 15 total classes
+# IDD T2 classes: 8 base + 6 novel + 1 unknown = 15 total classes
 classes = (
     # Base classes (from T1)
     "car",
@@ -142,16 +142,16 @@ classes = (
     "rider",
     "person",
     "autorickshaw",
+    "bicycle",
     "traffic sign",
     "traffic light",
-    "pole",
-    "bicycle",
     # Novel classes (new in T2)
     "bus",
     "truck",
     "tanker_vehicle",
-    "tractor",
+    "crane_truck",
     "street_cart",
+    "excavator",
     # Unknown class
     "unknown"
 )
