@@ -6,26 +6,32 @@
 #SBATCH --qos=l40
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
-#SBATCH --mem=32G
-#SBATCH --time=04:00:00
+#SBATCH --mem=64G
+#SBATCH --time=06:00:00
 
 # ============================================================================
-# Unknown Embedding Analysis
-# Projects all test embeddings (known + unknown) and computes stats
+# Unknown Embedding Analysis (train split)
+# Projects all train embeddings (known + unknown) and computes stats
+# + 2D Poincare ball visualization with horospheres
 # ============================================================================
 
 BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
 TASK="IDD_HYP/t1"
-CKPT="$BASE_DIR/IDD_HYP/t1/horospherical_v2/model_30.pth"
+CKPT="$BASE_DIR/IDD_HYP/t1/my_experiment/model_final.pth"
+# clip_r MUST match the value used during training
+CLIP_R=3.0
+SPLIT="train"
 
 echo "=========================================="
-echo "UNKNOWN EMBEDDING ANALYSIS"
+echo "UNKNOWN EMBEDDING ANALYSIS ($SPLIT)"
 echo "=========================================="
 echo "Job started at: $(date)"
 echo "Checkpoint: $CKPT"
+echo "clip_r: $CLIP_R"
+echo "Split: $SPLIT"
 echo "=========================================="
 
 # Activate conda environment
@@ -59,7 +65,8 @@ python debug/analyze_unknowns.py \
     --ckpt $CKPT \
     --hyp_c 1.0 \
     --hyp_dim 256 \
-    --clip_r 0.95 \
+    --clip_r $CLIP_R \
+    --split $SPLIT \
     --output_dir visualizations
 
 echo ""

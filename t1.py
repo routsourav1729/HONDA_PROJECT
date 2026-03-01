@@ -73,10 +73,9 @@ classes = (
     'rider',
     'person',
     'autorickshaw',
+    'bicycle',
     'traffic sign',
     'traffic light',
-    'pole',
-    'bicycle',
 )
 close_mosaic_epochs = 2
 custom_hooks = [
@@ -88,7 +87,7 @@ custom_hooks = [
         type='EMAHook',
         update_buffers=True),
     dict(
-        switch_epoch=23,
+        switch_epoch=38,
         switch_pipeline=[
             dict(backend_args=None, type='LoadImageFromFile'),
             dict(scale=(
@@ -134,7 +133,7 @@ default_hooks = dict(
     logger=dict(interval=50, type='LoggerHook'),
     param_scheduler=dict(
         lr_factor=0.01,
-        max_epochs=25,
+        max_epochs=40,
         scheduler_type='linear',
         type='YOLOv5ParamSchedulerHook'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
@@ -147,8 +146,8 @@ env_cfg = dict(
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0))
 hyp_config = dict(
     bias_reg_weight=0.1,
-    clip_r=3.0,
-    compactness_weight=0.0,
+    clip_r=1.0,
+    compactness_weight=0.05,
     curvature=1.0,
     dispersion_weight=0.1,
     embed_dim=256,
@@ -212,7 +211,7 @@ loss_cls_weight = 0.5
 loss_dfl_weight = 0.375
 lr_factor = 0.01
 max_aspect_ratio = 120
-max_epochs = 25
+max_epochs = 40
 max_keep_ckpts = 2
 mixup_prob = 0.15
 model = dict(
@@ -250,7 +249,7 @@ model = dict(
                 512,
             ],
             norm_cfg=dict(eps=0.001, momentum=0.03, type='BN'),
-            num_classes=9,
+            num_classes=8,
             reg_max=16,
             type='YOLOWorldHeadModule',
             use_bn_head=True,
@@ -323,7 +322,7 @@ model = dict(
         type='YOLOWorldPAFPN',
         widen_factor=1.5),
     num_test_classes=1203,
-    num_train_classes=9,
+    num_train_classes=8,
     test_cfg=dict(
         max_per_img=300,
         multi_label=True,
@@ -335,7 +334,7 @@ model = dict(
             alpha=0.5,
             beta=6.0,
             eps=1e-09,
-            num_classes=9,
+            num_classes=8,
             topk=10,
             type='BatchTaskAlignedAssigner',
             use_ciou=True)),
@@ -390,7 +389,7 @@ neck_num_heads = [
 norm_cfg = dict(eps=0.001, momentum=0.03, type='BN')
 num_classes = 1203
 num_det_layers = 3
-num_training_classes = 9
+num_training_classes = 8
 ood_threshold = 4.0
 optim_wrapper = dict(
     clip_grad=dict(max_norm=10.0),
@@ -501,7 +500,7 @@ text_channels = 512
 text_model_name = 'openai/clip-vit-base-patch32'
 text_transform = [
     dict(
-        max_num_samples=9,
+        max_num_samples=8,
         num_neg_samples=(
             1203,
             1203,
@@ -526,11 +525,11 @@ train_batch_size_per_gpu = 32
 train_cfg = dict(
     dynamic_intervals=[
         (
-            23,
+            38,
             1,
         ),
     ],
-    max_epochs=25,
+    max_epochs=40,
     type='EpochBasedTrainLoop',
     val_interval=10)
 train_data_prefix = 'train2017/'
@@ -743,10 +742,9 @@ trlder = dict(
                 'rider',
                 'person',
                 'autorickshaw',
+                'bicycle',
                 'traffic sign',
                 'traffic light',
-                'pole',
-                'bicycle',
             )),
         pipeline=[
             dict(backend_args=None, type='LoadImageFromFile'),

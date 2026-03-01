@@ -2,13 +2,13 @@
 #SBATCH --job-name=hyp_ddp
 #SBATCH --output=slurm_logs/hyp_ddp_%j.out
 #SBATCH --error=slurm_logs/hyp_ddp_%j.err
-#SBATCH --partition=l40
-#SBATCH --qos=l40
+#SBATCH --partition=dgx
+#SBATCH --qos=dgx
+#SBATCH --exclude=cn15-dgx
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:2
-# ^^^ CHANGE gpu:N to match NUM_GPUS argument below (e.g. gpu:4 for 4 GPUs)
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
 

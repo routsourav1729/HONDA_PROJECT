@@ -273,16 +273,14 @@ if __name__ == "__main__":
         epoch_start = time.time()
         print(f"\n=== Epoch {epoch} ===")
 
-        # Prototype freeze/unfreeze
+        # Prototype bias freeze/unfreeze (directions are permanently frozen as buffer)
         if epoch < PROTO_FREEZE_EPOCHS:
-            model.hyp_projector.classifier.prototype_direction.requires_grad_(False)
             model.hyp_projector.classifier.prototype_bias.requires_grad_(False)
             if epoch == start_epoch:
-                print(f"  [Prototype FROZEN] epochs 0-{PROTO_FREEZE_EPOCHS - 1}")
+                print(f"  [Bias FROZEN] epochs 0-{PROTO_FREEZE_EPOCHS - 1} (directions always frozen)")
         elif epoch == PROTO_FREEZE_EPOCHS:
-            model.hyp_projector.classifier.prototype_direction.requires_grad_(True)
             model.hyp_projector.classifier.prototype_bias.requires_grad_(True)
-            print(f"  [Prototype UNFROZEN] from epoch {epoch}")
+            print(f"  [Bias UNFROZEN] from epoch {epoch} (directions always frozen)")
 
         epoch_loss = {'cls': 0, 'dfl': 0, 'bbox': 0, 'horo': 0}
         steps = 0

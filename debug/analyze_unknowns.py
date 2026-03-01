@@ -1,8 +1,9 @@
 """
 Unknown Embedding Analysis for Horospherical Classifiers.
 
-Projects ALL test embeddings (known + unknown) through the trained model and
+Projects ALL embeddings (known + unknown) through the trained model and
 computes detailed statistics to understand OOD detection behavior.
+Supports both --split train and --split test.
 
 IMPORTANT: The mmengine YOLO VOC dataloader only produces GT labels for the 9
 known classes. Unknown class objects are SILENTLY DROPPED from gt_instances.
@@ -15,6 +16,7 @@ Analysis includes:
 - Class-wise adaptive threshold analysis
 - Score overlap analysis between known/unknown
 - True unknown subclass breakdown via XML annotation parsing
+- 2D Poincare ball visualization with/without horospheres
 """
 
 import os
@@ -28,9 +30,11 @@ import torch.nn.functional as F
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from pathlib import Path
 from tqdm import tqdm
 from collections import defaultdict
+from sklearn.decomposition import PCA
 
 from core import add_config
 from core.util.model_ema import add_model_ema_configs
@@ -278,7 +282,6 @@ def collect_all_embeddings(model, data_loader, known_class_names, dataset_root,
                         max_horo, assigned = horo_scores.max(dim=0)
                         min_dist, nearest = p_dists.min(dim=0)
 
-                        # Skip raw embedding/poincare_dists storage to save memory on full dataset
                         class_data[cls_key]['horo_scores_all'].append(horo_scores.cpu())
                         class_data[cls_key]['max_horo_score'].append(max_horo.item())
                         class_data[cls_key]['assigned_proto'].append(assigned.item())
@@ -286,6 +289,12 @@ def collect_all_embeddings(model, data_loader, known_class_names, dataset_root,
                         class_data[cls_key]['nearest_proto'].append(nearest.item())
                         class_data[cls_key]['embedding_norm'].append(emb.norm().item())
                         class_data[cls_key]['is_known'] = is_known
+
+                        # Store raw embedding for 2D Poincare visualization (subsample)
+                        if 'raw_embeddings' not in class_data[cls_key]:
+                            class_data[cls_key]['raw_embeddings'] = []
+                        if samples_count[cls_key] < 2000:  # cap per class for memory
+                            class_data[cls_key]['raw_embeddings'].append(emb.cpu())
 
                         samples_count[cls_key] += 1
 
@@ -765,6 +774,211 @@ def plot_analysis(stats, class_data, known_class_names, threshold_results, save_
     print(f"  Saved: {path3}")
 
 
+def plot_poincare_ball(class_data, known_class_names, prototypes, biases,
+                       hyp_c=1.0, save_dir='visualizations', split_name='test'):
+    """
+    2D Poincare ball visualization via PCA on logmap0 (tangent space).
+
+    Creates two figures:
+    1. Embeddings on Poincare disk (no horospheres)
+    2. Embeddings on Poincare disk WITH horospheres drawn
+
+    Horosphere geometry (c=1, ball radius R=1):
+    For prototype p on boundary (|p|=1) and Busemann level t:
+    The horosphere {x : B_p(x) = t} is a Euclidean circle:
+      - center = p / (1 + e^t)
+      - radius = e^t / (1 + e^t)
+    The classifier threshold horosphere is at t = a_k (the bias),
+    since score = -B + a >= 0 means B <= a.
+    """
+    print(f"\n{'='*60}")
+    print("POINCARE BALL 2D VISUALIZATION")
+    print(f"{'='*60}")
+
+    known_set = set(known_class_names)
+    R = 1.0 / (hyp_c ** 0.5)  # ball radius
+
+    # Collect raw embeddings from class_data
+    all_embs = []
+    all_labels = []
+    all_is_known = []
+    for cls_key in sorted(class_data.keys()):
+        d = class_data[cls_key]
+        raw = d.get('raw_embeddings', [])
+        if len(raw) == 0:
+            continue
+        emb_tensor = torch.stack(raw)  # (N, D)
+        all_embs.append(emb_tensor)
+        all_labels.extend([cls_key] * len(raw))
+        all_is_known.extend([d['is_known']] * len(raw))
+
+    if not all_embs:
+        print("  No raw embeddings stored — skipping Poincare plot")
+        return
+
+    all_embs = torch.cat(all_embs, dim=0).numpy()  # (N_total, D)
+    all_labels = np.array(all_labels)
+    all_is_known = np.array(all_is_known)
+
+    print(f"  Total embeddings for 2D plot: {len(all_embs)}")
+    print(f"    Known: {all_is_known.sum()}, Unknown: {(~all_is_known).sum()}")
+
+    # --- PCA on logmap0 (tangent space at origin) ---
+    # logmap0(x, c) = (2/sqrt(c)) * arctanh(sqrt(c)*||x||) * x/||x||
+    sqrt_c = hyp_c ** 0.5
+    norms = np.linalg.norm(all_embs, axis=-1, keepdims=True).clip(1e-8)
+    # Clip norms inside ball for numerical safety
+    norms_clipped = np.minimum(norms, (R - 1e-4))
+    tangent_vecs = (2.0 / sqrt_c) * np.arctanh(sqrt_c * norms_clipped) * (all_embs / norms)
+
+    pca = PCA(n_components=2, random_state=42)
+    tangent_2d = pca.fit_transform(tangent_vecs)
+    print(f"  PCA explained variance: {pca.explained_variance_ratio_[0]:.3f}, {pca.explained_variance_ratio_[1]:.3f}")
+
+    # Expmap0 back to Poincare disk: x = tanh(sqrt(c)*||v||/2) * v/(sqrt(c)*||v||)
+    # Wait — for 2D, we use a simpler approach: just map back via expmap0
+    t2d_norms = np.linalg.norm(tangent_2d, axis=-1, keepdims=True).clip(1e-8)
+    poincare_2d = np.tanh(sqrt_c * t2d_norms) / (sqrt_c * t2d_norms) * tangent_2d
+
+    # Project prototypes to 2D using same PCA
+    protos_np = prototypes.cpu().numpy()  # (K, D)
+    # Prototypes are on boundary (||p||=R), use their direction only
+    proto_norms = np.linalg.norm(protos_np, axis=-1, keepdims=True).clip(1e-8)
+    proto_dirs = protos_np / proto_norms
+    # Use moderate norm for tangent projection (prototypes are AT the boundary)
+    proto_inside = proto_dirs * (R * 0.98)
+    proto_norms_inside = np.linalg.norm(proto_inside, axis=-1, keepdims=True).clip(1e-8)
+    proto_tangent = (2.0/sqrt_c) * np.arctanh(sqrt_c * proto_norms_inside) * (proto_inside / proto_norms_inside)
+    proto_2d_tangent = pca.transform(proto_tangent)
+    proto_2d_t_norms = np.linalg.norm(proto_2d_tangent, axis=-1, keepdims=True).clip(1e-8)
+    proto_2d_poincare = np.tanh(sqrt_c * proto_2d_t_norms) / (sqrt_c * proto_2d_t_norms) * proto_2d_tangent
+    # Ideal points on 2D boundary
+    proto_2d_boundary = proto_2d_poincare / np.linalg.norm(proto_2d_poincare, axis=-1, keepdims=True).clip(1e-8) * R
+
+    # Color setup
+    known_colors = plt.cm.tab10(np.linspace(0, 1, len(known_class_names)))
+    # Create color map: known classes get tab10, unknowns get gray
+    color_map = {}
+    for i, name in enumerate(known_class_names):
+        color_map[name] = known_colors[i]
+
+    biases_np = biases.cpu().numpy()
+
+    # ===== FIGURE 1: Without horospheres =====
+    _draw_poincare_figure(
+        poincare_2d, all_labels, all_is_known, proto_2d_boundary,
+        known_class_names, color_map, R, biases_np,
+        draw_horospheres=False,
+        title=f'Poincare Ball Embeddings ({split_name} data, no horospheres)',
+        save_path=os.path.join(save_dir, f'poincare_ball_{split_name}_no_horo.png')
+    )
+
+    # ===== FIGURE 2: With horospheres =====
+    _draw_poincare_figure(
+        poincare_2d, all_labels, all_is_known, proto_2d_boundary,
+        known_class_names, color_map, R, biases_np,
+        draw_horospheres=True,
+        title=f'Poincare Ball Embeddings ({split_name} data, with horospheres)',
+        save_path=os.path.join(save_dir, f'poincare_ball_{split_name}_with_horo.png')
+    )
+
+
+def _draw_poincare_figure(poincare_2d, all_labels, all_is_known, proto_2d_boundary,
+                          known_class_names, color_map, R, biases_np,
+                          draw_horospheres=False, title='', save_path=''):
+    """Helper to draw a single Poincare ball figure."""
+    fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+
+    # Draw Poincare disk boundary
+    circle = plt.Circle((0, 0), R, fill=False, color='black', linewidth=2)
+    ax.add_patch(circle)
+
+    known_set = set(known_class_names)
+    unique_labels = sorted(set(all_labels))
+
+    # Plot unknown first (behind), then known
+    unknown_labels = [l for l in unique_labels if l not in known_set]
+    known_labels_present = [l for l in unique_labels if l in known_set]
+
+    for cls_key in unknown_labels:
+        mask = all_labels == cls_key
+        pts = poincare_2d[mask]
+        ax.scatter(pts[:, 0], pts[:, 1], s=4, alpha=0.15, c='gray',
+                   marker='.', label=f'*{cls_key}', rasterized=True)
+
+    for cls_key in known_labels_present:
+        mask = all_labels == cls_key
+        pts = poincare_2d[mask]
+        color = color_map.get(cls_key, 'black')
+        ax.scatter(pts[:, 0], pts[:, 1], s=6, alpha=0.3, c=[color],
+                   marker='.', label=cls_key, rasterized=True)
+
+    # Draw prototype ideal points on boundary
+    for k, name in enumerate(known_class_names):
+        if k >= len(proto_2d_boundary):
+            break
+        px, py = proto_2d_boundary[k]
+        color = color_map.get(name, 'black')
+        ax.plot(px, py, '*', markersize=16, color=color,
+                markeredgecolor='black', markeredgewidth=1.0, zorder=10)
+        # Label prototype
+        offset = 0.08
+        dx = px / max(np.sqrt(px**2 + py**2), 1e-5) * offset
+        dy = py / max(np.sqrt(px**2 + py**2), 1e-5) * offset
+        ax.annotate(name, (px + dx, py + dy), fontsize=7, fontweight='bold',
+                    ha='center', va='center',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+
+    # Draw horospheres if requested
+    if draw_horospheres:
+        for k, name in enumerate(known_class_names):
+            if k >= len(proto_2d_boundary) or k >= len(biases_np):
+                break
+            px, py = proto_2d_boundary[k]
+            p_dir = np.array([px, py])
+            p_norm = np.linalg.norm(p_dir)
+            if p_norm < 1e-8:
+                continue
+            p_unit = p_dir / p_norm  # unit direction to prototype on boundary
+
+            bias_k = biases_np[k]
+            # Horosphere at score=0: B_p(x) = bias_k, so t = bias_k
+            # In Poincare disk: center = p/(1+e^t), radius = e^t/(1+e^t)
+            # where p is ideal point on boundary (|p|=R)
+            t = float(bias_k)
+            exp_t = np.exp(np.clip(t, -10, 10))
+            horo_center = p_unit * R / (1.0 + exp_t)
+            horo_radius = R * exp_t / (1.0 + exp_t)
+
+            color = color_map.get(name, 'black')
+            horo_circle = plt.Circle(
+                (horo_center[0], horo_center[1]), horo_radius,
+                fill=False, color=color, linewidth=1.5, linestyle='--', alpha=0.7
+            )
+            ax.add_patch(horo_circle)
+
+    ax.set_xlim(-R * 1.25, R * 1.25)
+    ax.set_ylim(-R * 1.25, R * 1.25)
+    ax.set_aspect('equal')
+    ax.set_title(title, fontsize=13)
+    ax.set_xlabel('PCA dim 1')
+    ax.set_ylabel('PCA dim 2')
+
+    # Legend (deduplicate, limit entries)
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    # Limit legend to max 20 entries
+    items = list(by_label.items())[:20]
+    ax.legend([v for _, v in items], [k for k, _ in items],
+              loc='upper right', fontsize=7, ncol=2, markerscale=3)
+
+    ax.grid(True, alpha=0.15)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {save_path}")
+
+
 if __name__ == "__main__":
     parser = default_argument_parser()
     parser.add_argument("--task", default="IDD_HYP/t1")
@@ -772,6 +986,8 @@ if __name__ == "__main__":
     parser.add_argument("--hyp_c", type=float, default=1.0)
     parser.add_argument("--hyp_dim", type=int, default=256)
     parser.add_argument("--clip_r", type=float, default=0.95)
+    parser.add_argument("--split", default="test", choices=["train", "test"],
+                        help="Which data split to analyze (train or test)")
     parser.add_argument("--output_dir", default="visualizations")
 
     args = parser.parse_args()
@@ -795,8 +1011,10 @@ if __name__ == "__main__":
 
     print(f"\n=== Configuration ===")
     print(f"  Task: {args.task}")
+    print(f"  Split: {args.split}")
     print(f"  Known classes ({unknown_index}): {known_class_names}")
     print(f"  Curvature: {args.hyp_c}")
+    print(f"  clip_r: {args.clip_r}")
     print(f"  Checkpoint: {args.ckpt}")
 
     # Model config - use task_name (IDD_HYP) for config paths
@@ -811,8 +1029,19 @@ if __name__ == "__main__":
     runner.model.reparameterize([known_class_names])
     runner.model.eval()
 
-    # Build TEST loader (images from test split)
-    test_loader = Runner.build_dataloader(cfgY.test_dataloader)
+    # Build data loader based on --split
+    if args.split == 'train':
+        # Use training dataloader (trlder) — has full training set
+        # Override to non-shuffled, lower batch size for analysis
+        import copy
+        train_dl_cfg = copy.deepcopy(cfgY.trlder)
+        train_dl_cfg['sampler'] = dict(type='DefaultSampler', shuffle=False)
+        train_dl_cfg['batch_size'] = 16  # lower for analysis
+        data_loader = Runner.build_dataloader(train_dl_cfg)
+        print(f"  Using TRAIN loader: {len(data_loader.dataset)} images")
+    else:
+        data_loader = Runner.build_dataloader(cfgY.test_dataloader)
+        print(f"  Using TEST loader: {len(data_loader.dataset)} images")
 
     # Build hyperbolic model
     model = HypCustomYoloWorld(
@@ -838,7 +1067,7 @@ if __name__ == "__main__":
 
     # Collect embeddings — parses XML directly to get ALL boxes (full dataset)
     class_data, samples_count = collect_all_embeddings(
-        model, test_loader, known_class_names,
+        model, data_loader, known_class_names,
         dataset_root='./datasets',
         hyp_c=args.hyp_c,
     )
@@ -872,6 +1101,12 @@ if __name__ == "__main__":
 
     os.makedirs(args.output_dir, exist_ok=True)
     plot_analysis(stats, class_data, known_class_names, threshold_results, args.output_dir)
+
+    # --- 2D Poincare ball visualization with horospheres ---
+    plot_poincare_ball(
+        class_data, known_class_names, prototypes, biases,
+        hyp_c=args.hyp_c, save_dir=args.output_dir, split_name=args.split
+    )
 
     # Save data
     ckpt_name = Path(args.ckpt).stem

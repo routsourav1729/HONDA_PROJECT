@@ -21,7 +21,7 @@ BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
 TASK="IDD_HYP/t1"
 # Change this to match the model you want to calibrate!
-CKPT="$BASE_DIR/IDD_HYP/t1/horospherical_15epoch/model_final.pth"
+CKPT="$BASE_DIR/IDD_HYP/t1/abl_B_compact_biasreg/model_final.pth"
 
 echo "=========================================="
 echo "ADAPTIVE THRESHOLD ANALYSIS"

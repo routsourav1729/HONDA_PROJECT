@@ -6,7 +6,7 @@ custom_imports = dict(imports=['yolo_world'],
 # hyper-parameters
 num_classes = 1203
 num_training_classes = 8  # IDD base classes (not COCO's 80)
-max_epochs = 25  # 25 epochs for full convergence
+max_epochs = 40  # 40 epochs for full convergence
 close_mosaic_epochs = 2
 save_epoch_intervals = 2
 text_channels = 512
@@ -28,14 +28,14 @@ hyp_config = dict(
     curvature=1.0,           # c=1.0 means ball radius R=1/√c=1.0
     embed_dim=256,           # Hyperbolic embedding dimension
     # clip_r controls max Euclidean norm before expmap0.
-    # tanh(clip_r) = max Poincaré norm. 3.0 → 0.995, giving full radial discrimination.
-    clip_r=3.0,
+    # tanh(clip_r) = max Poincaré norm. 1.0 → 0.762, safe stable region.
+    clip_r=1.0,
     
-    # Loss weights
+    # Loss weights (matching old horospherical_v2 config)
     hyp_loss_weight=1.0,     # Weight for horospherical CE loss
-    dispersion_weight=0.1,   # Push prototype directions apart (was 0.0)
+    dispersion_weight=0.1,   # Push prototype directions apart
     bias_reg_weight=0.1,     # L2 penalty on biases: prevent horosphere inflation
-    compactness_weight=0.0,  # OFF: CE already handles this; compactness inflated biases
+    compactness_weight=0.05, # Mild compactness (old model value)
     
     # Prototype initialization (REQUIRED!)
     # Run: python init_prototypes.py --classes "car,motorcycle,..." --output init_protos_t1.pt

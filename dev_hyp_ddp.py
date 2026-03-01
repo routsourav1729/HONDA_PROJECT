@@ -289,17 +289,17 @@ if __name__ == "__main__":
     # Wrap in DDP
     # =========================================================================
     if is_distributed:
-        # SyncBatchNorm is already used in projector - no conversion needed.
-        # find_unused_parameters=True because:
-        #   - The frozen YOLO backbone has params that don't get gradients
-        #   - Some forward paths may skip certain params (e.g. frozen_directions)
+        # find_unused_parameters=False is safe because:
+        #   - All frozen params have requires_grad=False (set before wrapping)
+        #   - prototype_direction is a register_buffer (not a parameter)
+        #   - All trainable params (embeddings, projector convs, BN, bias) participate in every forward
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
-        print_rank0(f"[DDP] Model wrapped with find_unused_parameters=True", rank)
+        print_rank0(f"[DDP] Model wrapped with find_unused_parameters=False", rank)
     
     # Access the underlying model for methods not in nn.Module.forward()
     raw_model = model.module if isinstance(model, DDP) else model
@@ -315,11 +315,15 @@ if __name__ == "__main__":
 
     wb = None
     if args.wandb and is_main_process(rank):
-        from wandb_config import WandbLogger
-        wb = WandbLogger(
-            name=f"{args.task.replace('/', '_')}_{args.exp_name}_ddp{world_size}", 
-            config={'lr': cfgY.base_lr, 'c': hyp_c, 'world_size': world_size}
-        )
+        try:
+            from wandb_config import WandbLogger
+            wb = WandbLogger(
+                name=f"{args.task.replace('/', '_')}_{args.exp_name}_ddp{world_size}", 
+                config={'lr': cfgY.base_lr, 'c': hyp_c, 'world_size': world_size}
+            )
+        except Exception as e:
+            print(f"WARNING: WandB init failed ({e}), continuing without logging.")
+            wb = None
 
     start_epoch = 0
     if args.resume_from:
@@ -343,12 +347,10 @@ if __name__ == "__main__":
         
         print_rank0(f"\n=== Epoch {epoch} ===", rank)
 
-        # Prototype freeze/unfreeze
+        # Prototype bias freeze/unfreeze (directions are permanently frozen as buffer)
         if epoch < PROTO_FREEZE_EPOCHS:
-            raw_model.hyp_projector.classifier.prototype_direction.requires_grad_(False)
             raw_model.hyp_projector.classifier.prototype_bias.requires_grad_(False)
         elif epoch == PROTO_FREEZE_EPOCHS:
-            raw_model.hyp_projector.classifier.prototype_direction.requires_grad_(True)
             raw_model.hyp_projector.classifier.prototype_bias.requires_grad_(True)
 
         epoch_loss = {'cls': 0, 'dfl': 0, 'bbox': 0, 'horo': 0}
@@ -359,11 +361,11 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             data = raw_model.parent.data_preprocessor(batch)
             
-            if steps % 100 == 0 and is_main_process(rank):
-                head_losses, hyp_loss, breakdown = raw_model.head_loss_with_breakdown(data['inputs'], data['data_samples'])
-            else:
-                head_losses, hyp_loss = raw_model.head_loss(data['inputs'], data['data_samples'])
-                breakdown = None
+            # CRITICAL: Call through the DDP wrapper (model.__call__ → forward()).
+            # This ensures DDP's reducer properly sets up gradient sync hooks
+            # via prepare_for_backward(). Calling raw_model directly bypasses
+            # DDP entirely, breaking gradient AllReduce synchronization.
+            head_losses, hyp_loss = model(data['inputs'], data['data_samples'])
             
             loss = (head_losses['loss_cls'] + head_losses['loss_dfl'] + head_losses['loss_bbox'] 
                     + hyp_loss_weight * hyp_loss)
@@ -377,13 +379,20 @@ if __name__ == "__main__":
             if steps % 50 == 0 and is_main_process(rank):
                 print(f"  step {steps}: cls={head_losses['loss_cls'].item():.4f} "
                       f"bbox={head_losses['loss_bbox'].item():.4f} horo={hyp_loss.item():.4f}")
-                if breakdown:
-                    bias_mean = breakdown.get('bias_mean', 0)
-                    bias_max = breakdown.get('bias_max', 0)
-                    ce_loss = breakdown.get('horo_ce_loss', 0)
-                    disp_loss = breakdown.get('horo_disp_loss', 0)
+                # Log prototype stats from the classifier directly (no extra forward)
+                if steps % 100 == 0:
+                    with torch.no_grad():
+                        bias = raw_model.hyp_projector.classifier.prototype_bias
+                        bias_mean = bias.mean().item()
+                        bias_max = bias.max().item()
+                        dirs = raw_model.hyp_projector.classifier.prototype_direction
+                        dirs_n = torch.nn.functional.normalize(dirs, dim=-1)
+                        dist_sq = torch.cdist(dirs_n, dirs_n).pow(2)
+                        K = dirs_n.shape[0]
+                        mask = ~torch.eye(K, dtype=torch.bool, device=dirs_n.device)
+                        disp = torch.log(torch.exp(-dist_sq[mask]).mean()).item()
                     print(f"    [Proto] bias_mean={bias_mean:.3f} bias_max={bias_max:.3f} "
-                          f"ce={ce_loss:.4f} disp={disp_loss:.4f}")
+                          f"ce={hyp_loss.item():.4f} disp={disp:.4f}")
                 if wb:
                     wb.log({
                         'cls': head_losses['loss_cls'].item(), 

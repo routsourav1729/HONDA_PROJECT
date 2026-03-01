@@ -41,17 +41,18 @@ class HorosphericalClassifier(nn.Module):
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         
-        # Ideal prototype directions (normalized to boundary at runtime)
-        # When loading from checkpoint, init_directions is None here but
-        # prototypes will be overwritten by load_hyp_ckpt() afterwards.
+        # Ideal prototype directions — FROZEN (registered as buffer, not parameter).
+        # CLIP init gives a perfect uniform simplex (cos_sim = -1/(K-1) for all pairs).
+        # Training consistently degrades this optimal separation, so we freeze.
+        # Only the biases (horosphere positions) are learnable.
         if init_directions is not None:
             assert init_directions.shape == (num_classes, embed_dim), \
                 f"init_directions shape mismatch: {init_directions.shape} vs ({num_classes}, {embed_dim})"
-            self.prototype_direction = nn.Parameter(init_directions.clone())
-            print(f"  ✓ Prototype directions initialized from pre-computed tensor")
+            self.register_buffer('prototype_direction', init_directions.clone())
+            print(f"  ✓ Prototype directions FROZEN from pre-computed tensor (not trainable)")
         else:
-            # Placeholder — will be overwritten if loading from checkpoint
-            self.prototype_direction = nn.Parameter(torch.randn(num_classes, embed_dim))
+            # Placeholder — will be overwritten by load_hyp_ckpt()
+            self.register_buffer('prototype_direction', torch.randn(num_classes, embed_dim))
         
         # Learnable bias per class - controls horosphere position
         self.prototype_bias = nn.Parameter(torch.zeros(num_classes))
@@ -425,26 +426,27 @@ class HyperbolicProjector(nn.Module):
         self.num_classes = num_classes
         self.clip_r = clip_r
         
-        # Per-scale depthwise-separable projectors
+        # Per-scale two-conv projectors:
+        #   Conv1: in_dim → in_dim (1×1) + BN + ReLU  (cross-channel mixing at full dim)
+        #   Conv2: in_dim → out_dim (1×1)              (dimension reduction, linear)
+        # This preserves full representational capacity before bottlenecking.
+        # ~1.83M params. BatchNorm2d (not SyncBN) avoids NCCL stalls.
         self.proj_p3 = nn.Sequential(
-            nn.Conv2d(in_dims[0], in_dims[0], kernel_size=3, padding=1,
-                      groups=in_dims[0], bias=False),
-            nn.SyncBatchNorm(in_dims[0]),
-            nn.GELU(),
+            nn.Conv2d(in_dims[0], in_dims[0], kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_dims[0]),
+            nn.ReLU(inplace=True),
             nn.Conv2d(in_dims[0], out_dim, kernel_size=1, bias=False),
         )
         self.proj_p4 = nn.Sequential(
-            nn.Conv2d(in_dims[1], in_dims[1], kernel_size=3, padding=1,
-                      groups=in_dims[1], bias=False),
-            nn.SyncBatchNorm(in_dims[1]),
-            nn.GELU(),
+            nn.Conv2d(in_dims[1], in_dims[1], kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_dims[1]),
+            nn.ReLU(inplace=True),
             nn.Conv2d(in_dims[1], out_dim, kernel_size=1, bias=False),
         )
         self.proj_p5 = nn.Sequential(
-            nn.Conv2d(in_dims[2], in_dims[2], kernel_size=3, padding=1,
-                      groups=in_dims[2], bias=False),
-            nn.SyncBatchNorm(in_dims[2]),
-            nn.GELU(),
+            nn.Conv2d(in_dims[2], in_dims[2], kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_dims[2]),
+            nn.ReLU(inplace=True),
             nn.Conv2d(in_dims[2], out_dim, kernel_size=1, bias=False),
         )
         
@@ -476,7 +478,7 @@ class HyperbolicProjector(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+            elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
         # Standard Kaiming init for all convs (no near-zero override)

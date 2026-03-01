@@ -23,6 +23,51 @@ from .hyperbolic import HyperbolicProjector, busemann
 from .hyperbolic.projector import HorosphericalLoss
 
 
+def _rebuild_projector_from_ckpt(projector, state_dict):
+    """Rebuild projector conv layers to match checkpoint architecture.
+    
+    Detects single-conv vs two-conv from checkpoint weight shapes and
+    rebuilds the Sequential modules accordingly. This allows loading
+    old single-conv checkpoints with the current two-conv code (and vice versa).
+    """
+    import torch.nn as nn
+    
+    for scale in ['p3', 'p4', 'p5']:
+        prefix = f'hyp_projector.proj_{scale}'
+        # Gather all conv weight keys for this scale
+        conv_keys = sorted([k for k in state_dict if k.startswith(prefix) and 'weight' in k 
+                           and 'running' not in k and k.endswith('.weight')])
+        
+        # Check if it's single-conv (3 layers: conv, bn, relu → indices 0,1,2)
+        # or two-conv (4 layers: conv, bn, relu, conv → indices 0,1,2,3)
+        has_second_conv = f'{prefix}.3.weight' in state_dict
+        
+        first_conv_w = state_dict[f'{prefix}.0.weight']
+        out_ch, in_ch = first_conv_w.shape[:2]
+        
+        if has_second_conv:
+            # Two-conv: conv(in→in) + BN + ReLU + conv(in→out)
+            second_conv_w = state_dict[f'{prefix}.3.weight']
+            final_out = second_conv_w.shape[0]
+            new_proj = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_ch, final_out, kernel_size=1, bias=False),
+            )
+            print(f"    {scale}: two-conv ({in_ch}→{out_ch}→{final_out})")
+        else:
+            # Single-conv: conv(in→out) + BN + ReLU
+            new_proj = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            )
+            print(f"    {scale}: single-conv ({in_ch}→{out_ch})")
+        
+        setattr(projector, f'proj_{scale}', new_proj)
+
+
 def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=False):
     """
     Load checkpoint for horospherical model.
@@ -35,6 +80,19 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
     """
     checkpoint = torch.load(checkpoint_path, map_location='cuda')
     state_dict = checkpoint.get('model_state_dict', checkpoint)
+    
+    # Auto-detect projector architecture from checkpoint weights.
+    # Single-conv checkpoint: proj_p3.0.weight is (out_dim, in_dim, 1, 1)
+    # Two-conv checkpoint:    proj_p3.0.weight is (in_dim, in_dim, 1, 1)
+    # If mismatch with current model, rebuild projector to match checkpoint.
+    ckpt_p3_key = 'hyp_projector.proj_p3.0.weight'
+    if ckpt_p3_key in state_dict:
+        ckpt_shape = state_dict[ckpt_p3_key].shape  # (out_ch, in_ch, 1, 1)
+        model_shape = model.hyp_projector.proj_p3[0].weight.shape
+        if ckpt_shape != model_shape:
+            print(f"  ⚠ Projector architecture mismatch: ckpt={list(ckpt_shape)} vs model={list(model_shape)}")
+            print(f"    Rebuilding projector to match checkpoint...")
+            _rebuild_projector_from_ckpt(model.hyp_projector, state_dict)
     
     # Keys to handle separately
     exclude_keys = ['embeddings', 'frozen_embeddings', 
@@ -56,14 +114,15 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
             model.register_buffer('frozen_directions', state_dict['frozen_directions'].cuda())
             model.register_buffer('frozen_biases', state_dict['frozen_biases'].cuda())
         
-        # Load trainable prototypes
+        # Load prototypes: directions as frozen buffer, biases as trainable parameter
         if state_dict.get('hyp_projector.classifier.prototype_direction') is not None:
-            model.hyp_projector.classifier.prototype_direction = nn.Parameter(
-                state_dict['hyp_projector.classifier.prototype_direction'])
+            # Directions are frozen (buffer, not parameter)
+            model.hyp_projector.classifier.prototype_direction = \
+                state_dict['hyp_projector.classifier.prototype_direction'].to(model.hyp_projector.classifier.prototype_direction.device)
             model.hyp_projector.classifier.prototype_bias = nn.Parameter(
                 state_dict['hyp_projector.classifier.prototype_bias'])
-            norms = F.normalize(model.hyp_projector.classifier.prototype_direction, dim=-1).norm(dim=-1)
             print(f"  ✓ Prototypes loaded from checkpoint ({model.hyp_projector.classifier.num_classes} classes)")
+            print(f"    Directions: FROZEN (buffer), Biases: trainable")
             print(f"    Biases: {[f'{b:.4f}' for b in model.hyp_projector.classifier.prototype_bias.tolist()]}")
         else:
             print(f"  ⚠ WARNING: No prototype_direction found in checkpoint — using random init!")
@@ -305,6 +364,14 @@ class HypCustomYoloWorld(nn.Module):
             frozen_biases=self.frozen_biases
         )
     
+    def forward(self, batch_inputs: Tensor, batch_data_samples: SampleList):
+        """Forward pass — dispatches to head_loss.
+        
+        MUST be called through the DDP wrapper during training so that
+        DDP's reducer properly sets up gradient synchronization hooks.
+        """
+        return self.head_loss(batch_inputs, batch_data_samples)
+
     def head_loss(self, batch_inputs: Tensor, batch_data_samples: SampleList):
         """Compute YOLO + horospherical losses."""
         self.bbox_head.num_classes = self.text_feats[0].shape[0]
@@ -506,9 +573,9 @@ class HypCustomYoloWorld(nn.Module):
             # T1: Train all projector params
             for p in self.hyp_projector.parameters():
                 p.requires_grad = True
-            print("  [T1] Training ALL projector parameters")
+            print("  [T1] Training projector convs + classifier biases (directions frozen as buffer)")
         else:
-            # T2+: Freeze Conv, train only classifier
+            # T2+: Freeze Conv, train only classifier biases
             for name, p in self.hyp_projector.named_parameters():
                 p.requires_grad = 'classifier' in name
-            print("  [T2+] Training only classifier (directions + biases)")
+            print("  [T2+] Training only classifier biases (directions frozen as buffer)")
