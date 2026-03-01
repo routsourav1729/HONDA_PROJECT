@@ -211,10 +211,17 @@ if __name__ == "__main__":
         print("  For proper training, add init_protos to hyp_config in configs/IDD/t1.py!")
 
     # Build Horospherical model
+    # For T2+, classifier only holds novel class prototypes; base in frozen_* buffers.
+    prev_cls = cfg.TEST.PREV_INTRODUCED_CLS
+    cur_cls = cfg.TEST.CUR_INTRODUCED_CLS
+    classifier_num_classes = cur_cls if prev_cls > 0 else unknown_index
+    
     print(f"\n=== Building Horospherical Model ===")
+    print(f"  Classifier classes: {classifier_num_classes} ({'novel only' if prev_cls > 0 else 'all'})")
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
         hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
+        num_classifier_classes=classifier_num_classes,
         init_prototypes=init_prototypes,
         dispersion_weight=dispersion_weight,
         bias_reg_weight=bias_reg_weight,

@@ -328,64 +328,89 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
         total_num_unk = num_unks[50][0]
         self._logger.info('Absolute OSE (total_num_unk_det_as_known): ' + str(total_num_unk_det_as_known))
         self._logger.info('total_num_unk ' + str(total_num_unk))
-        # Extra logging of class-wise APs
-        avg_precs = list(np.mean([x for _, x in aps.items()], axis=0))
-        self._logger.info(self._class_names)
-        # self._logger.info("AP__: " + str(['%.1f' % x for x in avg_precs]))
-        self._logger.info("AP50: " + str(['%.1f' % x for x in aps[50]]))
-        self._logger.info("Precisions50: " + str(['%.1f' % x for x in precs[50]]))
-        self._logger.info("Recall50: " + str(['%.1f' % x for x in recs[50]]))
-        # self._logger.info("AP75: " + str(['%.1f' % x for x in aps[75]]))
+        # =================================================================
+        # Per-Class Results Table (labeled by group)
+        # =================================================================
+        self._logger.info("\n" + "=" * 80)
+        task_label = "T2+" if self.prev_intro_cls > 0 else "T1"
+        self._logger.info(f"PER-CLASS RESULTS ({task_label}: prev={self.prev_intro_cls}, cur={self.curr_intro_cls})")
+        self._logger.info("=" * 80)
+        self._logger.info(f"{'Class':25s} {'Group':8s} {'AP50':>8s} {'Prec50':>8s} {'Rec50':>8s}")
+        self._logger.info("-" * 80)
+
+        for cls_id, cls_name in enumerate(self._class_names):
+            if cls_id < self.prev_intro_cls:
+                group = "BASE"
+            elif cls_id < self.prev_intro_cls + self.curr_intro_cls:
+                group = "NOVEL" if self.prev_intro_cls > 0 else "BASE"
+            elif cls_id == self.unknown_class_index:
+                group = "UNK"
+            else:
+                group = "???"
+            ap_val = aps[50][cls_id] if cls_id < len(aps[50]) else 0.0
+            pr_val = precs[50][cls_id] if cls_id < len(precs[50]) else 0.0
+            rc_val = recs[50][cls_id] if cls_id < len(recs[50]) else 0.0
+            self._logger.info(f"{cls_name:25s} {group:8s} {ap_val:8.1f} {pr_val:8.1f} {rc_val:8.1f}")
+
+        self._logger.info("-" * 80)
+
+        # Group summaries
         if self.prev_intro_cls > 0:
-            # self._logger.info("\nPrev class AP__: " + str(np.mean(avg_precs[:self.prev_intro_cls])))
-            self._logger.info("Prev class AP50: " + str(np.mean(aps[50][:self.prev_intro_cls])))
-            self._logger.info("Prev class Precisions50: " + str(np.mean(precs[50][:self.prev_intro_cls])))
-            self._logger.info("Prev class Recall50: " + str(np.mean(recs[50][:self.prev_intro_cls])))
+            base_ap = np.mean(aps[50][:self.prev_intro_cls])
+            base_prec = np.mean(precs[50][:self.prev_intro_cls])
+            base_rec = np.mean(recs[50][:self.prev_intro_cls])
+            self._logger.info(f"{'BASE  (prev) mean':25s} {'':8s} {base_ap:8.1f} {base_prec:8.1f} {base_rec:8.1f}")
 
-            # self._logger.info("Prev class AP75: " + str(np.mean(aps[75][:self.prev_intro_cls])))
+            novel_ap = np.mean(aps[50][self.prev_intro_cls:self.prev_intro_cls + self.curr_intro_cls])
+            novel_prec = np.mean(precs[50][self.prev_intro_cls:self.prev_intro_cls + self.curr_intro_cls])
+            novel_rec = np.mean(recs[50][self.prev_intro_cls:self.prev_intro_cls + self.curr_intro_cls])
+            self._logger.info(f"{'NOVEL (cur)  mean':25s} {'':8s} {novel_ap:8.1f} {novel_prec:8.1f} {novel_rec:8.1f}")
+        else:
+            base_ap = np.mean(aps[50][:self.curr_intro_cls])
+            base_prec = np.mean(precs[50][:self.curr_intro_cls])
+            base_rec = np.mean(recs[50][:self.curr_intro_cls])
+            self._logger.info(f"{'BASE  (cur)  mean':25s} {'':8s} {base_ap:8.1f} {base_prec:8.1f} {base_rec:8.1f}")
 
-        # self._logger.info("\nCurrent class AP__: " + str(np.mean(avg_precs[self.prev_intro_cls:self.curr_intro_cls])))
-        self._logger.info("Current class AP50: " + str(
-            np.mean(aps[50][self.prev_intro_cls:self.prev_intro_cls + self.curr_intro_cls])))
-        self._logger.info("Current class Precisions50: " + str(
-            np.mean(precs[50][self.prev_intro_cls:self.prev_intro_cls + self.curr_intro_cls])))
-        self._logger.info("Current class Recall50: " + str(
-            np.mean(recs[50][self.prev_intro_cls:self.prev_intro_cls + self.curr_intro_cls])))
-        # self._logger.info("Current class AP75: " + str(np.mean(aps[75][self.prev_intro_cls:self.curr_intro_cls])))
+        known_ap = np.mean(aps[50][:self.num_seen_classes])
+        known_prec = np.mean(precs[50][:self.num_seen_classes])
+        known_rec = np.mean(recs[50][:self.num_seen_classes])
+        self._logger.info(f"{'KNOWN        mean':25s} {'':8s} {known_ap:8.1f} {known_prec:8.1f} {known_rec:8.1f}")
 
-        # self._logger.info("\nKnown AP__: " + str(np.mean(avg_precs[:self.prev_intro_cls + self.curr_intro_cls])))
-        self._logger.info("Known AP50: " + str(np.mean(aps[50][:self.prev_intro_cls + self.curr_intro_cls])))
-        self._logger.info("Known Precisions50: " + str(np.mean(precs[50][:self.prev_intro_cls + self.curr_intro_cls])))
-        self._logger.info("Known Recall50: " + str(np.mean(recs[50][:self.prev_intro_cls + self.curr_intro_cls])))
-        # self._logger.info("Known AP75: " + str(np.mean(aps[75][:self.prev_intro_cls + self.curr_intro_cls])))
+        unk_ap = aps[50][-1]
+        unk_prec = precs[50][-1]
+        unk_rec = recs[50][-1]
+        self._logger.info(f"{'UNKNOWN':25s} {'':8s} {unk_ap:8.1f} {unk_prec:8.1f} {unk_rec:8.1f}")
+        self._logger.info("=" * 80)
 
-        # self._logger.info("\nUnknown AP__: " + str(avg_precs[-1]))
-        self._logger.info("Unknown AP50: " + str(aps[50][-1]))
-        self._logger.info("Unknown Precisions50: " + str(precs[50][-1]))
-        self._logger.info("Unknown Recall50: " + str(recs[50][-1]))
-        # self._logger.info("Unknown AP75: " + str(aps[75][-1]))
-        
-        # Compute class-wise unknown recall
-        self._logger.info("\n" + "="*60)
+        # Populate ret with structured results
+        ret["base_AP50"] = float(base_ap)
+        ret["known_AP50"] = float(known_ap)
+        ret["unknown_AP50"] = float(unk_ap)
+        ret["unknown_Recall50"] = float(unk_rec)
+        if self.prev_intro_cls > 0:
+            ret["novel_AP50"] = float(novel_ap)
+
+        # =================================================================
+        # Class-Wise Unknown Recall
+        # =================================================================
+        self._logger.info("\n" + "=" * 60)
         self._logger.info("CLASS-WISE UNKNOWN RECALL:")
-        self._logger.info("="*60)
+        self._logger.info("=" * 60)
         classwise_unknown_stats = self.compute_classwise_unknown_recall(predictions)
-        
-        # Sort by class name for consistent output
+
         for unknown_class in sorted(classwise_unknown_stats.keys()):
             stats = classwise_unknown_stats[unknown_class]
             total = stats['total']
             detected = stats['detected']
             recall = (detected / total * 100) if total > 0 else 0.0
             self._logger.info(f"{unknown_class:20s}: {detected:4d}/{total:4d} detected = {recall:5.1f}% recall")
-        
-        # Overall unknown recall for comparison
+
         total_unknown = sum(s['total'] for s in classwise_unknown_stats.values())
         total_detected = sum(s['detected'] for s in classwise_unknown_stats.values())
         overall_recall = (total_detected / total_unknown * 100) if total_unknown > 0 else 0.0
-        self._logger.info("-"*60)
+        self._logger.info("-" * 60)
         self._logger.info(f"{'OVERALL':20s}: {total_detected:4d}/{total_unknown:4d} detected = {overall_recall:5.1f}% recall")
-        self._logger.info("="*60 + "\n")
+        self._logger.info("=" * 60 + "\n")
 
         # self._logger.info("R__: " + str(['%.1f' % x for x in list(np.mean([x for _, x in recs.items()], axis=0))]))
         # self._logger.info("R50: " + str(['%.1f' % x for x in recs[50]]))

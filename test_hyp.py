@@ -126,9 +126,15 @@ if __name__ == "__main__":
     evaluator = Trainer.build_evaluator(cfg, "my_val")
     evaluator.reset()
 
+    # For T2+ eval: classifier holds only novel classes; base in frozen_* buffers
+    prev_cls = cfg.TEST.PREV_INTRODUCED_CLS
+    cur_cls = cfg.TEST.CUR_INTRODUCED_CLS
+    classifier_num_classes = cur_cls if prev_cls > 0 else unknown_index
+
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
-        hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r
+        hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
+        num_classifier_classes=classifier_num_classes,
     )
     
     model = load_hyp_ckpt(model, args.ckpt,

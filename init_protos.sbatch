@@ -16,14 +16,14 @@
 # Run ONCE before training whenever classes change.
 #
 # Usage:
-#   sbatch init_protos.sbatch t1        # generate T1 prototypes (8 classes)
-#   sbatch init_protos.sbatch t2        # generate T2 novel-only prototypes
+#   sbatch init_protos.sbatch              # runs init_protos.sh as-is
+#   sbatch init_protos.sbatch <t1_ckpt>    # pass T1 checkpoint path for T2
+#
+# Edit init_protos.sh to switch between T1 / T2 (comment/uncomment).
 # ============================================================================
 
-TASK=${1:-t1}
-
 echo "=========================================="
-echo "PROTOTYPE INITIALIZATION: $TASK"
+echo "PROTOTYPE INITIALIZATION"
 echo "Job: $SLURM_JOB_ID | $(date)"
 echo "=========================================="
 
@@ -40,41 +40,7 @@ mkdir -p slurm_logs
 
 cd /home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2
 
-if [ "$TASK" = "t1" ]; then
-    echo ""
-    echo "=== T1: 8 base classes ==="
-    echo "  car, motorcycle, rider, person, autorickshaw, bicycle, traffic sign, traffic light"
-    echo ""
-    python init_prototypes.py \
-        --classes "car,motorcycle,rider,person,autorickshaw,bicycle,traffic sign,traffic light" \
-        --out_dim 256 \
-        --output init_protos_t1.pt \
-        --prompt_template "a photo of a {} on an Indian road" \
-        --n_iters 3000 \
-        --seed 42
-
-elif [ "$TASK" = "t2" ]; then
-    echo ""
-    echo "=== T2: novel-only (6 new classes), needs T1 checkpoint ==="
-    echo "  bus, truck, tanker_vehicle, crane_truck, street_cart, excavator"
-    echo ""
-    # Uses T1 trained directions as anchor so novel dirs don't overlap
-    T1_CKPT=${2:-"IDD_HYP/t1/horospherical/model_final.pth"}
-    echo "  T1 checkpoint: $T1_CKPT"
-    python init_prototypes.py \
-        --classes "car,motorcycle,rider,person,autorickshaw,bicycle,traffic sign,traffic light,bus,truck,tanker_vehicle,crane_truck,street_cart,excavator" \
-        --out_dim 256 \
-        --output init_protos_t2.pt \
-        --prompt_template "a photo of a {} on an Indian road" \
-        --n_iters 5000 \
-        --seed 42 \
-        --base_protos "$T1_CKPT" \
-        --num_base 8
-
-else
-    echo "ERROR: Unknown task '$TASK'. Use: t1 or t2"
-    exit 1
-fi
+bash init_protos.sh "$@"
 
 echo ""
 echo "=========================================="

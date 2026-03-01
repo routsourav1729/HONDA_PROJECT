@@ -15,7 +15,7 @@ neck_embed_channels = [128, 256, _base_.last_stage_out_channels // 2]
 neck_num_heads = [4, 8, _base_.last_stage_out_channels // 2 // 32]
 base_lr = 1e-4  # Same as nu-OWODB reference (lower LR prevents forgetting)
 weight_decay = 0.0125
-train_batch_size_per_gpu = 8  # Smaller batch = more gradient updates per epoch
+train_batch_size_per_gpu = 16  # Must match trlder.batch_size below
 affine_scale = 0.5
 max_aspect_ratio = 120
 text_model_name = 'openai/clip-vit-base-patch32'
@@ -28,18 +28,20 @@ hyp_config = dict(
     # Poincaré ball parameters (MUST match T1!)
     curvature=1.0,           # c=1.0 means ball radius R=1/√c=1.0
     embed_dim=256,           # Hyperbolic embedding dimension
-    clip_r=3.0,              # Must match T1
+    clip_r=1.0,              # Must match T1
     
     # Loss weights
     hyp_loss_weight=1.0,     # Weight for horospherical CE loss
     dispersion_weight=0.1,   # T2: enable cross-dispersion to separate new from frozen
+    bias_reg_weight=0.1,     # L2 penalty on biases
+    compactness_weight=0.05, # Mild compactness (match T1)
     
     # Prototype initialization for NEW classes (6 novel)
     # Run: python init_prototypes.py --classes "bus,truck,tanker_vehicle,crane_truck,street_cart,excavator" --output init_protos_t2.pt
     init_protos='init_protos_t2.pt',
     
     # Previous task checkpoint (T1 model)
-    prev_ckpt='IDD_HYP/t1/horospherical/model_best.pth',
+    prev_ckpt='IDD_HYP/t1/horo_2conv/model_final.pth',
     
     # OOD detection threshold (for inference)
     ood_threshold=0.0,       # Adjust after calibration
@@ -168,7 +170,7 @@ voc_dataset_eval = dict(
 
 # Training dataloader - few-shot annotations in FewShot_Annotations folder
 # Using 30-shot for better novel class learning
-fewshot_k = 30  # 30-shot: 347 images, ~725 annotations
+fewshot_k = 10  # 10-shot: 136 images  (alternatives: 1, 20, 30)
 trlder = dict(
     batch_size=16,  # Same as nu-OWODB reference
     dataset=dict(

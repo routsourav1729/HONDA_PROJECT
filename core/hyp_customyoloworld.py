@@ -23,51 +23,6 @@ from .hyperbolic import HyperbolicProjector, busemann
 from .hyperbolic.projector import HorosphericalLoss
 
 
-def _rebuild_projector_from_ckpt(projector, state_dict):
-    """Rebuild projector conv layers to match checkpoint architecture.
-    
-    Detects single-conv vs two-conv from checkpoint weight shapes and
-    rebuilds the Sequential modules accordingly. This allows loading
-    old single-conv checkpoints with the current two-conv code (and vice versa).
-    """
-    import torch.nn as nn
-    
-    for scale in ['p3', 'p4', 'p5']:
-        prefix = f'hyp_projector.proj_{scale}'
-        # Gather all conv weight keys for this scale
-        conv_keys = sorted([k for k in state_dict if k.startswith(prefix) and 'weight' in k 
-                           and 'running' not in k and k.endswith('.weight')])
-        
-        # Check if it's single-conv (3 layers: conv, bn, relu → indices 0,1,2)
-        # or two-conv (4 layers: conv, bn, relu, conv → indices 0,1,2,3)
-        has_second_conv = f'{prefix}.3.weight' in state_dict
-        
-        first_conv_w = state_dict[f'{prefix}.0.weight']
-        out_ch, in_ch = first_conv_w.shape[:2]
-        
-        if has_second_conv:
-            # Two-conv: conv(in→in) + BN + ReLU + conv(in→out)
-            second_conv_w = state_dict[f'{prefix}.3.weight']
-            final_out = second_conv_w.shape[0]
-            new_proj = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_ch, final_out, kernel_size=1, bias=False),
-            )
-            print(f"    {scale}: two-conv ({in_ch}→{out_ch}→{final_out})")
-        else:
-            # Single-conv: conv(in→out) + BN + ReLU
-            new_proj = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-            )
-            print(f"    {scale}: single-conv ({in_ch}→{out_ch})")
-        
-        setattr(projector, f'proj_{scale}', new_proj)
-
-
 def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=False):
     """
     Load checkpoint for horospherical model.
@@ -80,19 +35,6 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
     """
     checkpoint = torch.load(checkpoint_path, map_location='cuda')
     state_dict = checkpoint.get('model_state_dict', checkpoint)
-    
-    # Auto-detect projector architecture from checkpoint weights.
-    # Single-conv checkpoint: proj_p3.0.weight is (out_dim, in_dim, 1, 1)
-    # Two-conv checkpoint:    proj_p3.0.weight is (in_dim, in_dim, 1, 1)
-    # If mismatch with current model, rebuild projector to match checkpoint.
-    ckpt_p3_key = 'hyp_projector.proj_p3.0.weight'
-    if ckpt_p3_key in state_dict:
-        ckpt_shape = state_dict[ckpt_p3_key].shape  # (out_ch, in_ch, 1, 1)
-        model_shape = model.hyp_projector.proj_p3[0].weight.shape
-        if ckpt_shape != model_shape:
-            print(f"  ⚠ Projector architecture mismatch: ckpt={list(ckpt_shape)} vs model={list(model_shape)}")
-            print(f"    Rebuilding projector to match checkpoint...")
-            _rebuild_projector_from_ckpt(model.hyp_projector, state_dict)
     
     # Keys to handle separately
     exclude_keys = ['embeddings', 'frozen_embeddings', 
@@ -162,12 +104,22 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
         model.register_buffer('frozen_directions', freeze_dirs.cuda())
         model.register_buffer('frozen_biases', freeze_biases.cuda())
         
-        # Initialize new trainable prototypes for novel classes
-        # NOTE: For T2+, should also use init_prototypes.py for novel class prototypes!
-        print(f"  ⚠ T2+: Using random init for {current_classes} novel prototypes")
-        print(f"     Consider using init_prototypes.py for better init!")
-        model.hyp_projector.classifier.prototype_direction = nn.Parameter(
-            torch.randn(current_classes, model.hyp_projector.out_dim))
+        # Re-initialize classifier for novel classes only.
+        # Directions: use CLIP-init from init_protos (already set in constructor
+        # via init_prototypes arg). If no init_protos was provided, fall back
+        # to random. Either way, directions are FROZEN (register_buffer).
+        existing_dirs = model.hyp_projector.classifier.prototype_direction
+        if existing_dirs.shape[0] == current_classes:
+            # init_protos was already loaded in constructor with correct novel count
+            print(f"  ✓ T2+: Novel directions from init_protos ({current_classes} classes, frozen buffer)")
+        else:
+            # Resize classifier for novel classes (random init fallback)
+            print(f"  ⚠ T2+: Resizing classifier for {current_classes} novel classes (random init)")
+            model.hyp_projector.classifier.register_buffer(
+                'prototype_direction',
+                torch.randn(current_classes, model.hyp_projector.out_dim))
+        
+        # Novel biases: trainable, start at 0
         model.hyp_projector.classifier.prototype_bias = nn.Parameter(
             torch.zeros(current_classes))
     
@@ -192,6 +144,7 @@ class HypCustomYoloWorld(nn.Module):
         hyp_c=1.0,
         hyp_dim=256,
         clip_r=0.95,
+        num_classifier_classes=None,  # For T2+: only novel classes (base in frozen_*)
         init_prototypes=None,  # Pre-computed from init_prototypes.py
         dispersion_weight=0.1,
         bias_reg_weight=0.1,
@@ -208,6 +161,9 @@ class HypCustomYoloWorld(nn.Module):
         # num_classes for visualization script compatibility
         self.num_classes = unknown_index
         
+        # Number of classes in the classifier (novel only for T2+, all for T1)
+        self._classifier_num_classes = num_classifier_classes if num_classifier_classes is not None else unknown_index
+        
         # TAL assignment labels
         self.tmp_labels = None
         
@@ -222,6 +178,7 @@ class HypCustomYoloWorld(nn.Module):
         
         self._init_text_embedding()
         self._init_hyperbolic_projector(clip_r, init_prototypes)
+        print(f"  Classifier: {self._classifier_num_classes} classes in classifier, {unknown_index} total")
         
         # Loss function with all regularization terms
         self.hyp_loss_fn = HorosphericalLoss(
@@ -252,7 +209,7 @@ class HypCustomYoloWorld(nn.Module):
             in_dims=[384, 768, 768],
             out_dim=self.hyp_dim,
             curvature=self.hyp_c,
-            num_classes=self.unknown_index,
+            num_classes=self._classifier_num_classes,
             clip_r=clip_r,
             riemannian=True,
             init_prototypes=init_prototypes

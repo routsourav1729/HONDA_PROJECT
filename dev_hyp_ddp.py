@@ -257,10 +257,18 @@ if __name__ == "__main__":
         exit(1)
 
     # Build model
+    # For T2+, the classifier only holds NOVEL class prototypes.
+    # Base class prototypes are loaded into frozen_directions/frozen_biases by load_hyp_ckpt.
+    prev_cls = cfg.TEST.PREV_INTRODUCED_CLS
+    cur_cls = cfg.TEST.CUR_INTRODUCED_CLS
+    classifier_num_classes = cur_cls if prev_cls > 0 else unknown_index
+    
     print_rank0(f"\n=== Building Horospherical Model ===", rank)
+    print_rank0(f"  Classifier classes: {classifier_num_classes} ({'novel only' if prev_cls > 0 else 'all'})", rank)
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
         hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
+        num_classifier_classes=classifier_num_classes,
         init_prototypes=init_prototypes,
         dispersion_weight=dispersion_weight,
         bias_reg_weight=bias_reg_weight,
@@ -434,11 +442,64 @@ if __name__ == "__main__":
         # Build a non-distributed loader for calibration
         cal_loader = Runner.build_dataloader(cfgY.trlder)
         
-        adaptive_stats = calibrate(
-            raw_model, cal_loader, class_names,
-            dataset_root='./datasets',
-            hyp_c=hyp_c,
-        )
+        # For T2+: preserve T1 base-class calibration stats (computed on the
+        # full training set) and only calibrate the NOVEL classes from the
+        # few-shot T2 data.  Merging avoids catastrophic stat degradation for
+        # base classes (T2 few-shot data has <<100 base-class instances).
+        if prev_cls > 0:
+            # --- Load T1 calibration stats ---
+            t1_ckpt_path = prev_ckpt if prev_ckpt else args.ckpt
+            print(f"  [T2+] Loading T1 calibration from: {t1_ckpt_path}")
+            t1_ckpt = torch.load(t1_ckpt_path, map_location='cpu')
+            t1_stats = t1_ckpt.get('adaptive_stats', None)
+            if t1_stats is None:
+                print("  WARNING: T1 checkpoint has no adaptive_stats — "
+                      "falling back to full recalibration.")
+            
+            # Calibrate ALL classes from T2 data (labels use global indices
+            # so we must pass the full class_names list), but we will only
+            # use the novel-class stats in the merge below.
+            novel_class_names = class_names[prev_cls:]
+            print(f"  [T2+] Novel classes to calibrate: {novel_class_names}")
+            print(f"  [T2+] Running calibration pass over T2 few-shot data...")
+            t2_stats = calibrate(
+                raw_model, cal_loader, class_names,  # full list (global indices)
+                dataset_root='./datasets',
+                hyp_c=hyp_c,
+            )
+            
+            # Merge: base stats from T1, novel stats from T2
+            if t1_stats is not None:
+                adaptive_stats = {'per_class': {}, 'alpha': t1_stats.get('alpha', 0.75)}
+                base_class_names = class_names[:prev_cls]
+                for cls_name in base_class_names:
+                    if cls_name in t1_stats['per_class']:
+                        adaptive_stats['per_class'][cls_name] = t1_stats['per_class'][cls_name]
+                        print(f"  [T2+] BASE  {cls_name:<20s}: PRESERVED from T1 "
+                              f"(n={t1_stats['per_class'][cls_name]['count']})")
+                    else:
+                        adaptive_stats['per_class'][cls_name] = {
+                            'mean': 0.0, 'std': 1.0, 'count': 0}
+                        print(f"  [T2+] BASE  {cls_name:<20s}: MISSING in T1 (fallback)")
+                for cls_name in novel_class_names:
+                    if cls_name in t2_stats['per_class'] and t2_stats['per_class'][cls_name]['count'] > 0:
+                        adaptive_stats['per_class'][cls_name] = t2_stats['per_class'][cls_name]
+                        n = t2_stats['per_class'][cls_name]['count']
+                        print(f"  [T2+] NOVEL {cls_name:<20s}: calibrated from T2 (n={n})")
+                    else:
+                        adaptive_stats['per_class'][cls_name] = {
+                            'mean': 0.0, 'std': 1.0, 'count': 0}
+                        print(f"  [T2+] NOVEL {cls_name:<20s}: NO samples (fallback)")
+            else:
+                # No T1 stats available — fall through to full calibration
+                adaptive_stats = t2_stats
+        else:
+            # T1: calibrate all classes normally on the full training set
+            adaptive_stats = calibrate(
+                raw_model, cal_loader, class_names,
+                dataset_root='./datasets',
+                hyp_c=hyp_c,
+            )
         
         hyp_config_dict = {
             'curvature': hyp_c,

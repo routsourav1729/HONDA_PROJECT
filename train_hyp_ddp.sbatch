@@ -1,16 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=hyp_ddp
+#SBATCH --job-name=hyp_t2
 #SBATCH --output=slurm_logs/hyp_ddp_%j.out
 #SBATCH --error=slurm_logs/hyp_ddp_%j.err
-#SBATCH --partition=dgx
-#SBATCH --qos=dgx
-#SBATCH --exclude=cn15-dgx
+#SBATCH --partition=l40
+#SBATCH --qos=l40
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:2
 #SBATCH --mem=128G
-#SBATCH --time=24:00:00
+#SBATCH --time=10:00:00
 
 # ============================================================================
 # Hyperbolic YOLO-World Training - Multi-GPU DDP
@@ -24,8 +23,8 @@
 # ============================================================================
 
 # Arguments
-SPLIT=${1:-t1}
-EXP_NAME=${2:-horospherical}
+SPLIT=${1:-t2}
+EXP_NAME=${2:-horo_2conv}
 # NUM_GPUS must match --gres=gpu:N in the SBATCH header above!
 # If you change this default, also change --gres=gpu:N and --cpus-per-task=(8*N)
 NUM_GPUS=${3:-2}
@@ -97,16 +96,8 @@ echo "=========================================="
 echo "Starting DDP TRAINING with $NUM_GPUS GPUs"
 echo "=========================================="
 
-# Use torchrun for DDP launch
-torchrun \
-    --nproc_per_node=$NUM_GPUS \
-    --master_port=$MASTER_PORT \
-    dev_hyp_ddp.py \
-    --config-file configs/IDD_HYP/base.yaml \
-    --task $TASK \
-    --ckpt $PRETRAINED_CKPT \
-    --exp_name $EXP_NAME \
-    --wandb
+# Call training script (edit train_hyp.sh to switch between T1/T2)
+bash train_hyp.sh $NUM_GPUS $MASTER_PORT $EXP_NAME
 
 echo ""
 echo "=========================================="
