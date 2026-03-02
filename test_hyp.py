@@ -14,6 +14,7 @@ where tau_k = mean_k - alpha * std_k  (calibrated from training data).
 import os
 import torch
 from tqdm import tqdm
+from torchvision.ops import nms
 
 from core import add_config
 from core.util.model_ema import add_model_ema_configs
@@ -164,6 +165,7 @@ if __name__ == "__main__":
 
     # Counters
     total_dets = 0
+    total_dets_after_nms = 0
     total_relabeled = 0
     
     # ---- Evaluation loop ----
@@ -183,6 +185,7 @@ if __name__ == "__main__":
                 preds.append(pred)
                 continue
             
+            # --- OOD relabeling (adaptive thresholds) ---
             if adaptive_thresholds is not None:
                 if hasattr(pred, 'horo_max_scores') and hasattr(pred, 'horo_assigned_proto'):
                     proto_indices = pred.horo_assigned_proto.long()
@@ -190,6 +193,14 @@ if __name__ == "__main__":
                     is_unknown = pred.horo_max_scores < per_det_thresholds
                     pred.labels[is_unknown] = unknown_index
                     total_relabeled += is_unknown.sum().item()
+            
+            # --- Post-NMS (matching ovow base_eval.py) ---
+            # The model already does NMS at iou=0.7 + max_per_img=300 internally.
+            # This second, tighter NMS at iou=0.5 removes remaining overlapping boxes,
+            # consistent with how ovow evaluates nu-OWODB and IDD benchmarks.
+            keep_idxs = nms(pred.bboxes, pred.scores, iou_threshold=0.5)
+            pred = pred[keep_idxs]
+            total_dets_after_nms += len(pred.scores)
             
             preds.append(pred)
         
@@ -203,7 +214,9 @@ if __name__ == "__main__":
     print(f"{'='*60}")
     print(f"  Checkpoint: {args.ckpt}")
     print(f"  clip_r: {clip_r} (from checkpoint)")
-    print(f"  Total detections: {total_dets}")
+    print(f"  Total detections (pre-NMS): {total_dets}")
+    print(f"  Total detections (post-NMS@0.5): {total_dets_after_nms}")
+    print(f"  NMS reduction: {(1 - total_dets_after_nms/max(total_dets,1))*100:.1f}%")
     print(f"  Relabeled as unknown: {total_relabeled} ({total_relabeled/max(total_dets,1)*100:.1f}%)")
     for key, value in results.items():
         print(f"  {key}: {value}")

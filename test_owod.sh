@@ -30,7 +30,7 @@ EXP=${EXP:-"horo_2conv"}   # experiment folder name under each task dir
 # T2 Evaluation: 8 base + 6 novel = 14 known + 1 unknown  (IDD)
 # Few-shot fine-tuned model with merged calibration (T1 base + T2 novel)
 # ============================================================================
-T2_EXP=${T2_EXP:-"fewshotfinetunev2"}
+T2_EXP=${T2_EXP:-"fewshotfinetunev3"}
 python test_hyp.py \
     --task ${BENCHMARK}/t2 \
     --config-file configs/${BENCHMARK}/t2.yaml \
