@@ -2,14 +2,14 @@
 #SBATCH --job-name=hyp_t2
 #SBATCH --output=slurm_logs/hyp_ddp_%j.out
 #SBATCH --error=slurm_logs/hyp_ddp_%j.err
-#SBATCH --partition=l40
-#SBATCH --qos=l40
+#SBATCH --partition=dgx
+#SBATCH --qos=dgx
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:2
 #SBATCH --mem=128G
-#SBATCH --time=10:00:00
+#SBATCH --time=1:00:00
 
 # ============================================================================
 # Hyperbolic YOLO-World Training - Multi-GPU DDP

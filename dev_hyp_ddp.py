@@ -439,8 +439,17 @@ if __name__ == "__main__":
         # Use raw_model for calibration (unwrapped from DDP)
         raw_model.eval()
         
-        # Build a non-distributed loader for calibration
-        cal_loader = Runner.build_dataloader(cfgY.trlder)
+        # Build a NON-distributed calibration loader that sees ALL images.
+        # We override batch_size=4 (small to avoid OOM on single-GPU inference),
+        # shuffle=False, and ensure no DDP sampler is injected.
+        import copy
+        cal_cfg = copy.deepcopy(cfgY.trlder)
+        cal_cfg['batch_size'] = 4
+        cal_cfg['sampler'] = dict(type='DefaultSampler', shuffle=False)
+        cal_loader = Runner.build_dataloader(cal_cfg)
+        print(f"  Calibration loader: {len(cal_loader)} batches "
+              f"(batch_size={cal_cfg['batch_size']}, "
+              f"images={len(cal_loader.dataset)})")
         
         # For T2+: preserve T1 base-class calibration stats (computed on the
         # full training set) and only calibrate the NOVEL classes from the

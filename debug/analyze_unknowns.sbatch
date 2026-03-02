@@ -2,14 +2,14 @@
 #SBATCH --job-name=analyze_unk
 #SBATCH --output=slurm_logs/analyze_unk_%j.out
 #SBATCH --error=slurm_logs/analyze_unk_%j.err
-#SBATCH --partition=l40
-#SBATCH --qos=l40
+#SBATCH --partition=dgx
+#SBATCH --qos=dgx
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
-#SBATCH --time=06:00:00
+#SBATCH --time=02:00:00
 
 # ============================================================================
 # Unknown Embedding Analysis (train split)
@@ -19,10 +19,11 @@
 
 BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
-TASK="IDD_HYP/t1"
-CKPT="$BASE_DIR/IDD_HYP/t1/my_experiment/model_final.pth"
-# clip_r MUST match the value used during training
-CLIP_R=3.0
+# --- EDIT THESE for T1 vs T2 ---
+TASK="IDD_HYP/t2"
+CKPT="$BASE_DIR/IDD_HYP/t2/fewshotfinetunev3/model_final.pth"
+# clip_r is now auto-read from checkpoint (the --clip_r flag is just a fallback)
+CLIP_R=1.0
 SPLIT="train"
 
 echo "=========================================="

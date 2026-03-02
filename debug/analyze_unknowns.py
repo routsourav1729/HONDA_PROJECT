@@ -855,9 +855,12 @@ def plot_poincare_ball(class_data, known_class_names, prototypes, biases,
     # Ideal points on 2D boundary
     proto_2d_boundary = proto_2d_poincare / np.linalg.norm(proto_2d_poincare, axis=-1, keepdims=True).clip(1e-8) * R
 
-    # Color setup
-    known_colors = plt.cm.tab10(np.linspace(0, 1, len(known_class_names)))
-    # Create color map: known classes get tab10, unknowns get gray
+    # Color setup — use tab20 for up to 20 distinct known-class colors
+    n_known = len(known_class_names)
+    if n_known <= 10:
+        known_colors = plt.cm.tab10(np.linspace(0, 1, 10))[:n_known]
+    else:
+        known_colors = plt.cm.tab20(np.linspace(0, 1, 20))[:n_known]
     color_map = {}
     for i, name in enumerate(known_class_names):
         color_map[name] = known_colors[i]
@@ -896,16 +899,15 @@ def _draw_poincare_figure(poincare_2d, all_labels, all_is_known, proto_2d_bounda
     known_set = set(known_class_names)
     unique_labels = sorted(set(all_labels))
 
-    # Plot unknown first (behind), then known
-    unknown_labels = [l for l in unique_labels if l not in known_set]
+    # Plot ALL unknowns as a single group (one color, one legend entry)
+    unk_mask = ~all_is_known
+    if unk_mask.any():
+        pts_unk = poincare_2d[unk_mask]
+        ax.scatter(pts_unk[:, 0], pts_unk[:, 1], s=4, alpha=0.12,
+                   c='#AAAAAA', marker='.', label='unknown', rasterized=True)
+
+    # Plot each known class with distinct color
     known_labels_present = [l for l in unique_labels if l in known_set]
-
-    for cls_key in unknown_labels:
-        mask = all_labels == cls_key
-        pts = poincare_2d[mask]
-        ax.scatter(pts[:, 0], pts[:, 1], s=4, alpha=0.15, c='gray',
-                   marker='.', label=f'*{cls_key}', rasterized=True)
-
     for cls_key in known_labels_present:
         mask = all_labels == cls_key
         pts = poincare_2d[mask]
@@ -964,13 +966,12 @@ def _draw_poincare_figure(poincare_2d, all_labels, all_is_known, proto_2d_bounda
     ax.set_xlabel('PCA dim 1')
     ax.set_ylabel('PCA dim 2')
 
-    # Legend (deduplicate, limit entries)
+    # Legend (deduplicate)
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
-    # Limit legend to max 20 entries
-    items = list(by_label.items())[:20]
-    ax.legend([v for _, v in items], [k for k, _ in items],
-              loc='upper right', fontsize=7, ncol=2, markerscale=3)
+    ax.legend(by_label.values(), by_label.keys(),
+              loc='upper right', fontsize=8, ncol=1, markerscale=3,
+              framealpha=0.85)
 
     ax.grid(True, alpha=0.15)
     plt.tight_layout()
@@ -999,7 +1000,11 @@ if __name__ == "__main__":
 
     # Handle IDD_HYP -> IDD for dataset registration
     base_dataset = task_name.replace('_HYP', '')
-    dataset_key = base_dataset
+    # For T2+, use the T2 dataset key so all 14 classes are registered
+    if split_name in ['t2', 't3', 't4']:
+        dataset_key = f"{base_dataset}_T{split_name[1].upper()}"
+    else:
+        dataset_key = base_dataset
 
     data_split = f"{base_dataset}/{split_name}"
     data_register = Register('./datasets/', data_split, cfg, dataset_key)
@@ -1016,6 +1021,24 @@ if __name__ == "__main__":
     print(f"  Curvature: {args.hyp_c}")
     print(f"  clip_r: {args.clip_r}")
     print(f"  Checkpoint: {args.ckpt}")
+
+    # --- Read hyp_config from checkpoint (authoritative source for clip_r etc.) ---
+    ckpt_data = torch.load(args.ckpt, map_location='cpu')
+    hyp_config = ckpt_data.get('hyp_config', {})
+    hyp_c = hyp_config.get('curvature', args.hyp_c)
+    hyp_dim = hyp_config.get('embed_dim', args.hyp_dim)
+    clip_r = hyp_config.get('clip_r', args.clip_r)
+    # Override args with checkpoint values (they are the ground truth)
+    if clip_r != args.clip_r:
+        print(f"  WARNING: --clip_r={args.clip_r} overridden by checkpoint clip_r={clip_r}")
+        args.clip_r = clip_r
+    if hyp_c != args.hyp_c:
+        print(f"  WARNING: --hyp_c={args.hyp_c} overridden by checkpoint hyp_c={hyp_c}")
+        args.hyp_c = hyp_c
+    if hyp_dim != args.hyp_dim:
+        print(f"  WARNING: --hyp_dim={args.hyp_dim} overridden by checkpoint hyp_dim={hyp_dim}")
+        args.hyp_dim = hyp_dim
+    del ckpt_data  # free memory
 
     # Model config - use task_name (IDD_HYP) for config paths
     config_file = os.path.join("./configs", task_name, split_name + ".py")
@@ -1043,16 +1066,21 @@ if __name__ == "__main__":
         data_loader = Runner.build_dataloader(cfgY.test_dataloader)
         print(f"  Using TEST loader: {len(data_loader.dataset)} images")
 
-    # Build hyperbolic model
+    # Build hyperbolic model — for T2+, classifier holds only novel classes
+    prev_cls = cfg.TEST.PREV_INTRODUCED_CLS
+    cur_cls = cfg.TEST.CUR_INTRODUCED_CLS
+    classifier_num_classes = cur_cls if prev_cls > 0 else unknown_index
+
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
-        hyp_c=args.hyp_c, hyp_dim=args.hyp_dim, clip_r=args.clip_r
+        hyp_c=args.hyp_c, hyp_dim=args.hyp_dim, clip_r=args.clip_r,
+        num_classifier_classes=classifier_num_classes,
     )
 
     print(f"\n=== Loading Checkpoint: {args.ckpt} ===")
     with torch.no_grad():
         model = load_hyp_ckpt(model, args.ckpt,
-                              cfg.TEST.PREV_INTRODUCED_CLS, cfg.TEST.CUR_INTRODUCED_CLS, eval=True)
+                              prev_cls, cur_cls, eval=True)
         model = model.cuda()
         model.add_generic_text(known_class_names, generic_prompt='object', alpha=0.4)
     model.eval()
