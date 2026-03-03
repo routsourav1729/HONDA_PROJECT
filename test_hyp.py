@@ -169,6 +169,7 @@ if __name__ == "__main__":
     total_relabeled = 0
     
     # ---- Evaluation loop ----
+    # Pipeline matches ovow test.py: predict → relabel OOD → NMS → evaluate
     for batch in tqdm(test_loader, desc="Evaluating"):
         data = model.parent.data_preprocessor(batch)
         
@@ -185,7 +186,11 @@ if __name__ == "__main__":
                 preds.append(pred)
                 continue
             
-            # --- OOD relabeling (adaptive thresholds) ---
+            # --- Step 1: OOD relabeling (BEFORE NMS, matching ovow test.py) ---
+            # ovow: ood_score = -cosinescores.max(dim=1).values
+            #        if ood_score > ood_threshold → unknown
+            # ours:  horo_max_scores = max horosphere score (higher = more ID)
+            #        if horo_max_scores < adaptive_threshold[proto_k] → unknown
             if adaptive_thresholds is not None:
                 if hasattr(pred, 'horo_max_scores') and hasattr(pred, 'horo_assigned_proto'):
                     proto_indices = pred.horo_assigned_proto.long()
@@ -194,10 +199,8 @@ if __name__ == "__main__":
                     pred.labels[is_unknown] = unknown_index
                     total_relabeled += is_unknown.sum().item()
             
-            # --- Post-NMS (matching ovow base_eval.py) ---
-            # The model already does NMS at iou=0.7 + max_per_img=300 internally.
-            # This second, tighter NMS at iou=0.5 removes remaining overlapping boxes,
-            # consistent with how ovow evaluates nu-OWODB and IDD benchmarks.
+            # --- Step 2: NMS (AFTER relabeling, matching ovow test.py) ---
+            # Class-agnostic NMS at iou=0.5 on YOLO scores
             keep_idxs = nms(pred.bboxes, pred.scores, iou_threshold=0.5)
             pred = pred[keep_idxs]
             total_dets_after_nms += len(pred.scores)
@@ -217,7 +220,7 @@ if __name__ == "__main__":
     print(f"  Total detections (pre-NMS): {total_dets}")
     print(f"  Total detections (post-NMS@0.5): {total_dets_after_nms}")
     print(f"  NMS reduction: {(1 - total_dets_after_nms/max(total_dets,1))*100:.1f}%")
-    print(f"  Relabeled as unknown: {total_relabeled} ({total_relabeled/max(total_dets,1)*100:.1f}%)")
+    print(f"  Relabeled as unknown: {total_relabeled} ({total_relabeled/max(total_dets_after_nms,1)*100:.1f}% of post-NMS)")
     for key, value in results.items():
         print(f"  {key}: {value}")
     print(f"{'='*60}")

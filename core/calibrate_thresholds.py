@@ -220,6 +220,11 @@ def compute_thresholds(adaptive_stats, class_names, alpha=None):
     """
     Compute per-class threshold tensor from calibration stats.
 
+    tau_k = mean_k - alpha * std_k
+
+    Every class uses its own calibration data, regardless of sample count.
+    In few-shot (e.g., 10-shot), even 10 samples give a reasonable mean/std.
+
     Parameters
     ----------
     adaptive_stats : dict
@@ -238,15 +243,16 @@ def compute_thresholds(adaptive_stats, class_names, alpha=None):
         alpha = adaptive_stats.get('alpha', 0.75)
 
     cal = adaptive_stats['per_class']
-    thresholds = []
 
+    thresholds = []
     print(f"\n  Adaptive thresholds (alpha={alpha:.2f}):")
     for cls_name in class_names:
-        if cls_name in cal:
+        if cls_name in cal and cal[cls_name]['count'] > 0:
             mu = cal[cls_name]['mean']
             std = cal[cls_name]['std']
+            n = cal[cls_name]['count']
             tau = mu - alpha * std
-            print(f"    {cls_name:<20s}: tau={tau:.4f}  (mean={mu:.4f}, std={std:.4f}, n={cal[cls_name]['count']})")
+            print(f"    {cls_name:<20s}: tau={tau:.4f}  (mean={mu:.4f}, std={std:.4f}, n={n})")
         else:
             tau = -10.0
             print(f"    {cls_name:<20s}: tau={tau:.4f}  (MISSING — permissive fallback)")
