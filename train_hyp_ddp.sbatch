@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=hyp_t2
+#SBATCH --job-name=hyp_t1
 #SBATCH --output=slurm_logs/hyp_ddp_%j.out
 #SBATCH --error=slurm_logs/hyp_ddp_%j.err
 #SBATCH --partition=dgx
@@ -23,8 +23,8 @@
 # ============================================================================
 
 # Arguments
-SPLIT=${1:-t2}
-EXP_NAME=${2:-horo_2conv}
+SPLIT=${1:-t1}
+EXP_NAME=${2:-hyp_v2}
 # NUM_GPUS must match --gres=gpu:N in the SBATCH header above!
 # If you change this default, also change --gres=gpu:N and --cpus-per-task=(8*N)
 NUM_GPUS=${3:-2}

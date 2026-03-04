@@ -182,3 +182,6 @@ dmypy.json
 
 .idea/
 output*/
+
+# Ignore only the util directory at the root of this repo (not other util dirs)
+/util/

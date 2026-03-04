@@ -21,8 +21,8 @@
 # ============================================================================
 
 TASK="IDD_HYP/t1"
-# CKPT="IDD_HYP/t1/4gpu_1x1_40ep/model_final.pth"
-CKPT="IDD_HYP/t1/horo_2conv/model_final.pth"
+# CKPT="IDD_HYP/t1/horo_2conv/model_final.pth"  # V1 (dim=256)
+CKPT="IDD_HYP/t1/hyp_v2/model_final.pth"        # V2 (dim=64)
 
 
 # Optional: override alpha (default=0.75 from calibration)

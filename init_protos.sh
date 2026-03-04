@@ -18,46 +18,45 @@ read_classes() {
 }
 
 # ============================================================================
-# T1: Base prototypes (8 classes)
+# T1: Base prototypes (8 classes)  ← ACTIVE
 # ============================================================================
-# Uncomment to regenerate T1 prototypes (already done once)
-
-# T1_CLASSES=$(read_classes "$CLASS_DIR/t1_classes.txt")
-# echo "=== T1 Prototypes: $T1_CLASSES ==="
-# python init_prototypes.py \
-#     --classes "$T1_CLASSES" \
-#     --out_dim 256 \
-#     --output init_protos_t1.pt \
-#     --prompt_template "$PROMPT" \
-#     --n_iters 3000 \
-#     --seed 42
-
-# ============================================================================
-# T2: Novel prototypes (6 classes, anchored to T1)
-# ============================================================================
-# Generates directions for ALL 14 classes, then extracts only the 6 novel ones.
-# Uses T1 checkpoint to ensure novel directions don't overlap with base ones.
-
-T1_CKPT=${1:-"IDD_HYP/t1/horo_2conv/model_final.pth"}
+# V2: out_dim=64 (reduced from 256)
 
 T1_CLASSES=$(read_classes "$CLASS_DIR/t1_classes.txt")
-T2_CLASSES=$(read_classes "$CLASS_DIR/t2_classes.txt")
-ALL_CLASSES="${T1_CLASSES},${T2_CLASSES}"
-
-echo "=== T2 Prototypes ==="
-echo "  All classes (14): $ALL_CLASSES"
-echo "  Novel only (6):   $T2_CLASSES"
-echo "  T1 checkpoint:    $T1_CKPT"
-echo ""
-
+echo "=== T1 Prototypes: $T1_CLASSES ==="
 python init_prototypes.py \
-    --classes "$ALL_CLASSES" \
-    --out_dim 256 \
-    --output init_protos_t2.pt \
+    --classes "$T1_CLASSES" \
+    --out_dim 64 \
+    --output init_protos_t1.pt \
     --prompt_template "$PROMPT" \
-    --n_iters 5000 \
-    --seed 42 \
-    --base_protos "$T1_CKPT" \
+    --n_iters 3000 \
+    --seed 42
+
+# ============================================================================
+# T2: Novel prototypes (6 classes, anchored to T1)  ← COMMENTED
+# ============================================================================
+# Uncomment when T1 is done. Update T1_CKPT to the new hyp_v2 checkpoint.
+
+# T1_CKPT=${1:-"IDD_HYP/t1/hyp_v2/model_final.pth"}
+#
+# T1_CLASSES=$(read_classes "$CLASS_DIR/t1_classes.txt")
+# T2_CLASSES=$(read_classes "$CLASS_DIR/t2_classes.txt")
+# ALL_CLASSES="${T1_CLASSES},${T2_CLASSES}"
+#
+# echo "=== T2 Prototypes ==="
+# echo "  All classes (14): $ALL_CLASSES"
+# echo "  Novel only (6):   $T2_CLASSES"
+# echo "  T1 checkpoint:    $T1_CKPT"
+# echo ""
+#
+# python init_prototypes.py \
+#     --classes "$ALL_CLASSES" \
+#     --out_dim 64 \
+#     --output init_protos_t2.pt \
+#     --prompt_template "$PROMPT" \
+#     --n_iters 5000 \
+#     --seed 42 \
+#     --base_protos "$T1_CKPT" \
     --num_base 8
 
 echo ""

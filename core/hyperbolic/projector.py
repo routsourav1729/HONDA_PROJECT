@@ -1,8 +1,13 @@
 """
-Hyperbolic Projector with Horospherical Classifier.
+Hyperbolic Projector with Horospherical Classifier — V2.
 
 Projects visual features from YOLO backbone to Poincaré ball,
 then classifies using Busemann function with ideal prototypes on boundary.
+
+V2 changes:
+- embed_dim 256 → 64 (14 classes only need d >= K-1 = 13)
+- Prototypes trainable on unit sphere via Riemannian gradient (manual projection)
+- HorosphericalLossV2: class-balanced CE + margin + geodesic pull + dispersion + bias reg
 """
 
 import torch
@@ -22,6 +27,9 @@ class HorosphericalClassifier(nn.Module):
     
     For OOD detection: max_k ξ_k(x) < threshold → unknown
     
+    V2: Prototypes are now TRAINABLE nn.Parameters that stay on the unit sphere
+    via manual Riemannian projection after each optimizer step.
+    
     Parameters
     ----------
     num_classes : int
@@ -32,30 +40,49 @@ class HorosphericalClassifier(nn.Module):
         Poincaré ball curvature (default: 1.0)
     init_directions : tensor, optional
         Pre-computed prototype directions from init_prototypes.py (K, embed_dim)
+    trainable_prototypes : bool
+        Whether prototype directions are trainable (default: True for V2)
     """
     
-    def __init__(self, num_classes, embed_dim, curvature=1.0, init_directions=None):
+    def __init__(self, num_classes, embed_dim, curvature=1.0, init_directions=None,
+                 trainable_prototypes=True):
         super().__init__()
         self.c = curvature
         self.R = 1.0 / (curvature ** 0.5)  # Ball radius
         self.num_classes = num_classes
         self.embed_dim = embed_dim
+        self.trainable_prototypes = trainable_prototypes
         
-        # Ideal prototype directions — FROZEN (registered as buffer, not parameter).
-        # CLIP init gives a perfect uniform simplex (cos_sim = -1/(K-1) for all pairs).
-        # Training consistently degrades this optimal separation, so we freeze.
-        # Only the biases (horosphere positions) are learnable.
         if init_directions is not None:
             assert init_directions.shape == (num_classes, embed_dim), \
                 f"init_directions shape mismatch: {init_directions.shape} vs ({num_classes}, {embed_dim})"
-            self.register_buffer('prototype_direction', init_directions.clone())
-            print(f"  ✓ Prototype directions FROZEN from pre-computed tensor (not trainable)")
+            directions = F.normalize(init_directions.clone(), dim=-1)
         else:
             # Placeholder — will be overwritten by load_hyp_ckpt()
-            self.register_buffer('prototype_direction', torch.randn(num_classes, embed_dim))
+            directions = F.normalize(torch.randn(num_classes, embed_dim), dim=-1)
+        
+        if trainable_prototypes:
+            # TRAINABLE on unit sphere. After each optimizer.step(), call
+            # project_prototypes_to_sphere() to re-normalize.
+            self.prototype_direction = nn.Parameter(directions)
+            print(f"  ✓ Prototype directions TRAINABLE on S^{embed_dim-1} ({num_classes} classes)")
+        else:
+            # FROZEN (v1 behavior)
+            self.register_buffer('prototype_direction', directions)
+            print(f"  ✓ Prototype directions FROZEN from pre-computed tensor (not trainable)")
         
         # Learnable bias per class - controls horosphere position
         self.prototype_bias = nn.Parameter(torch.zeros(num_classes))
+    
+    @torch.no_grad()
+    def project_prototypes_to_sphere(self):
+        """Project prototype directions back to unit sphere after optimizer step.
+        
+        This implements the Riemannian constraint: prototypes must lie on S^{d-1}.
+        Call this after every optimizer.step() during training.
+        """
+        if self.trainable_prototypes and isinstance(self.prototype_direction, nn.Parameter):
+            self.prototype_direction.data = F.normalize(self.prototype_direction.data, dim=-1)
     
     @property
     def prototypes(self):
@@ -122,43 +149,155 @@ class HorosphericalClassifier(nn.Module):
 
 
 class HorosphericalLoss(nn.Module):
+    """Backward-compatible alias for HorosphericalLossV2."""
+    pass  # Kept for import compatibility — V2 is the actual class now
+
+
+# =========================================================================
+# V2 Loss Helper Functions
+# =========================================================================
+
+def compute_class_weights(labels, num_classes, smoothing=0.5):
     """
-    Cross-entropy loss over horospherical scores with regularization.
+    Compute sqrt-inverse-frequency weights for class balancing.
     
-    L = CE(scores, labels) 
-        + dispersion_weight * dispersion_loss    (push prototypes apart)
-        + bias_reg_weight * ||biases||^2          (keep horospheres tight)
-        + compactness_weight * compactness_loss    (pull knowns into their horosphere)
+    Args:
+        labels: (N,) tensor of class indices for foreground anchors
+        num_classes: int, total number of known classes
+        smoothing: float, power for inverse frequency (0.5 = sqrt)
     
-    Parameters
-    ----------
-    curvature : float
-        Poincaré ball curvature (default: 1.0)
-    label_smoothing : float
-        Label smoothing factor (default: 0.0)
-    dispersion_weight : float
-        Weight for direction dispersion loss (default: 0.1)
-    bias_reg_weight : float
-        L2 penalty on prototype biases to prevent horosphere inflation (default: 0.1)
-    compactness_weight : float
-        Weight for intra-class compactness loss (default: 0.0)
+    Returns:
+        weights: (num_classes,) tensor of per-class weights, normalized so mean=1
+    """
+    counts = torch.bincount(labels, minlength=num_classes).float().clamp(min=1.0)
+    max_count = counts.max()
+    weights = (max_count / counts) ** smoothing  # sqrt inverse frequency
+    weights = weights / weights.mean()  # normalize so mean weight = 1
+    return weights
+
+
+def busemann_margin_loss(scores, labels, margin=1.0):
+    """
+    Busemann margin loss for horospherical classification.
+    
+    For each foreground anchor, enforce: ξ_{y_i}(x_i) - ξ_k(x_i) >= margin ∀ k ≠ y_i
+    
+    Args:
+        scores: (N, K) Busemann-based horosphere scores
+        labels: (N,) ground-truth class indices
+        margin: float, required score gap
+    
+    Returns:
+        loss: scalar, mean hinge loss over all foreground anchors
+    """
+    N, K = scores.shape
+    if N == 0:
+        return scores.sum() * 0.0
+    
+    # Get correct class score for each anchor: (N,)
+    correct_scores = scores.gather(1, labels.unsqueeze(1)).squeeze(1)
+    
+    # margin - (correct_score - other_score) for each class
+    margins = margin - correct_scores.unsqueeze(1) + scores  # (N, K)
+    
+    # Zero out the correct class (no self-comparison)
+    mask = torch.ones_like(margins, dtype=torch.bool)
+    mask.scatter_(1, labels.unsqueeze(1), False)
+    
+    # Hinge: max(0, margin - gap)
+    violations = torch.clamp(margins[mask].view(N, K - 1), min=0.0)
+    
+    return violations.mean()
+
+
+def geodesic_prototype_pull(embeddings, labels, prototypes, c=1.0, target_norm_fraction=0.85):
+    """
+    Pull embeddings toward target points near their class prototype.
+    
+    Instead of pulling to the boundary (which causes collapse), pull toward
+    a point at target_norm_fraction * R in the prototype's direction.
+    
+    Args:
+        embeddings: (N, D) points in Poincaré ball
+        labels: (N,) class indices
+        prototypes: (K, D) ideal prototypes on boundary (norm = R = 1/√c)
+        c: float, curvature
+        target_norm_fraction: float in (0, 1), how close to boundary the target is
+    
+    Returns:
+        loss: scalar, mean geodesic distance to target points
+    """
+    if embeddings.shape[0] == 0:
+        return embeddings.sum() * 0.0
+    
+    R = 1.0 / (c ** 0.5)  # ball radius
+    
+    # Target points: scale prototypes inward from boundary
+    # prototypes have norm R, targets have norm target_norm_fraction * R
+    target_points = prototypes[labels] * target_norm_fraction  # (N, D)
+    
+    # Geodesic distance in Poincaré ball
+    # d_H(x,y) = acosh(1 + 2||x-y||² / ((1 - c||x||²)(1 - c||y||²)))
+    diff_sq = (embeddings - target_points).pow(2).sum(dim=-1)  # (N,)
+    emb_sq = (embeddings.pow(2).sum(dim=-1)).clamp(max=R**2 - 1e-5)
+    tgt_sq = (target_points.pow(2).sum(dim=-1)).clamp(max=R**2 - 1e-5)
+    
+    denom = (1.0 - c * emb_sq) * (1.0 - c * tgt_sq)
+    denom = denom.clamp(min=1e-8)
+    
+    argument = 1.0 + 2.0 * c * diff_sq / denom
+    argument = argument.clamp(min=1.0 + 1e-7)  # numerical safety for acosh
+    
+    dist = torch.acosh(argument)
+    
+    return dist.mean()
+
+
+class HorosphericalLossV2(nn.Module):
+    """
+    Horospherical loss V2 with 5 components:
+    
+    A) Class-balanced cross-entropy (sqrt-inverse-frequency weighting)
+    B) Busemann margin loss (enforce gap between correct and other scores)
+    C) Geodesic prototype pull (pull embeddings toward target in Poincaré ball)
+    D) Direction dispersion loss (push prototypes apart on sphere) — kept from V1
+    E) Bias L2 regularization (keep horospheres tight) — kept from V1
+    
+    Replaces V1's compactness loss with geodesic pull + margin loss.
     """
     
-    def __init__(self, curvature=1.0, label_smoothing=0.0, dispersion_weight=0.1,
-                 bias_reg_weight=0.1, compactness_weight=0.0):
+    def __init__(self, 
+                 curvature=1.0,
+                 # CE
+                 ce_weight=1.0,
+                 class_balance_smoothing=0.5,
+                 # Margin
+                 margin=1.0,
+                 margin_weight=0.5,
+                 # Geodesic pull
+                 pull_weight=0.1,
+                 target_norm_fraction=0.85,
+                 # Dispersion (from V1)
+                 dispersion_weight=0.1,
+                 # Bias reg (from V1)
+                 bias_reg_weight=0.1):
         super().__init__()
         self.c = curvature
-        self.label_smoothing = label_smoothing
+        self.ce_weight = ce_weight
+        self.class_balance_smoothing = class_balance_smoothing
+        self.margin = margin
+        self.margin_weight = margin_weight
+        self.pull_weight = pull_weight
+        self.target_norm_fraction = target_norm_fraction
         self.dispersion_weight = dispersion_weight
         self.bias_reg_weight = bias_reg_weight
-        self.compactness_weight = compactness_weight
     
     def direction_dispersion_loss(self, prototype_direction, frozen_directions=None):
         """
-        Uniform loss (Wang & Isola 2020 / Berg et al. IJCV 2025 Eq. 17).
-        Continuous repulsion on ALL pairs; includes cross-repulsion at T2+.
+        Uniform loss (Wang & Isola 2020): continuous repulsion on ALL pairs.
+        Includes cross-repulsion with frozen base directions at T2+.
         """
-        dirs = F.normalize(prototype_direction, dim=-1)  # (K_new, D)
+        dirs = F.normalize(prototype_direction, dim=-1)
         if frozen_directions is not None and frozen_directions.numel() > 0:
             all_dirs = torch.cat([dirs, F.normalize(frozen_directions, dim=-1)], dim=0)
         else:
@@ -170,219 +309,96 @@ class HorosphericalLoss(nn.Module):
         mask = ~torch.eye(K, dtype=torch.bool, device=dirs.device)
         return torch.log(torch.exp(-dist_sq[mask]).mean())
     
-    def bias_regularization(self, prototype_bias, frozen_biases=None):
+    def forward(self, embeddings, scores, labels, prototypes, biases,
+                prototype_direction=None, frozen_directions=None):
         """
-        L2 penalty on prototype biases to keep horospheres tight.
+        Compute V2 loss.
         
-        Large positive biases inflate horospheres, causing unknowns to be 
-        absorbed. This penalizes all biases, especially large positive ones.
-        """
-        reg = prototype_bias.pow(2).mean()
-        if frozen_biases is not None and frozen_biases.numel() > 0:
-            reg = reg + frozen_biases.pow(2).mean()
-        return reg
-    
-    def compactness_loss(self, scores, labels):
-        """
-        Encourage high horosphere scores for correctly assigned anchors.
+        Args:
+            embeddings: (M, D) Poincaré ball embeddings for ALL B×8400 anchors
+            scores: (M, K) horosphere scores ξ_k(x) = -B_pk(x) + a_k
+            labels: (M,) ground truth, -1 for background/ignore
+            prototypes: (K, D) ideal prototypes on boundary
+            biases: (K,) learnable bias terms
+            prototype_direction: (K_train, D) trainable directions for dispersion
+            frozen_directions: (K_frozen, D) frozen directions for cross-dispersion
         
-        For each assigned anchor, maximize its score for the GT class.
-        This tightens known clusters, making the boundary more discriminative.
-        
-        L_compact = mean(max(margin - score_gt, 0))
-        """
-        valid = labels >= 0
-        if valid.sum() == 0:
-            return scores.new_tensor(0.0)
-        
-        valid_scores = scores[valid]  # (N_valid, K)
-        valid_labels = labels[valid]  # (N_valid,)
-        
-        # Get score for the GT class
-        gt_scores = valid_scores[torch.arange(len(valid_labels), device=labels.device), valid_labels]
-        
-        # Hinge: penalize when GT score < margin (want high scores for correct class)
-        margin = 2.0  
-        compact = F.relu(margin - gt_scores)
-        return compact.mean()
-    
-    def forward(self, scores, labels, prototype_direction=None, frozen_directions=None,
-                prototype_bias=None, frozen_biases=None):
-        """
-        Compute cross-entropy loss over horospherical scores.
-        
-        Parameters
-        ----------
-        scores : tensor (B*N, K) or (N, K)
-            Horospherical scores from classifier
-        labels : tensor (B*N,) or (N,)
-            Class labels, -1 for background/ignore
-        prototype_direction : tensor (K, D), optional
-            Raw prototype directions for dispersion loss
-        frozen_directions : tensor (K_frozen, D), optional
-            Frozen directions from previous tasks for cross-dispersion (T2+)
-        prototype_bias : tensor (K,), optional
-            Prototype biases for L2 regularization
-        frozen_biases : tensor (K_frozen,), optional
-            Frozen biases for regularization
-        
-        Returns
-        -------
-        tensor
-            Scalar loss (CE + dispersion + bias_reg + compactness)
+        Returns:
+            loss: scalar total loss
+            loss_dict: dict of individual loss values for logging
         """
         # Flatten if batched
         if scores.dim() == 3:
             B, N, K = scores.shape
             scores = scores.reshape(B * N, K)
             labels = labels.reshape(B * N)
+            embeddings = embeddings.reshape(B * N, embeddings.shape[-1])
         
-        # Filter valid (ignore background label=-1)
         valid = labels >= 0
-        if valid.sum() == 0:
-            ce_loss = scores.new_tensor(0.0)
-        else:
-            valid_scores = scores[valid]
-            valid_labels = labels[valid]
-            ce_loss = F.cross_entropy(valid_scores, valid_labels, label_smoothing=self.label_smoothing)
+        num_classes = prototypes.shape[0]
         
-        # Dispersion loss (push prototype directions apart)
+        if valid.sum() == 0:
+            zero = scores.sum() * 0.0
+            return zero, {
+                'ce_loss': 0.0, 'margin_loss': 0.0, 'pull_loss': 0.0,
+                'disp_loss': 0.0, 'bias_reg': 0.0, 'total': 0.0,
+            }
+        
+        fg_embeddings = embeddings[valid]   # (N, D)
+        fg_scores = scores[valid]           # (N, K)
+        fg_labels = labels[valid]           # (N,)
+        
+        # --- A: Class-balanced CE ---
+        class_weights = compute_class_weights(fg_labels, num_classes, self.class_balance_smoothing)
+        ce_loss = F.cross_entropy(fg_scores, fg_labels, weight=class_weights.to(fg_scores.device))
+        
+        # --- B: Busemann margin loss ---
+        margin_loss = busemann_margin_loss(fg_scores, fg_labels, self.margin)
+        
+        # --- C: Geodesic prototype pull ---
+        pull_loss = geodesic_prototype_pull(
+            fg_embeddings, fg_labels, prototypes,
+            c=self.c, target_norm_fraction=self.target_norm_fraction
+        )
+        
+        # --- D: Dispersion ---
         disp_loss = scores.new_tensor(0.0)
         if prototype_direction is not None and self.dispersion_weight > 0:
             disp_loss = self.direction_dispersion_loss(prototype_direction, frozen_directions)
         
-        # Bias L2 regularization (keep horospheres tight)
-        bias_loss = scores.new_tensor(0.0)
-        if prototype_bias is not None and self.bias_reg_weight > 0:
-            bias_loss = self.bias_regularization(prototype_bias, frozen_biases)
+        # --- E: Bias regularization ---
+        bias_reg = (biases ** 2).mean()
         
-        # Compactness loss (pull knowns into their prototype)
-        compact_loss = scores.new_tensor(0.0)
-        if self.compactness_weight > 0:
-            compact_loss = self.compactness_loss(scores, labels)
-        
-        return (ce_loss 
-                + self.dispersion_weight * disp_loss 
-                + self.bias_reg_weight * bias_loss
-                + self.compactness_weight * compact_loss)
-    
-    def forward_with_breakdown(self, scores, labels, all_prototypes=None, all_biases=None,
-                                  prototype_direction=None, frozen_directions=None,
-                                  prototype_bias=None, frozen_biases=None):
-        """
-        Same as forward but returns diagnostic info.
-        
-        Parameters
-        ----------
-        scores : tensor
-            Horospherical scores
-        labels : tensor
-            Class labels
-        all_prototypes : tensor, optional
-            Full prototypes (frozen + trainable) for T2+ stats
-        all_biases : tensor, optional
-            Full biases (frozen + trainable) for T2+ stats
-        prototype_direction : tensor, optional
-            Trainable directions for dispersion
-        frozen_directions : tensor, optional
-            Frozen directions for cross-dispersion (T2+)
-        prototype_bias : tensor, optional
-            Trainable biases for L2 regularization
-        frozen_biases : tensor, optional
-            Frozen biases for regularization
-        """
-        # Compute full loss (CE + dispersion + bias_reg + compactness)
-        loss = self.forward(scores, labels, prototype_direction, frozen_directions,
-                            prototype_bias, frozen_biases)
-        
-        # Compute individual components for breakdown
-        # CE loss
-        if scores.dim() == 3:
-            B, N, K = scores.shape
-            scores_flat = scores.reshape(B * N, K)
-            labels_flat = labels.reshape(B * N)
-        else:
-            scores_flat = scores
-            labels_flat = labels
-        
-        valid = labels_flat >= 0
-        if valid.sum() == 0:
-            ce_loss_val = 0.0
-        else:
-            ce_loss_val = F.cross_entropy(
-                scores_flat[valid], labels_flat[valid], 
-                label_smoothing=self.label_smoothing
-            ).item()
-        
-        # Dispersion loss
-        disp_loss_val = 0.0
-        if prototype_direction is not None and self.dispersion_weight > 0:
-            disp_loss_val = self.direction_dispersion_loss(
-                prototype_direction, frozen_directions
-            ).item()
-        
-        # Bias regularization loss
-        bias_reg_val = 0.0
-        if prototype_bias is not None and self.bias_reg_weight > 0:
-            bias_reg_val = self.bias_regularization(prototype_bias, frozen_biases).item()
-        
-        # Compactness loss
-        compact_val = 0.0
-        if self.compactness_weight > 0:
-            compact_val = self.compactness_loss(
-                scores_flat if scores.dim() <= 2 else scores.reshape(-1, scores.shape[-1]), 
-                labels_flat if labels.dim() <= 1 else labels.reshape(-1)
-            ).item()
-        
-        # Use provided full prototypes/biases if available (for T2+ accuracy)
-        if all_biases is not None:
-            biases = all_biases
-            proto_norms = all_prototypes.norm(dim=-1) if all_prototypes is not None else biases.new_zeros(len(biases))
-        else:
-            biases = scores.new_zeros(1)  # Fallback
-            proto_norms = scores.new_zeros(1)
-        
-        # Score statistics for debugging OOD detection  
-        with torch.no_grad():
-            if valid.sum() > 0:
-                valid_scores = scores_flat[valid]
-                valid_labels = labels_flat[valid]
-                
-                # Scores for correct class
-                pos_scores = valid_scores[torch.arange(len(valid_labels)), valid_labels]
-                # Max score across all classes
-                max_scores = valid_scores.max(dim=-1).values
-                
-                score_stats = {
-                    'pos_score_mean': pos_scores.mean().item(),
-                    'pos_score_std': pos_scores.std().item() if len(pos_scores) > 1 else 0.0,
-                    'max_score_mean': max_scores.mean().item(),
-                    'score_margin': (max_scores - pos_scores).mean().item(),  # 0 if correct class has max
-                }
-            else:
-                score_stats = {
-                    'pos_score_mean': 0.0, 'pos_score_std': 0.0,
-                    'max_score_mean': 0.0, 'score_margin': 0.0
-                }
+        # --- Total ---
+        total = (self.ce_weight * ce_loss
+                + self.margin_weight * margin_loss
+                + self.pull_weight * pull_loss
+                + self.dispersion_weight * disp_loss
+                + self.bias_reg_weight * bias_reg)
         
         loss_dict = {
-            'horo_ce_loss': ce_loss_val,
-            'horo_disp_loss': disp_loss_val,
-            'horo_disp_weighted': self.dispersion_weight * disp_loss_val,
-            'horo_bias_reg': bias_reg_val,
-            'horo_bias_reg_weighted': self.bias_reg_weight * bias_reg_val,
-            'horo_compact_loss': compact_val,
-            'horo_compact_weighted': self.compactness_weight * compact_val,
-            'horo_total_loss': loss.item(),
-            'bias_mean': biases.mean().item(),
-            'bias_std': biases.std().item() if len(biases) > 1 else 0.0,
-            'bias_max': biases.max().item(),
-            'bias_min': biases.min().item(),
-            'proto_norm_mean': proto_norms.mean().item(),
-            'num_prototypes': len(biases),
-            **score_stats,  # Include score statistics
+            'ce_loss': ce_loss.item(),
+            'margin_loss': margin_loss.item(),
+            'pull_loss': pull_loss.item(),
+            'disp_loss': disp_loss.item(),
+            'bias_reg': bias_reg.item(),
+            'total': total.item(),
+            'margin_violations': (busemann_margin_loss(fg_scores, fg_labels, self.margin) > 0).float().mean().item() if fg_scores.shape[0] > 0 else 0.0,
         }
-        return loss, loss_dict
+        
+        # Additional diagnostics
+        with torch.no_grad():
+            pos_scores = fg_scores.gather(1, fg_labels.unsqueeze(1)).squeeze(1)
+            max_scores = fg_scores.max(dim=-1).values
+            loss_dict['pos_score_mean'] = pos_scores.mean().item()
+            loss_dict['pos_score_std'] = pos_scores.std().item() if len(pos_scores) > 1 else 0.0
+            loss_dict['max_score_mean'] = max_scores.mean().item()
+            loss_dict['score_margin'] = (max_scores - pos_scores).mean().item()
+            loss_dict['emb_norm_mean'] = fg_embeddings.norm(dim=-1).mean().item()
+            loss_dict['emb_norm_max'] = fg_embeddings.norm(dim=-1).max().item()
+            loss_dict['emb_norm_min'] = fg_embeddings.norm(dim=-1).min().item()
+        
+        return total, loss_dict
 
 
 class HyperbolicProjector(nn.Module):
@@ -411,12 +427,13 @@ class HyperbolicProjector(nn.Module):
     def __init__(
         self,
         in_dims=[384, 768, 768],
-        out_dim=256,
+        out_dim=64,
         curvature=1.0,
         num_classes=20,
         clip_r=0.95,
         riemannian=True,
-        init_prototypes=None
+        init_prototypes=None,
+        trainable_prototypes=True
     ):
         super().__init__()
         
@@ -466,7 +483,8 @@ class HyperbolicProjector(nn.Module):
             num_classes=num_classes,
             embed_dim=out_dim,
             curvature=curvature,
-            init_directions=init_prototypes
+            init_directions=init_prototypes,
+            trainable_prototypes=trainable_prototypes
         )
         
         self._init_weights()

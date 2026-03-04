@@ -21,28 +21,39 @@ text_model_name = 'openai/clip-vit-base-patch32'
 ood_threshold = 4.0  # Adjusted for IDD
 
 # =============================================================================
-# Horospherical/Hyperbolic Configuration
+# Horospherical/Hyperbolic Configuration (V2)
 # =============================================================================
 hyp_config = dict(
     # Poincaré ball parameters
     curvature=1.0,           # c=1.0 means ball radius R=1/√c=1.0
-    embed_dim=256,           # Hyperbolic embedding dimension
+    embed_dim=64,            # Reduced from 256 → 64 for sharper geometry
     # clip_r controls max Euclidean norm before expmap0.
     # tanh(clip_r) = max Poincaré norm. 1.0 → 0.762, safe stable region.
     clip_r=1.0,
     
-    # Loss weights (matching old horospherical_v2 config)
-    hyp_loss_weight=1.0,     # Weight for horospherical CE loss
-    dispersion_weight=0.1,   # Push prototype directions apart
-    bias_reg_weight=0.1,     # L2 penalty on biases: prevent horosphere inflation
-    compactness_weight=0.05, # Mild compactness (old model value)
+    # Overall hyp loss multiplier
+    hyp_loss_weight=1.0,
+    
+    # V2 loss components
+    ce_weight=1.0,               # Cross-entropy with class balancing
+    class_balance_smoothing=0.5, # sqrt-inverse-frequency weights
+    margin=1.0,                  # Busemann margin loss: enforce score gap >= margin
+    margin_weight=0.5,           # Weight for margin loss
+    pull_weight=0.1,             # Geodesic prototype pull weight
+    target_norm_fraction=0.85,   # Pull target at 85% of boundary radius
+    dispersion_weight=0.1,       # Push prototype directions apart
+    bias_reg_weight=0.1,         # L2 penalty on biases
+    
+    # Trainable prototypes (V2)
+    trainable_prototypes=True,   # Prototypes as nn.Parameter (vs frozen buffer)
+    prototype_lr=1e-3,           # Separate LR for prototype directions
     
     # Prototype initialization (REQUIRED!)
-    # Run: python init_prototypes.py --classes "car,motorcycle,..." --output init_protos_t1.pt
+    # Run: python init_prototypes.py --classes "car,motorcycle,..." --out_dim 64 --output init_protos_t1.pt
     init_protos='init_protos_t1.pt',
     
     # OOD detection threshold (for inference)
-    ood_threshold=0.0,       # Higher score = more OOD; adjust after calibration
+    ood_threshold=0.0,           # Higher score = more OOD; adjust after calibration
 )
 
 # scaling model from X to XL

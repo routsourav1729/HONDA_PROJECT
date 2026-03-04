@@ -14,7 +14,7 @@ where tau_k = mean_k - alpha * std_k  (calibrated from training data).
 import os
 import torch
 from tqdm import tqdm
-from torchvision.ops import nms
+from torchvision.ops import nms, batched_nms
 
 from core import add_config
 from core.util.model_ema import add_model_ema_configs
@@ -24,6 +24,58 @@ from core.calibrate_thresholds import compute_thresholds
 from core.eval_utils import Trainer
 
 from mmengine.config import Config
+
+
+def soft_nms(pred, iou_threshold=0.5, sigma=0.5, score_threshold=0.001):
+    """Gaussian Soft-NMS: decay overlapping scores instead of removing.
+    
+    For each highest-scoring detection, overlapping detections get their
+    score decayed by: score *= exp(-iou^2 / sigma)
+    This preserves cross-class overlaps (e.g., rider on motorcycle) while
+    still reducing true duplicates.
+    """
+    bboxes = pred.bboxes
+    scores = pred.scores.clone()
+    N = len(scores)
+    
+    if N == 0:
+        return pred
+    
+    # Compute all pairwise IoUs once
+    x1 = bboxes[:, 0]; y1 = bboxes[:, 1]
+    x2 = bboxes[:, 2]; y2 = bboxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    
+    order = scores.argsort(descending=True)
+    
+    for i in range(N):
+        idx = order[i]
+        if scores[idx] < score_threshold:
+            continue
+        
+        # Compute IoU of idx with all remaining
+        remaining = order[i+1:]
+        if len(remaining) == 0:
+            break
+        
+        xx1 = torch.max(x1[idx], x1[remaining])
+        yy1 = torch.max(y1[idx], y1[remaining])
+        xx2 = torch.min(x2[idx], x2[remaining])
+        yy2 = torch.min(y2[idx], y2[remaining])
+        
+        inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
+        union = areas[idx] + areas[remaining] - inter
+        iou = inter / union.clamp(min=1e-6)
+        
+        # Gaussian decay
+        decay = torch.exp(-(iou ** 2) / sigma)
+        scores[remaining] *= decay
+    
+    # Filter by score threshold
+    keep = scores >= score_threshold
+    pred.scores = scores
+    pred = pred[keep]
+    return pred
 from mmengine.runner import Runner
 from detectron2.engine import default_argument_parser, default_setup
 from detectron2.config import get_cfg
@@ -71,6 +123,12 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", type=float, default=None,
                         help="Override alpha (tau_k = mean_k - alpha*std_k). "
                              "Default: use value from checkpoint calibration.")
+    parser.add_argument("--nms_mode", type=str, default="hard",
+                        choices=["hard", "soft", "class", "none"],
+                        help="NMS mode: hard=class-agnostic@0.5 (ovow default), "
+                             "soft=Gaussian soft-NMS, class=per-class NMS, none=skip external NMS")
+    parser.add_argument("--nms_iou", type=float, default=0.5,
+                        help="IoU threshold for external NMS (default: 0.5, matching ovow)")
     
     args = parser.parse_args()
     print("Args:", args)
@@ -200,9 +258,18 @@ if __name__ == "__main__":
                     total_relabeled += is_unknown.sum().item()
             
             # --- Step 2: NMS (AFTER relabeling, matching ovow test.py) ---
-            # Class-agnostic NMS at iou=0.5 on YOLO scores
-            keep_idxs = nms(pred.bboxes, pred.scores, iou_threshold=0.5)
-            pred = pred[keep_idxs]
+            if args.nms_mode == 'hard':
+                # Class-agnostic hard NMS (ovow default)
+                keep_idxs = nms(pred.bboxes, pred.scores, iou_threshold=args.nms_iou)
+                pred = pred[keep_idxs]
+            elif args.nms_mode == 'soft':
+                # Gaussian Soft-NMS: decay scores instead of removing
+                pred = soft_nms(pred, iou_threshold=args.nms_iou, sigma=0.5, score_threshold=0.001)
+            elif args.nms_mode == 'class':
+                # Per-class NMS: preserves cross-class overlaps (rider+motorcycle both survive)
+                keep_idxs = batched_nms(pred.bboxes, pred.scores, pred.labels, iou_threshold=args.nms_iou)
+                pred = pred[keep_idxs]
+            # else: nms_mode=='none', skip external NMS entirely
             total_dets_after_nms += len(pred.scores)
             
             preds.append(pred)
@@ -217,10 +284,11 @@ if __name__ == "__main__":
     print(f"{'='*60}")
     print(f"  Checkpoint: {args.ckpt}")
     print(f"  clip_r: {clip_r} (from checkpoint)")
+    print(f"  NMS mode: {args.nms_mode} (iou={args.nms_iou})")
     print(f"  Total detections (pre-NMS): {total_dets}")
-    print(f"  Total detections (post-NMS@0.5): {total_dets_after_nms}")
+    print(f"  Total detections (post-NMS): {total_dets_after_nms}")
     print(f"  NMS reduction: {(1 - total_dets_after_nms/max(total_dets,1))*100:.1f}%")
-    print(f"  Relabeled as unknown: {total_relabeled} ({total_relabeled/max(total_dets_after_nms,1)*100:.1f}% of post-NMS)")
+    print(f"  Relabeled as unknown: {total_relabeled} ({total_relabeled/max(total_dets,1)*100:.1f}% of pre-NMS)")
     for key, value in results.items():
         print(f"  {key}: {value}")
     print(f"{'='*60}")

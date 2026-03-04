@@ -22,7 +22,7 @@
 
 # Arguments
 SPLIT=${1:-t1}
-EXP_NAME=${2:-horospherical}
+EXP_NAME=${2:-hyp_v2}
 
 TASK="IDD_HYP/$SPLIT"
 PRETRAINED_CKPT="yolo_world_v2_xl_obj365v1_goldg_cc3mlite_pretrain-5daf1395.pth"

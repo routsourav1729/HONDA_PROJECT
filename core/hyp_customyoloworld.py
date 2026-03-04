@@ -20,7 +20,7 @@ from mmyolo.models.utils import gt_instances_preprocess
 from mmengine.dist import get_dist_info
 
 from .hyperbolic import HyperbolicProjector, busemann
-from .hyperbolic.projector import HorosphericalLoss
+from .hyperbolic.projector import HorosphericalLossV2
 
 
 def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=False):
@@ -56,15 +56,21 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
             model.register_buffer('frozen_directions', state_dict['frozen_directions'].cuda())
             model.register_buffer('frozen_biases', state_dict['frozen_biases'].cuda())
         
-        # Load prototypes: directions as frozen buffer, biases as trainable parameter
+        # Load prototypes: directions + biases
         if state_dict.get('hyp_projector.classifier.prototype_direction') is not None:
-            # Directions are frozen (buffer, not parameter)
-            model.hyp_projector.classifier.prototype_direction = \
-                state_dict['hyp_projector.classifier.prototype_direction'].to(model.hyp_projector.classifier.prototype_direction.device)
-            model.hyp_projector.classifier.prototype_bias = nn.Parameter(
-                state_dict['hyp_projector.classifier.prototype_bias'])
-            print(f"  ✓ Prototypes loaded from checkpoint ({model.hyp_projector.classifier.num_classes} classes)")
-            print(f"    Directions: FROZEN (buffer), Biases: trainable")
+            saved_dir = state_dict['hyp_projector.classifier.prototype_direction']
+            saved_bias = state_dict['hyp_projector.classifier.prototype_bias']
+            device = model.hyp_projector.classifier.prototype_direction.device
+            
+            # Works for both nn.Parameter and buffer
+            if isinstance(model.hyp_projector.classifier.prototype_direction, nn.Parameter):
+                model.hyp_projector.classifier.prototype_direction.data = saved_dir.to(device)
+            else:
+                model.hyp_projector.classifier.prototype_direction = saved_dir.to(device)
+            
+            model.hyp_projector.classifier.prototype_bias = nn.Parameter(saved_bias.to(device))
+            is_param = isinstance(model.hyp_projector.classifier.prototype_direction, nn.Parameter)
+            print(f"  ✓ Prototypes loaded ({model.hyp_projector.classifier.num_classes} classes, param={is_param})")
             print(f"    Biases: {[f'{b:.4f}' for b in model.hyp_projector.classifier.prototype_bias.tolist()]}")
         else:
             print(f"  ⚠ WARNING: No prototype_direction found in checkpoint — using random init!")
@@ -105,19 +111,20 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
         model.register_buffer('frozen_biases', freeze_biases.cuda())
         
         # Re-initialize classifier for novel classes only.
-        # Directions: use CLIP-init from init_protos (already set in constructor
-        # via init_prototypes arg). If no init_protos was provided, fall back
-        # to random. Either way, directions are FROZEN (register_buffer).
         existing_dirs = model.hyp_projector.classifier.prototype_direction
+        is_param = isinstance(existing_dirs, nn.Parameter)
         if existing_dirs.shape[0] == current_classes:
-            # init_protos was already loaded in constructor with correct novel count
-            print(f"  ✓ T2+: Novel directions from init_protos ({current_classes} classes, frozen buffer)")
+            print(f"  ✓ T2+: Novel directions from init_protos ({current_classes} classes, param={is_param})")
         else:
             # Resize classifier for novel classes (random init fallback)
             print(f"  ⚠ T2+: Resizing classifier for {current_classes} novel classes (random init)")
-            model.hyp_projector.classifier.register_buffer(
-                'prototype_direction',
-                torch.randn(current_classes, model.hyp_projector.out_dim))
+            new_dirs = torch.randn(current_classes, model.hyp_projector.out_dim)
+            import torch.nn.functional as F
+            new_dirs = F.normalize(new_dirs, dim=-1)
+            if model.trainable_prototypes:
+                model.hyp_projector.classifier.prototype_direction = nn.Parameter(new_dirs)
+            else:
+                model.hyp_projector.classifier.register_buffer('prototype_direction', new_dirs)
         
         # Novel biases: trainable, start at 0
         model.hyp_projector.classifier.prototype_bias = nn.Parameter(
@@ -142,13 +149,20 @@ class HypCustomYoloWorld(nn.Module):
         yolo_world_model,
         unknown_index,
         hyp_c=1.0,
-        hyp_dim=256,
+        hyp_dim=64,
         clip_r=0.95,
         num_classifier_classes=None,  # For T2+: only novel classes (base in frozen_*)
         init_prototypes=None,  # Pre-computed from init_prototypes.py
+        trainable_prototypes=True,
+        # V2 loss weights
+        ce_weight=1.0,
+        class_balance_smoothing=0.5,
+        margin=1.0,
+        margin_weight=0.5,
+        pull_weight=0.1,
+        target_norm_fraction=0.85,
         dispersion_weight=0.1,
         bias_reg_weight=0.1,
-        compactness_weight=0.0,
     ):
         super().__init__()
         
@@ -157,6 +171,7 @@ class HypCustomYoloWorld(nn.Module):
         self.unknown_index = unknown_index
         self.hyp_c = hyp_c
         self.hyp_dim = hyp_dim
+        self.trainable_prototypes = trainable_prototypes
         
         # num_classes for visualization script compatibility
         self.num_classes = unknown_index
@@ -166,6 +181,8 @@ class HypCustomYoloWorld(nn.Module):
         
         # TAL assignment labels
         self.tmp_labels = None
+        # Stash for embeddings during loss (V2 needs them)
+        self.tmp_hyp_embeddings = None
         
         # Text embeddings
         self.frozen_embeddings = None
@@ -180,12 +197,17 @@ class HypCustomYoloWorld(nn.Module):
         self._init_hyperbolic_projector(clip_r, init_prototypes)
         print(f"  Classifier: {self._classifier_num_classes} classes in classifier, {unknown_index} total")
         
-        # Loss function with all regularization terms
-        self.hyp_loss_fn = HorosphericalLoss(
-            curvature=hyp_c, 
+        # V2 loss function
+        self.hyp_loss_fn = HorosphericalLossV2(
+            curvature=hyp_c,
+            ce_weight=ce_weight,
+            class_balance_smoothing=class_balance_smoothing,
+            margin=margin,
+            margin_weight=margin_weight,
+            pull_weight=pull_weight,
+            target_norm_fraction=target_norm_fraction,
             dispersion_weight=dispersion_weight,
             bias_reg_weight=bias_reg_weight,
-            compactness_weight=compactness_weight
         )
     
     def _init_text_embedding(self):
@@ -212,7 +234,8 @@ class HypCustomYoloWorld(nn.Module):
             num_classes=self._classifier_num_classes,
             clip_r=clip_r,
             riemannian=True,
-            init_prototypes=init_prototypes
+            init_prototypes=init_prototypes,
+            trainable_prototypes=self.trainable_prototypes
         )
     
     @property
@@ -294,32 +317,36 @@ class HypCustomYoloWorld(nn.Module):
         return scores
     
     def horospherical_loss(self, hyp_embeddings):
-        """Compute horospherical CE loss with dispersion + bias regularization."""
+        """Compute V2 horospherical loss (CE + margin + geodesic pull + dispersion + bias_reg)."""
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0)
         scores = self.compute_horosphere_scores(hyp_embeddings)
-        return self.hyp_loss_fn(
-            scores, self.tmp_labels,
+        loss, _ = self.hyp_loss_fn(
+            embeddings=hyp_embeddings,
+            scores=scores,
+            labels=self.tmp_labels,
+            prototypes=self.prototypes,
+            biases=self.prototype_biases,
             prototype_direction=self.hyp_projector.prototype_direction,
             frozen_directions=self.frozen_directions,
-            prototype_bias=self.hyp_projector.prototype_bias,
-            frozen_biases=self.frozen_biases
         )
+        return loss
     
     def horospherical_loss_with_breakdown(self, hyp_embeddings):
-        """Loss with diagnostics."""
+        """V2 loss with diagnostics."""
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0), {}
         scores = self.compute_horosphere_scores(hyp_embeddings)
-        return self.hyp_loss_fn.forward_with_breakdown(
-            scores, self.tmp_labels, 
-            all_prototypes=self.prototypes, 
-            all_biases=self.prototype_biases,
+        loss, loss_dict = self.hyp_loss_fn(
+            embeddings=hyp_embeddings,
+            scores=scores,
+            labels=self.tmp_labels,
+            prototypes=self.prototypes,
+            biases=self.prototype_biases,
             prototype_direction=self.hyp_projector.prototype_direction,
             frozen_directions=self.frozen_directions,
-            prototype_bias=self.hyp_projector.prototype_bias,
-            frozen_biases=self.frozen_biases
         )
+        return loss, loss_dict
     
     def forward(self, batch_inputs: Tensor, batch_data_samples: SampleList):
         """Forward pass — dispatches to head_loss.
@@ -527,12 +554,15 @@ class HypCustomYoloWorld(nn.Module):
     def enable_projector_grad(self, index):
         """Enable gradients for training."""
         if index == 0:
-            # T1: Train all projector params
+            # T1: Train all projector params (including trainable prototypes)
             for p in self.hyp_projector.parameters():
                 p.requires_grad = True
-            print("  [T1] Training projector convs + classifier biases (directions frozen as buffer)")
+            n_trainable = sum(p.numel() for p in self.hyp_projector.parameters() if p.requires_grad)
+            proto_trainable = self.hyp_projector.classifier.prototype_direction.requires_grad
+            print(f"  [T1] Training projector convs + classifier (trainable_protos={proto_trainable})")
+            print(f"  [T1] Total trainable params: {n_trainable:,}")
         else:
-            # T2+: Freeze Conv, train only classifier biases
+            # T2+: Freeze Conv, train only classifier (biases + prototypes if trainable)
             for name, p in self.hyp_projector.named_parameters():
                 p.requires_grad = 'classifier' in name
-            print("  [T2+] Training only classifier biases (directions frozen as buffer)")
+            print("  [T2+] Training only classifier params (directions trainable={self.trainable_prototypes})")

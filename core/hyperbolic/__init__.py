@@ -22,6 +22,7 @@ from .projector import (
     HyperbolicProjector,
     HorosphericalClassifier,
     HorosphericalLoss,
+    HorosphericalLossV2,
 )
 
 from .visualization import (
@@ -50,6 +51,7 @@ __all__ = [
     'HyperbolicProjector',
     'HorosphericalClassifier',
     'HorosphericalLoss',
+    'HorosphericalLossV2',
     # Visualization
     'visualize_hyperbolic_embeddings',
     'plot_poincare_disk',

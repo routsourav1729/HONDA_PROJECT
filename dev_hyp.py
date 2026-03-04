@@ -106,9 +106,12 @@ if __name__ == "__main__":
     parser.add_argument("--hyp_dim", type=int, default=None, help="Override embed_dim from config")
     parser.add_argument("--clip_r", type=float, default=None, help="Override clip_r from config")
     parser.add_argument("--hyp_loss_weight", type=float, default=None, help="Override hyp_loss_weight from config")
-    parser.add_argument("--dispersion_weight", type=float, default=None, help="Override dispersion_weight from config")
-    parser.add_argument("--bias_reg_weight", type=float, default=None, help="Override bias_reg_weight from config")
-    parser.add_argument("--compactness_weight", type=float, default=None, help="Override compactness_weight from config")
+    parser.add_argument("--dispersion_weight", type=float, default=None, help="Override dispersion_weight")
+    parser.add_argument("--bias_reg_weight", type=float, default=None, help="Override bias_reg_weight")
+    parser.add_argument("--margin", type=float, default=None, help="Override margin")
+    parser.add_argument("--margin_weight", type=float, default=None, help="Override margin_weight")
+    parser.add_argument("--pull_weight", type=float, default=None, help="Override pull_weight")
+    parser.add_argument("--ce_weight", type=float, default=None, help="Override ce_weight")
     parser.add_argument("--init_protos", type=str, default=None, help="Override init_protos from config")
     parser.add_argument("--wandb", action="store_true", help="Enable WandB")
     
@@ -173,23 +176,36 @@ if __name__ == "__main__":
     
     # Get values from config, allow CLI override
     hyp_c = args.hyp_c if args.hyp_c is not None else hyp_cfg.get('curvature', 1.0)
-    hyp_dim = args.hyp_dim if args.hyp_dim is not None else hyp_cfg.get('embed_dim', 256)
+    hyp_dim = args.hyp_dim if args.hyp_dim is not None else hyp_cfg.get('embed_dim', 64)
     clip_r = args.clip_r if args.clip_r is not None else hyp_cfg.get('clip_r', 0.95)
     hyp_loss_weight = args.hyp_loss_weight if args.hyp_loss_weight is not None else hyp_cfg.get('hyp_loss_weight', 1.0)
-    dispersion_weight = args.dispersion_weight if args.dispersion_weight is not None else hyp_cfg.get('dispersion_weight', 0.0)
-    bias_reg_weight = args.bias_reg_weight if args.bias_reg_weight is not None else hyp_cfg.get('bias_reg_weight', 0.0)
-    compactness_weight = args.compactness_weight if args.compactness_weight is not None else hyp_cfg.get('compactness_weight', 0.0)
+    dispersion_weight = args.dispersion_weight if args.dispersion_weight is not None else hyp_cfg.get('dispersion_weight', 0.1)
+    bias_reg_weight = args.bias_reg_weight if args.bias_reg_weight is not None else hyp_cfg.get('bias_reg_weight', 0.1)
+    
+    # V2 loss params
+    ce_weight = args.ce_weight if args.ce_weight is not None else hyp_cfg.get('ce_weight', 1.0)
+    class_balance_smoothing = hyp_cfg.get('class_balance_smoothing', 0.5)
+    margin = args.margin if args.margin is not None else hyp_cfg.get('margin', 1.0)
+    margin_weight = args.margin_weight if args.margin_weight is not None else hyp_cfg.get('margin_weight', 0.5)
+    pull_weight = args.pull_weight if args.pull_weight is not None else hyp_cfg.get('pull_weight', 0.1)
+    target_norm_fraction = hyp_cfg.get('target_norm_fraction', 0.85)
+    trainable_prototypes = hyp_cfg.get('trainable_prototypes', True)
+    prototype_lr = hyp_cfg.get('prototype_lr', 1e-3)
+    
     init_protos_path = args.init_protos if args.init_protos is not None else hyp_cfg.get('init_protos', '')
     prev_ckpt = args.ckpt if args.ckpt else hyp_cfg.get('prev_ckpt', '')
     
-    print(f"\n=== Hyperbolic Config ===")
+    print(f"\n=== Hyperbolic Config (V2) ===")
     print(f"  curvature: {hyp_c}")
     print(f"  embed_dim: {hyp_dim}")
     print(f"  clip_r: {clip_r}")
     print(f"  hyp_loss_weight: {hyp_loss_weight}")
+    print(f"  ce_weight: {ce_weight}, class_balance_smoothing: {class_balance_smoothing}")
+    print(f"  margin: {margin}, margin_weight: {margin_weight}")
+    print(f"  pull_weight: {pull_weight}, target_norm_fraction: {target_norm_fraction}")
     print(f"  dispersion_weight: {dispersion_weight}")
     print(f"  bias_reg_weight: {bias_reg_weight}")
-    print(f"  compactness_weight: {compactness_weight}")
+    print(f"  trainable_prototypes: {trainable_prototypes}, prototype_lr: {prototype_lr}")
     print(f"  init_protos: {init_protos_path}")
     if cfg.TEST.PREV_INTRODUCED_CLS > 0:
         print(f"  prev_ckpt (T2+): {prev_ckpt}")
@@ -223,9 +239,15 @@ if __name__ == "__main__":
         hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
         num_classifier_classes=classifier_num_classes,
         init_prototypes=init_prototypes,
+        trainable_prototypes=trainable_prototypes,
+        ce_weight=ce_weight,
+        class_balance_smoothing=class_balance_smoothing,
+        margin=margin,
+        margin_weight=margin_weight,
+        pull_weight=pull_weight,
+        target_norm_fraction=target_norm_fraction,
         dispersion_weight=dispersion_weight,
         bias_reg_weight=bias_reg_weight,
-        compactness_weight=compactness_weight
     )
     
     if args.resume_from:
@@ -251,15 +273,32 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Trainable: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
     
-    # Optimizer + LR schedule
-    PROTO_FREEZE_EPOCHS = 0  # Co-train prototypes from epoch 0 (freeze caused cold-start trap)
-    optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfgY.base_lr, weight_decay=cfgY.weight_decay
-    )
+    # Optimizer + LR schedule with separate param groups
+    # Prototype directions get higher LR for Riemannian optimization
+    PROTO_FREEZE_EPOCHS = 0  # Co-train prototypes from epoch 0
+    
+    proto_params = []
+    other_params = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if 'prototype_direction' in name:
+            proto_params.append(p)
+        else:
+            other_params.append(p)
+    
+    param_groups = [
+        {'params': other_params, 'lr': cfgY.base_lr},
+    ]
+    if proto_params:
+        param_groups.append({'params': proto_params, 'lr': prototype_lr})
+    
+    optimizer = optim.AdamW(param_groups, weight_decay=cfgY.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfgY.max_epochs, eta_min=1e-6)
-    print(f"Optimizer: AdamW, LR={cfgY.base_lr}, CosineAnnealing to 1e-6")
-    print(f"Prototype freeze: epochs 0-{PROTO_FREEZE_EPOCHS - 1}")
+    print(f"Optimizer: AdamW, base_lr={cfgY.base_lr}, prototype_lr={prototype_lr}")
+    print(f"  other_params: {sum(p.numel() for p in other_params):,}")
+    print(f"  proto_params: {sum(p.numel() for p in proto_params):,}")
+    print(f"  CosineAnnealing to 1e-6")
 
     wb = None
     if args.wandb:
@@ -280,14 +319,18 @@ if __name__ == "__main__":
         epoch_start = time.time()
         print(f"\n=== Epoch {epoch} ===")
 
-        # Prototype bias freeze/unfreeze (directions are permanently frozen as buffer)
+        # Prototype freeze/unfreeze
         if epoch < PROTO_FREEZE_EPOCHS:
             model.hyp_projector.classifier.prototype_bias.requires_grad_(False)
+            if trainable_prototypes:
+                model.hyp_projector.classifier.prototype_direction.requires_grad_(False)
             if epoch == start_epoch:
-                print(f"  [Bias FROZEN] epochs 0-{PROTO_FREEZE_EPOCHS - 1} (directions always frozen)")
+                print(f"  [Protos FROZEN] epochs 0-{PROTO_FREEZE_EPOCHS - 1}")
         elif epoch == PROTO_FREEZE_EPOCHS:
             model.hyp_projector.classifier.prototype_bias.requires_grad_(True)
-            print(f"  [Bias UNFROZEN] from epoch {epoch} (directions always frozen)")
+            if trainable_prototypes:
+                model.hyp_projector.classifier.prototype_direction.requires_grad_(True)
+            print(f"  [Protos UNFROZEN] from epoch {epoch} (trainable_protos={trainable_prototypes})")
 
         epoch_loss = {'cls': 0, 'dfl': 0, 'bbox': 0, 'horo': 0}
         steps = 0
@@ -318,17 +361,21 @@ if __name__ == "__main__":
                 print(f"  step {steps}: cls={head_losses['loss_cls'].item():.4f} "
                       f"bbox={head_losses['loss_bbox'].item():.4f} horo={hyp_loss.item():.4f}")
                 if breakdown:
-                    # Log detailed breakdown for debugging
-                    bias_mean = breakdown.get('bias_mean', 0)
-                    bias_std = breakdown.get('bias_std', 0)
-                    bias_max = breakdown.get('bias_max', 0)
-                    ce_loss = breakdown.get('horo_ce_loss', 0)
-                    disp_loss = breakdown.get('horo_disp_loss', 0)
-                    bias_reg = breakdown.get('horo_bias_reg', 0)
-                    compact_loss = breakdown.get('horo_compact_loss', 0)
-                    proto_norm = breakdown.get('proto_norm_mean', 0)
-                    print(f"    [Proto] bias_mean={bias_mean:.3f} bias_max={bias_max:.3f} bias_std={bias_std:.3f} "
-                          f"ce={ce_loss:.4f} disp={disp_loss:.4f} bias_reg={bias_reg:.4f} compact={compact_loss:.4f}")
+                    # V2 breakdown logging
+                    ce = breakdown.get('ce_loss', 0)
+                    mrg = breakdown.get('margin_loss', 0)
+                    pull = breakdown.get('pull_loss', 0)
+                    disp = breakdown.get('disp_loss', 0)
+                    breg = breakdown.get('bias_reg', 0)
+                    emb_norm = breakdown.get('emb_norm_mean', 0)
+                    emb_max = breakdown.get('emb_norm_max', 0)
+                    pos_sc = breakdown.get('pos_score_mean', 0)
+                    max_sc = breakdown.get('max_score_mean', 0)
+                    sc_margin = breakdown.get('score_margin', 0)
+                    print(f"    [V2] ce={ce:.4f} margin={mrg:.4f} pull={pull:.4f} "
+                          f"disp={disp:.4f} bias_reg={breg:.4f}")
+                    print(f"    [Emb] norm_mean={emb_norm:.4f} norm_max={emb_max:.4f} | "
+                          f"pos_score={pos_sc:.3f} max_score={max_sc:.3f} gap={sc_margin:.3f}")
                 if wb:
                     log_dict = {
                         'cls': head_losses['loss_cls'].item(), 
@@ -337,13 +384,15 @@ if __name__ == "__main__":
                     }
                     if breakdown:
                         log_dict.update({
-                            'bias_mean': breakdown.get('bias_mean', 0),
-                            'bias_std': breakdown.get('bias_std', 0),
-                            'horo_ce': breakdown.get('horo_ce_loss', 0),
-                            'horo_disp': breakdown.get('horo_disp_loss', 0),
-                            'proto_norm': breakdown.get('proto_norm_mean', 0),
+                            'ce_loss': breakdown.get('ce_loss', 0),
+                            'margin_loss': breakdown.get('margin_loss', 0),
+                            'pull_loss': breakdown.get('pull_loss', 0),
+                            'disp_loss': breakdown.get('disp_loss', 0),
+                            'bias_reg': breakdown.get('bias_reg', 0),
+                            'emb_norm': breakdown.get('emb_norm_mean', 0),
                             'pos_score': breakdown.get('pos_score_mean', 0),
                             'max_score': breakdown.get('max_score_mean', 0),
+                            'score_margin': breakdown.get('score_margin', 0),
                         })
                     wb.log(log_dict, step=gs)
             
@@ -357,6 +406,11 @@ if __name__ == "__main__":
                     print(f"    [Grads] bias_grad={bias_grad_norm:.6f} dir_grad={dir_grad_norm:.6f}")
             
             optimizer.step()
+            
+            # Riemannian constraint: project prototype directions back to unit sphere
+            if trainable_prototypes and hasattr(model.hyp_projector.classifier, 'project_prototypes_to_sphere'):
+                model.hyp_projector.classifier.project_prototypes_to_sphere()
+            
             steps += 1
             gs += 1
         
