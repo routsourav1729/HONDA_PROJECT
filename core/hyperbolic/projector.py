@@ -401,6 +401,40 @@ class HorosphericalLossV2(nn.Module):
         return total, loss_dict
 
 
+class BiLipschitzProjector(nn.Module):
+    """
+    Distance-aware projector (SNGP-style, Liu et al. NeurIPS 2020).
+    
+    Spectral norm = upper Lipschitz bound (prevents catapulting OOD inputs)
+    Residual skip = lower Lipschitz bound (preserves input distances)
+    
+    Together: if FPN feature is far from known-class features,
+    output will be far from known-class outputs (near-boundary region)
+    → naturally lands near origin → low Busemann score → flagged OOD.
+    
+    NOTE: We use GroupNorm instead of BatchNorm after spectral norm.
+    BN re-normalizes activations to unit variance, which partially
+    undoes the Lipschitz constraint. GroupNorm preserves the bound.
+    """
+    def __init__(self, in_dim, out_dim, num_groups=16):
+        super().__init__()
+        from torch.nn.utils import spectral_norm
+        # Main path: spectrally-normed convs with GroupNorm
+        # GroupNorm (not BN) so we don't undo the Lipschitz constraint
+        self.main = nn.Sequential(
+            spectral_norm(nn.Conv2d(in_dim, in_dim, 1, bias=False)),
+            nn.GroupNorm(min(num_groups, in_dim), in_dim),
+            nn.ReLU(inplace=True),
+            spectral_norm(nn.Conv2d(in_dim, out_dim, 1, bias=False)),
+        )
+        # Skip connection: linear projection (also spectral-normed)
+        # Ensures lower Lipschitz bound — distances can't collapse
+        self.skip = spectral_norm(nn.Conv2d(in_dim, out_dim, 1, bias=False))
+    
+    def forward(self, x):
+        return self.main(x) + self.skip(x)
+
+
 class HyperbolicProjector(nn.Module):
     """
     Projects multi-scale FPN features to Poincaré ball with horospherical classification.
@@ -422,6 +456,9 @@ class HyperbolicProjector(nn.Module):
         Number of class prototypes
     clip_r : float
         Clip radius for ToPoincare. Must be < 1/√c (default: 0.95 for c=1)
+    bi_lipschitz : bool
+        Use BiLipschitz projectors (spectral norm + residual) for OOD-aware
+        distance preservation. Default: False (backward compatible).
     """
     
     def __init__(
@@ -433,7 +470,8 @@ class HyperbolicProjector(nn.Module):
         clip_r=0.95,
         riemannian=True,
         init_prototypes=None,
-        trainable_prototypes=True
+        trainable_prototypes=True,
+        bi_lipschitz=False
     ):
         super().__init__()
         
@@ -442,30 +480,37 @@ class HyperbolicProjector(nn.Module):
         self.c = curvature
         self.num_classes = num_classes
         self.clip_r = clip_r
+        self.bi_lipschitz = bi_lipschitz
         
-        # Per-scale two-conv projectors:
-        #   Conv1: in_dim → in_dim (1×1) + BN + ReLU  (cross-channel mixing at full dim)
-        #   Conv2: in_dim → out_dim (1×1)              (dimension reduction, linear)
-        # This preserves full representational capacity before bottlenecking.
-        # ~1.83M params. BatchNorm2d (not SyncBN) avoids NCCL stalls.
-        self.proj_p3 = nn.Sequential(
-            nn.Conv2d(in_dims[0], in_dims[0], kernel_size=1, bias=False),
-            nn.BatchNorm2d(in_dims[0]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_dims[0], out_dim, kernel_size=1, bias=False),
-        )
-        self.proj_p4 = nn.Sequential(
-            nn.Conv2d(in_dims[1], in_dims[1], kernel_size=1, bias=False),
-            nn.BatchNorm2d(in_dims[1]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_dims[1], out_dim, kernel_size=1, bias=False),
-        )
-        self.proj_p5 = nn.Sequential(
-            nn.Conv2d(in_dims[2], in_dims[2], kernel_size=1, bias=False),
-            nn.BatchNorm2d(in_dims[2]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_dims[2], out_dim, kernel_size=1, bias=False),
-        )
+        if bi_lipschitz:
+            # BiLipschitz projectors: spectral norm + residual skip
+            # Preserves distance structure → unknowns naturally get lower norms
+            print(f"  ✓ Using BiLipschitz projectors (spectral norm + residual)")
+            self.proj_p3 = BiLipschitzProjector(in_dims[0], out_dim)
+            self.proj_p4 = BiLipschitzProjector(in_dims[1], out_dim)
+            self.proj_p5 = BiLipschitzProjector(in_dims[2], out_dim)
+        else:
+            # Original: unconstrained Conv projectors
+            #   Conv1: in_dim → in_dim (1×1) + BN + ReLU
+            #   Conv2: in_dim → out_dim (1×1)
+            self.proj_p3 = nn.Sequential(
+                nn.Conv2d(in_dims[0], in_dims[0], kernel_size=1, bias=False),
+                nn.BatchNorm2d(in_dims[0]),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_dims[0], out_dim, kernel_size=1, bias=False),
+            )
+            self.proj_p4 = nn.Sequential(
+                nn.Conv2d(in_dims[1], in_dims[1], kernel_size=1, bias=False),
+                nn.BatchNorm2d(in_dims[1]),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_dims[1], out_dim, kernel_size=1, bias=False),
+            )
+            self.proj_p5 = nn.Sequential(
+                nn.Conv2d(in_dims[2], in_dims[2], kernel_size=1, bias=False),
+                nn.BatchNorm2d(in_dims[2]),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_dims[2], out_dim, kernel_size=1, bias=False),
+            )
         
         # ToPoincare layer
         self.to_poincare = ToPoincare(
@@ -487,21 +532,24 @@ class HyperbolicProjector(nn.Module):
             trainable_prototypes=trainable_prototypes
         )
         
-        self._init_weights()
+        if not bi_lipschitz:
+            self._init_weights()
+        # BiLipschitz: spectral_norm handles its own normalization;
+        # Kaiming init would be overridden by SN's power iteration anyway.
     
     def _init_weights(self):
-        """Initialize Conv weights."""
+        """Initialize Conv weights (only for non-BiLipschitz projectors)."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
+                # Skip if spectral norm is applied (has weight_orig attribute)
+                if hasattr(m, 'weight_orig'):
+                    continue
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-        # Standard Kaiming init for all convs (no near-zero override)
-        # Near-zero init caused cold-start trap: embeddings near origin
-        # are equidistant from all boundary prototypes → no gradient signal
     
     @property
     def prototypes(self):
@@ -540,8 +588,25 @@ class HyperbolicProjector(nn.Module):
         z4 = self.proj_p4(p4).permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
         z5 = self.proj_p5(p5).permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
         
-        # Concatenate and project to Poincaré ball
+        # Concatenate
         z = torch.cat([z3, z4, z5], dim=1)
+        
+        # Cache intermediate norms for diagnostic analysis
+        # Activating: model.hyp_projector.store_norms = True
+        if getattr(self, 'store_norms', False):
+            # FPN input norms (global-avg-pooled per anchor is too expensive,
+            # so we store per-anchor Euclidean norms of the PROJECTED features pre-clip)
+            fpn3 = p3.permute(0, 2, 3, 1).reshape(B, -1, p3.shape[1])
+            fpn4 = p4.permute(0, 2, 3, 1).reshape(B, -1, p4.shape[1])
+            fpn5 = p5.permute(0, 2, 3, 1).reshape(B, -1, p5.shape[1])
+            fpn_all = torch.cat([
+                fpn3.norm(dim=-1),
+                fpn4.norm(dim=-1),
+                fpn5.norm(dim=-1),
+            ], dim=1)  # (B, N_anchors)
+            self._cached_fpn_norms = fpn_all       # per-anchor FPN norms
+            self._cached_pre_clip_norms = z.norm(dim=-1)  # per-anchor post-proj Euclidean norms
+        
         return self.to_poincare(z)
     
     def compute_scores(self, embeddings):

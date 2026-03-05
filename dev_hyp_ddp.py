@@ -244,10 +244,12 @@ if __name__ == "__main__":
     compactness_weight = args.compactness_weight if args.compactness_weight is not None else hyp_cfg.get('compactness_weight', 0.0)
     init_protos_path = args.init_protos if args.init_protos is not None else hyp_cfg.get('init_protos', '')
     prev_ckpt = args.ckpt if args.ckpt else hyp_cfg.get('prev_ckpt', '')
+    bi_lipschitz = hyp_cfg.get('bi_lipschitz', False)
     
     print_rank0(f"\n=== Hyperbolic Config ===", rank)
     print_rank0(f"  curvature: {hyp_c}, embed_dim: {hyp_dim}, clip_r: {clip_r}", rank)
     print_rank0(f"  hyp_loss_weight: {hyp_loss_weight}, dispersion: {dispersion_weight}", rank)
+    print_rank0(f"  bi_lipschitz: {bi_lipschitz}", rank)
     
     # Load init prototypes
     init_prototypes = None
@@ -276,6 +278,7 @@ if __name__ == "__main__":
         init_prototypes=init_prototypes,
         dispersion_weight=dispersion_weight,
         bias_reg_weight=bias_reg_weight,
+        bi_lipschitz=bi_lipschitz,
     )
     
     if args.resume_from:

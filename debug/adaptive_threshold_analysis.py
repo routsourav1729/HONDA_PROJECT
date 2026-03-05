@@ -829,7 +829,7 @@ if __name__ == "__main__":
     parser.add_argument("--task", default="IDD_HYP/t1")
     parser.add_argument("--ckpt", default="IDD_HYP/t1/horospherical_v2/model_30.pth")
     parser.add_argument("--hyp_c", type=float, default=1.0)
-    parser.add_argument("--hyp_dim", type=int, default=256)
+    parser.add_argument("--hyp_dim", type=int, default=64)
     parser.add_argument("--clip_r", type=float, default=0.95)
     parser.add_argument("--output_dir", default="visualizations/adaptive")
 
@@ -863,6 +863,8 @@ if __name__ == "__main__":
 
     # Initialize YOLO-World
     runner = Runner.from_cfg(cfgY)
+    # Strip EMA hook — it deep-copies the entire XL model (~20 min!) and is unused
+    runner._hooks = [h for h in runner._hooks if not h.__class__.__name__.startswith('EMA')]
     runner.call_hook("before_run")
     runner.load_or_resume()
     runner.model.reparameterize([known_class_names])
@@ -874,10 +876,20 @@ if __name__ == "__main__":
     # Test loader for evaluation (Phase 2)
     test_loader = Runner.build_dataloader(cfgY.test_dataloader)
 
+    # --- Auto-detect hyp config from checkpoint ---
+    ckpt_data = torch.load(args.ckpt, map_location='cpu')
+    hyp_config = ckpt_data.get('hyp_config', {})
+    hyp_c = hyp_config.get('curvature', args.hyp_c)
+    hyp_dim = hyp_config.get('embed_dim', args.hyp_dim)
+    clip_r = hyp_config.get('clip_r', args.clip_r)
+    if hyp_dim != args.hyp_dim:
+        print(f"  NOTE: Using hyp_dim={hyp_dim} from checkpoint (CLI default was {args.hyp_dim})")
+    del ckpt_data  # free memory
+
     # Build hyperbolic model
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
-        hyp_c=args.hyp_c, hyp_dim=args.hyp_dim, clip_r=args.clip_r
+        hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r
     )
 
     print(f"\n=== Loading Checkpoint: {args.ckpt} ===")

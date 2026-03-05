@@ -346,6 +346,8 @@ if __name__ == "__main__":
           f"nms_iou={args.nms_iou}, max_per_img={args.max_per_img}, multi_label=False")
 
     runner = Runner.from_cfg(cfgY)
+    # Strip EMA hook — it deep-copies the entire XL model (~20 min!) and is unused
+    runner._hooks = [h for h in runner._hooks if not h.__class__.__name__.startswith('EMA')]
     runner.call_hook("before_run")
     runner.load_or_resume()
     runner.model.reparameterize([known_class_names])

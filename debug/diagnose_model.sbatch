@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=vis_hyp
-#SBATCH --output=slurm_logs/vis_hyp_%j.out
-#SBATCH --error=slurm_logs/vis_hyp_%j.err
+#SBATCH --job-name=diag_hyp
+#SBATCH --output=slurm_logs/diag_hyp_%j.out
+#SBATCH --error=slurm_logs/diag_hyp_%j.err
 #SBATCH --partition=a40
 #SBATCH --qos=a40
 #SBATCH --nodes=1
@@ -9,23 +9,25 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
-#SBATCH --time=00:50:00
+#SBATCH --time=00:45:00
+#SBATCH --exclude=cn15-dgx
 
 # ============================================================================
-# Poincaré Ball Visualization
+# Hyperbolic Model Diagnostic Report
 # ============================================================================
 
-# Base directory
 BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
-TASK="$BASE_DIR/IDD_HYP/t1"
+TASK="IDD_HYP/t1"
 CKPT="$BASE_DIR/IDD_HYP/t1/hyp_v2/model_latest.pth"
+OUTPUT_DIR="$BASE_DIR/diagnostics"
 
 echo "=========================================="
-echo "POINCARÉ BALL VISUALIZATION"
+echo "HYPERBOLIC MODEL DIAGNOSTICS"
 echo "=========================================="
 echo "Job started at: $(date)"
 echo "Checkpoint: $CKPT"
+echo "Output: $OUTPUT_DIR"
 echo "=========================================="
 
 # Activate conda environment
@@ -55,28 +57,22 @@ export TOKENIZERS_PARALLELISM=false
 echo "Python: $(which python)"
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 
-mkdir -p visualizations
+mkdir -p "$OUTPUT_DIR"
+mkdir -p slurm_logs
 
 echo "=========================================="
-echo "Starting VISUALIZATION"
+echo "Starting DIAGNOSTICS"
 echo "=========================================="
 
-python debug/visualize_simple.py \
-    --config-file configs/IDD_HYP/t1.yaml \
+python debug/diagnose_model.py \
+    --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $CKPT \
-    --hyp_c 1.0 \
-    --hyp_dim 64 \
-    --clip_r 1.0 \
-    --output_dir visualizations \
-    --num_batches 100 \
-    --samples_per_class 50 \
-    --projection hyperbolic_umap \
-    --n_neighbors 15 \
-    --min_dist 0.1
+    --output_dir "$OUTPUT_DIR" \
+    --split test
 
 echo ""
 echo "=========================================="
 echo "Job finished at: $(date)"
-echo "Visualizations saved to: visualizations/"
+echo "Output: $OUTPUT_DIR"
 echo "=========================================="

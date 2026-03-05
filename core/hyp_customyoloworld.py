@@ -154,6 +154,7 @@ class HypCustomYoloWorld(nn.Module):
         num_classifier_classes=None,  # For T2+: only novel classes (base in frozen_*)
         init_prototypes=None,  # Pre-computed from init_prototypes.py
         trainable_prototypes=True,
+        bi_lipschitz=False,  # BiLipschitz projectors (spectral norm + residual)
         # V2 loss weights
         ce_weight=1.0,
         class_balance_smoothing=0.5,
@@ -172,6 +173,7 @@ class HypCustomYoloWorld(nn.Module):
         self.hyp_c = hyp_c
         self.hyp_dim = hyp_dim
         self.trainable_prototypes = trainable_prototypes
+        self.bi_lipschitz = bi_lipschitz
         
         # num_classes for visualization script compatibility
         self.num_classes = unknown_index
@@ -235,7 +237,8 @@ class HypCustomYoloWorld(nn.Module):
             clip_r=clip_r,
             riemannian=True,
             init_prototypes=init_prototypes,
-            trainable_prototypes=self.trainable_prototypes
+            trainable_prototypes=self.trainable_prototypes,
+            bi_lipschitz=getattr(self, 'bi_lipschitz', False)
         )
     
     @property

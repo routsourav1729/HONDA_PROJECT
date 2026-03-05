@@ -985,7 +985,7 @@ if __name__ == "__main__":
     parser.add_argument("--task", default="IDD_HYP/t1")
     parser.add_argument("--ckpt", default="IDD_HYP/t1/horospherical/model_5.pth")
     parser.add_argument("--hyp_c", type=float, default=1.0)
-    parser.add_argument("--hyp_dim", type=int, default=256)
+    parser.add_argument("--hyp_dim", type=int, default=64)
     parser.add_argument("--clip_r", type=float, default=0.95)
     parser.add_argument("--split", default="test", choices=["train", "test"],
                         help="Which data split to analyze (train or test)")
@@ -1047,6 +1047,8 @@ if __name__ == "__main__":
 
     # Initialize YOLO-World
     runner = Runner.from_cfg(cfgY)
+    # Strip EMA hook — it deep-copies the entire XL model (~20 min!) and is unused
+    runner._hooks = [h for h in runner._hooks if not h.__class__.__name__.startswith('EMA')]
     runner.call_hook("before_run")
     runner.load_or_resume()
     runner.model.reparameterize([known_class_names])

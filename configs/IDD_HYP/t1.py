@@ -39,10 +39,13 @@ hyp_config = dict(
     class_balance_smoothing=0.5, # sqrt-inverse-frequency weights
     margin=1.0,                  # Busemann margin loss: enforce score gap >= margin
     margin_weight=0.5,           # Weight for margin loss
-    pull_weight=0.1,             # Geodesic prototype pull weight
+    pull_weight=0.0,             # Disabled — was compressing score range, hurting OOD
     target_norm_fraction=0.85,   # Pull target at 85% of boundary radius
     dispersion_weight=0.1,       # Push prototype directions apart
     bias_reg_weight=0.1,         # L2 penalty on biases
+    
+    # BiLipschitz projector (SNGP-style spectral-normed residual)
+    bi_lipschitz=True,           # Use spectral-normed projectors for distance preservation
     
     # Trainable prototypes (V2)
     trainable_prototypes=True,   # Prototypes as nn.Parameter (vs frozen buffer)

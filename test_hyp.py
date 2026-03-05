@@ -157,7 +157,7 @@ if __name__ == "__main__":
     # Extract hyp_config (clip_r, curvature, etc.) from checkpoint
     hyp_config = ckpt_data.get('hyp_config', {})
     hyp_c = hyp_config.get('curvature', 1.0)
-    hyp_dim = hyp_config.get('embed_dim', 256)
+    hyp_dim = hyp_config.get('embed_dim', 64)
     clip_r = hyp_config.get('clip_r', 0.95)
 
     print(f"  hyp_config from checkpoint: c={hyp_c}, dim={hyp_dim}, clip_r={clip_r}")
@@ -176,6 +176,8 @@ if __name__ == "__main__":
     cfgY.work_dir = "."
 
     runner = Runner.from_cfg(cfgY)
+    # Strip EMA hook — it deep-copies the entire XL model (~20 min!) and is unused
+    runner._hooks = [h for h in runner._hooks if not h.__class__.__name__.startswith('EMA')]
     runner.call_hook("before_run")
     runner.load_or_resume()
     runner.model.reparameterize([class_names])

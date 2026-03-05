@@ -145,6 +145,7 @@ env_cfg = dict(
     dist_cfg=dict(backend='nccl'),
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0))
 hyp_config = dict(
+    bi_lipschitz=True,
     bias_reg_weight=0.1,
     ce_weight=1.0,
     class_balance_smoothing=0.5,
@@ -158,7 +159,7 @@ hyp_config = dict(
     margin_weight=0.5,
     ood_threshold=0.0,
     prototype_lr=0.001,
-    pull_weight=0.1,
+    pull_weight=0.0,
     target_norm_fraction=0.85,
     trainable_prototypes=True)
 img_scale = (
