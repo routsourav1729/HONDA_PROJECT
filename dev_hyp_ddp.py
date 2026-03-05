@@ -219,6 +219,10 @@ if __name__ == "__main__":
     # Initialize YOLO-World (on rank 0, then broadcast weights; or all ranks load same ckpt)
     print_rank0(f"\n=== Initializing YOLO-World ===", rank)
     runner = Runner.from_cfg(cfgY)
+    # Strip the EMA hook — it deep-copies the entire XL model (~26 min!)
+    # and is unused since we have our own training loop, not Runner.train().
+    runner._hooks = [h for h in runner._hooks if not h.__class__.__name__.startswith('EMA')]
+    print_rank0(f"  Hooks after EMA removal: {[h.__class__.__name__ for h in runner._hooks]}", rank)
     runner.call_hook("before_run")
     runner.load_or_resume()
     runner.model = runner.model.to(device)
@@ -272,7 +276,6 @@ if __name__ == "__main__":
         init_prototypes=init_prototypes,
         dispersion_weight=dispersion_weight,
         bias_reg_weight=bias_reg_weight,
-        compactness_weight=compactness_weight
     )
     
     if args.resume_from:

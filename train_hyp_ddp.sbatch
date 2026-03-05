@@ -9,7 +9,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:2
 #SBATCH --mem=128G
-#SBATCH --time=1:00:00
+#SBATCH --time=30:00:00
+#SBATCH --exclude=cn15-dgx
 
 # ============================================================================
 # Hyperbolic YOLO-World Training - Multi-GPU DDP
