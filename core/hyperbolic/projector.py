@@ -471,7 +471,8 @@ class HyperbolicProjector(nn.Module):
         riemannian=True,
         init_prototypes=None,
         trainable_prototypes=True,
-        bi_lipschitz=False
+        bi_lipschitz=False,
+        tau_init=None
     ):
         super().__init__()
         
@@ -519,7 +520,8 @@ class HyperbolicProjector(nn.Module):
             train_x=False,
             ball_dim=out_dim,
             riemannian=riemannian,
-            clip_r=clip_r
+            clip_r=clip_r,
+            tau_init=tau_init
         )
         
         # Horospherical classifier

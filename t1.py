@@ -159,8 +159,9 @@ hyp_config = dict(
     margin_weight=0.5,
     ood_threshold=0.0,
     prototype_lr=0.001,
-    pull_weight=0.0,
+    pull_weight=0.1,
     target_norm_fraction=0.85,
+    tau_init=12.0,
     trainable_prototypes=True)
 img_scale = (
     640,

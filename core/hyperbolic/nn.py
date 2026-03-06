@@ -35,7 +35,7 @@ class ToPoincare(nn.Module):
     """
 
     def __init__(self, c, train_c=False, train_x=False, ball_dim=None, 
-                 riemannian=True, clip_r=None):
+                 riemannian=True, clip_r=None, tau_init=None):
         super(ToPoincare, self).__init__()
         
         if train_x:
@@ -53,7 +53,20 @@ class ToPoincare(nn.Module):
             self.c = c
 
         self.train_x = train_x
-        self.clip_r = clip_r
+        
+        # Temperature-scaled exponential map (replaces hard clip_r)
+        # τ rescales projector norms into tanh's useful range:
+        #   expmap0(x/τ) = tanh(||x||/τ) · x̂
+        # If tau_init is set, use learnable temperature and ignore clip_r.
+        # If tau_init is None, fall back to legacy clip_r behaviour.
+        if tau_init is not None:
+            self.clip_r = None  # disable hard clip
+            # Store in log-space so τ is always positive
+            self.log_tau = nn.Parameter(torch.tensor(float(tau_init)).log())
+            print(f"  ✓ ToPoincare: learnable τ (init={tau_init:.2f}), clip_r disabled")
+        else:
+            self.clip_r = clip_r
+            self.register_parameter("log_tau", None)
 
         # Set up Riemannian gradient
         self.riemannian = pmath.RiemannianGradient
@@ -78,8 +91,12 @@ class ToPoincare(nn.Module):
         tensor
             Points on Poincare ball of shape (..., D)
         """
-        # Optional: clip norms to prevent instability
-        if self.clip_r is not None:
+        # Temperature scaling (if learnable τ is set) OR legacy hard clip
+        if self.log_tau is not None:
+            # Divide by τ to map projector norms into tanh's useful range
+            tau = self.log_tau.exp()
+            x = x / tau
+        elif self.clip_r is not None:
             x_norm = torch.norm(x, dim=-1, keepdim=True) + 1e-5
             fac = torch.minimum(
                 torch.ones_like(x_norm), 
@@ -97,6 +114,9 @@ class ToPoincare(nn.Module):
         return self.grad_fix(pmath.project(pmath.expmap0(x, c=self.c), c=self.c))
 
     def extra_repr(self):
+        if self.log_tau is not None:
+            tau = self.log_tau.exp().item()
+            return f"c={self.c}, train_x={self.train_x}, τ={tau:.3f} (learnable)"
         return f"c={self.c}, train_x={self.train_x}, clip_r={self.clip_r}"
 
 

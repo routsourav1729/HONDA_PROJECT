@@ -20,10 +20,9 @@
 BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
 # --- EDIT THESE for T1 vs T2 ---
-TASK="IDD_HYP/t2"
-CKPT="$BASE_DIR/IDD_HYP/t2/fewshotfinetunev3/model_final.pth"
-# clip_r is now auto-read from checkpoint (the --clip_r flag is just a fallback)
-CLIP_R=1.0
+TASK="IDD_HYP/t1"
+CKPT="$BASE_DIR/IDD_HYP/t1/newmodel/model_35.pth"
+# tau_init and bi_lipschitz are auto-read from checkpoint hyp_config
 SPLIT="train"
 
 echo "=========================================="
@@ -31,13 +30,11 @@ echo "UNKNOWN EMBEDDING ANALYSIS ($SPLIT)"
 echo "=========================================="
 echo "Job started at: $(date)"
 echo "Checkpoint: $CKPT"
-echo "clip_r: $CLIP_R"
 echo "Split: $SPLIT"
 echo "=========================================="
 
 # Activate conda environment
-eval "$(conda shell.bash hook)"
-conda activate ovow2
+source /home/agipml/sourav.rout/miniconda3/bin/activate ovow2
 
 # Export LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
@@ -55,6 +52,7 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
 
 cd /home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2
 
@@ -64,9 +62,6 @@ python debug/analyze_unknowns.py \
     --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $CKPT \
-    --hyp_c 1.0 \
-    --hyp_dim 256 \
-    --clip_r $CLIP_R \
     --split $SPLIT \
     --output_dir visualizations
 

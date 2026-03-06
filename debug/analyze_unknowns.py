@@ -1022,12 +1022,14 @@ if __name__ == "__main__":
     print(f"  clip_r: {args.clip_r}")
     print(f"  Checkpoint: {args.ckpt}")
 
-    # --- Read hyp_config from checkpoint (authoritative source for clip_r etc.) ---
+    # --- Read hyp_config from checkpoint (authoritative source for clip_r, tau_init etc.) ---
     ckpt_data = torch.load(args.ckpt, map_location='cpu')
     hyp_config = ckpt_data.get('hyp_config', {})
     hyp_c = hyp_config.get('curvature', args.hyp_c)
     hyp_dim = hyp_config.get('embed_dim', args.hyp_dim)
     clip_r = hyp_config.get('clip_r', args.clip_r)
+    tau_init = hyp_config.get('tau_init', None)
+    bi_lipschitz = hyp_config.get('bi_lipschitz', False)
     # Override args with checkpoint values (they are the ground truth)
     if clip_r != args.clip_r:
         print(f"  WARNING: --clip_r={args.clip_r} overridden by checkpoint clip_r={clip_r}")
@@ -1038,6 +1040,10 @@ if __name__ == "__main__":
     if hyp_dim != args.hyp_dim:
         print(f"  WARNING: --hyp_dim={args.hyp_dim} overridden by checkpoint hyp_dim={hyp_dim}")
         args.hyp_dim = hyp_dim
+    if tau_init is not None:
+        print(f"  Using learnable τ (tau_init={tau_init}) — clip_r is ignored")
+    if bi_lipschitz:
+        print(f"  Using BiLipschitz projectors")
     del ckpt_data  # free memory
 
     # Model config - use task_name (IDD_HYP) for config paths
@@ -1051,6 +1057,7 @@ if __name__ == "__main__":
     runner._hooks = [h for h in runner._hooks if not h.__class__.__name__.startswith('EMA')]
     runner.call_hook("before_run")
     runner.load_or_resume()
+    runner.model = runner.model.cuda()
     runner.model.reparameterize([known_class_names])
     runner.model.eval()
 
@@ -1077,6 +1084,8 @@ if __name__ == "__main__":
         runner.model, unknown_index,
         hyp_c=args.hyp_c, hyp_dim=args.hyp_dim, clip_r=args.clip_r,
         num_classifier_classes=classifier_num_classes,
+        bi_lipschitz=bi_lipschitz,
+        tau_init=tau_init,
     )
 
     print(f"\n=== Loading Checkpoint: {args.ckpt} ===")

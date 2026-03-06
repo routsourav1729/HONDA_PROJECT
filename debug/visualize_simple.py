@@ -973,6 +973,7 @@ if __name__ == "__main__":
     runner._hooks = [h for h in runner._hooks if not h.__class__.__name__.startswith('EMA')]
     runner.call_hook("before_run")
     runner.load_or_resume()
+    runner.model = runner.model.cuda()
     runner.model.reparameterize([known_class_names])
     runner.model.eval()
 
@@ -985,16 +986,24 @@ if __name__ == "__main__":
     hyp_c = hyp_config.get('curvature', args.hyp_c)
     hyp_dim = hyp_config.get('embed_dim', args.hyp_dim)
     clip_r = hyp_config.get('clip_r', args.clip_r)
+    tau_init = hyp_config.get('tau_init', None)
+    bi_lipschitz = hyp_config.get('bi_lipschitz', False)
     if hyp_dim != args.hyp_dim:
         print(f"  NOTE: Using hyp_dim={hyp_dim} from checkpoint (CLI default was {args.hyp_dim})")
     if hyp_c != args.hyp_c:
         print(f"  NOTE: Using hyp_c={hyp_c} from checkpoint (CLI default was {args.hyp_c})")
+    if tau_init is not None:
+        print(f"  NOTE: Using learnable τ (tau_init={tau_init}) — clip_r is ignored")
+    if bi_lipschitz:
+        print(f"  NOTE: Using BiLipschitz projectors")
     del ckpt_data  # free memory
 
     # Build hyperbolic model
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
-        hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r
+        hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
+        bi_lipschitz=bi_lipschitz,
+        tau_init=tau_init,
     )
 
     print(f"\n=== Loading Checkpoint: {args.ckpt} ===")

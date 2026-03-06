@@ -29,7 +29,16 @@ hyp_config = dict(
     embed_dim=64,            # Reduced from 256 → 64 for sharper geometry
     # clip_r controls max Euclidean norm before expmap0.
     # tanh(clip_r) = max Poincaré norm. 1.0 → 0.762, safe stable region.
+    # NOTE: clip_r is IGNORED when tau_init is set (temperature scaling replaces it)
     clip_r=1.0,
+    
+    # Temperature-scaled exponential map (replaces hard clip_r)
+    # τ rescales projector norms into tanh's useful range:
+    #   x/τ → expmap0 → tanh(||x||/τ) preserves norm ordering
+    # Init: τ = mean_proj_norm / atanh(0.85) ≈ 15 / 1.26 ≈ 12
+    # Mean known norm ~19, unknown ~13 from pipeline analysis.
+    # With τ=12: known → tanh(19/12)=0.92, unknown → tanh(13/12)=0.74
+    tau_init=12.0,
     
     # Overall hyp loss multiplier
     hyp_loss_weight=1.0,
@@ -39,7 +48,7 @@ hyp_config = dict(
     class_balance_smoothing=0.5, # sqrt-inverse-frequency weights
     margin=1.0,                  # Busemann margin loss: enforce score gap >= margin
     margin_weight=0.5,           # Weight for margin loss
-    pull_weight=0.0,             # Disabled — was compressing score range, hurting OOD
+    pull_weight=0.1,             # Re-enabled: temp scaling gives radial room for geodesic pull
     target_norm_fraction=0.85,   # Pull target at 85% of boundary radius
     dispersion_weight=0.1,       # Push prototype directions apart
     bias_reg_weight=0.1,         # L2 penalty on biases

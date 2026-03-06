@@ -29,8 +29,7 @@ echo "Checkpoint: $CKPT"
 echo "=========================================="
 
 # Activate conda environment
-eval "$(conda shell.bash hook)"
-conda activate ovow2
+source /home/agipml/sourav.rout/miniconda3/bin/activate ovow2
 
 # Export LD_LIBRARY_PATH for detectron2
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
@@ -51,6 +50,7 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
 
 echo "Python: $(which python)"
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"

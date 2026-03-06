@@ -225,9 +225,17 @@ if __name__ == "__main__":
     print_rank0(f"  Hooks after EMA removal: {[h.__class__.__name__ for h in runner._hooks]}", rank)
     runner.call_hook("before_run")
     runner.load_or_resume()
+    print_rank0(f"  [DEBUG] checkpoint loaded, moving model to device {device}...", rank)
+    import sys; sys.stdout.flush()
     runner.model = runner.model.to(device)
+    print_rank0(f"  [DEBUG] model on device, calling reparameterize...", rank)
+    sys.stdout.flush()
     runner.model.reparameterize([class_names])
+    print_rank0(f"  [DEBUG] reparameterize done, setting train mode...", rank)
+    sys.stdout.flush()
     runner.model.train()
+    print_rank0(f"  [DEBUG] train mode set, building dataloaders...", rank)
+    sys.stdout.flush()
 
     # Build data loaders (with DDP sampler if distributed)
     train_loader = build_ddp_dataloader(cfgY, is_distributed, world_size, rank)
@@ -245,11 +253,12 @@ if __name__ == "__main__":
     init_protos_path = args.init_protos if args.init_protos is not None else hyp_cfg.get('init_protos', '')
     prev_ckpt = args.ckpt if args.ckpt else hyp_cfg.get('prev_ckpt', '')
     bi_lipschitz = hyp_cfg.get('bi_lipschitz', False)
+    tau_init = hyp_cfg.get('tau_init', None)
     
     print_rank0(f"\n=== Hyperbolic Config ===", rank)
     print_rank0(f"  curvature: {hyp_c}, embed_dim: {hyp_dim}, clip_r: {clip_r}", rank)
     print_rank0(f"  hyp_loss_weight: {hyp_loss_weight}, dispersion: {dispersion_weight}", rank)
-    print_rank0(f"  bi_lipschitz: {bi_lipschitz}", rank)
+    print_rank0(f"  bi_lipschitz: {bi_lipschitz}, tau_init: {tau_init}", rank)
     
     # Load init prototypes
     init_prototypes = None
@@ -279,6 +288,7 @@ if __name__ == "__main__":
         dispersion_weight=dispersion_weight,
         bias_reg_weight=bias_reg_weight,
         bi_lipschitz=bi_lipschitz,
+        tau_init=tau_init,
     )
     
     if args.resume_from:
@@ -429,9 +439,13 @@ if __name__ == "__main__":
             print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
             
             # Save checkpoints (rank 0 only)
+            hyp_config_save = {
+                'curvature': hyp_c, 'embed_dim': hyp_dim, 'clip_r': clip_r,
+                'tau_init': tau_init, 'bi_lipschitz': bi_lipschitz,
+            }
             if epoch % 5 == 0:
-                save_model(model, optimizer, epoch, save_dir)
-            save_model(model, optimizer, 'latest', save_dir, actual_epoch=epoch)
+                save_model(model, optimizer, epoch, save_dir, hyp_config=hyp_config_save)
+            save_model(model, optimizer, 'latest', save_dir, actual_epoch=epoch, hyp_config=hyp_config_save)
         
         # Sync all processes before next epoch
         if is_distributed:
@@ -520,6 +534,8 @@ if __name__ == "__main__":
             'curvature': hyp_c,
             'embed_dim': hyp_dim,
             'clip_r': clip_r,
+            'tau_init': tau_init,
+            'bi_lipschitz': bi_lipschitz,
         }
         
         save_model(model, optimizer, 'final', save_dir,
