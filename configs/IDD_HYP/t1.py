@@ -21,44 +21,42 @@ text_model_name = 'openai/clip-vit-base-patch32'
 ood_threshold = 4.0  # Adjusted for IDD
 
 # =============================================================================
-# Horospherical/Hyperbolic Configuration (V2)
+# Geodesic Prototypical Hyperbolic Configuration
 # =============================================================================
 hyp_config = dict(
     # Poincaré ball parameters
     curvature=1.0,           # c=1.0 means ball radius R=1/√c=1.0
     embed_dim=64,            # Reduced from 256 → 64 for sharper geometry
-    # clip_r controls max Euclidean norm before expmap0.
-    # tanh(clip_r) = max Poincaré norm. 1.0 → 0.762, safe stable region.
-    # NOTE: clip_r is IGNORED when tau_init is set (temperature scaling replaces it)
-    clip_r=1.0,
     
-    # Temperature-scaled exponential map (replaces hard clip_r)
-    # τ rescales projector norms into tanh's useful range:
-    #   x/τ → expmap0 → tanh(||x||/τ) preserves norm ordering
-    # Init: τ = mean_proj_norm / atanh(0.85) ≈ 15 / 1.26 ≈ 12
-    # Mean known norm ~19, unknown ~13 from pipeline analysis.
-    # With τ=12: known → tanh(19/12)=0.92, unknown → tanh(13/12)=0.74
-    tau_init=12.0,
+    # clip_r: SAFETY clamp on Euclidean norm before expmap0.
+    # L_reg keeps norms small so this rarely triggers.
+    # tanh(2.0) = 0.964, so max Poincaré norm ~0.964.
+    clip_r=2.0,
     
     # Overall hyp loss multiplier
     hyp_loss_weight=1.0,
     
-    # V2 loss components
-    ce_weight=1.0,               # Cross-entropy with class balancing
+    # Geodesic prototype loss components
+    ce_weight=1.0,               # Cross-entropy over -d^2_B scores
     class_balance_smoothing=0.5, # sqrt-inverse-frequency weights
-    margin=1.0,                  # Busemann margin loss: enforce score gap >= margin
-    margin_weight=0.5,           # Weight for margin loss
-    pull_weight=0.1,             # Re-enabled: temp scaling gives radial room for geodesic pull
-    target_norm_fraction=0.85,   # Pull target at 85% of boundary radius
-    dispersion_weight=0.1,       # Push prototype directions apart
-    bias_reg_weight=0.1,         # L2 penalty on biases
+    
+    # L_reg: pre-expmap norm regularization (CRITICAL for preventing tanh saturation)
+    # β * mean(||x_hat||^2) where x_hat = projector output before expmap0
+    # Target: keep mean(||x_hat||) around 1-2 so tanh operates in linear range
+    beta_reg=0.1,
+    
+    # L_sep: prototype separation loss
+    # max(0, margin - d_B(z_i, z_j)) for all prototype pairs
+    lambda_sep=1.0,              # Weight for separation loss
+    sep_margin=1.0,              # Minimum geodesic distance between prototypes
     
     # BiLipschitz projector (SNGP-style spectral-normed residual)
-    bi_lipschitz=True,           # Use spectral-normed projectors for distance preservation
+    bi_lipschitz=True,
     
-    # Trainable prototypes (V2)
-    trainable_prototypes=True,   # Prototypes as nn.Parameter (vs frozen buffer)
-    prototype_lr=1e-3,           # Separate LR for prototype directions
+    # Trainable prototypes — interior points, not on boundary
+    trainable_prototypes=True,
+    prototype_lr=1e-3,           # Separate LR for prototypes (standard Adam, project after step)
+    prototype_init_norm=0.4,     # Initial Poincaré norm for prototypes inside ball
     
     # Prototype initialization (REQUIRED!)
     # Run: python init_prototypes.py --classes "car,motorcycle,..." --out_dim 64 --output init_protos_t1.pt

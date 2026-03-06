@@ -1,22 +1,22 @@
 """
 Adaptive Per-Prototype Threshold Calibration.
 
-Runs the model over the training set and collects per-class horosphere score
-statistics from GT-assigned anchors.  These per-class (mean, std) values
+Runs the model over the training set and collects per-class geodesic distance
+scores from GT-assigned anchors.  These per-class (mean, std) values
 define adaptive OOD thresholds:
+
+    tau_k = mean_k + alpha * std_k
+
+Note: In geodesic framework, OOD score = min_k d^2_B (higher = more OOD).
+So threshold direction is REVERSED vs Busemann: score > tau_k -> unknown.
+For per-class calibration, we use max geodesic score (-d^2, higher = more ID)
+and threshold as: score < tau_k -> unknown:
 
     tau_k = mean_k - alpha * std_k
 
-At inference, a detection assigned to prototype k with max_score < tau_k
-is relabeled as *unknown*.
-
-This module is called automatically at the end of training (dev_hyp.py).
+This module is called automatically at the end of training (dev_hyp_ddp.py).
 The resulting stats are embedded in the final checkpoint so that test_hyp.py
 can load them without any external file.
-
-Key design: uses GT boxes directly from the dataloader (already scaled/padded
-to 640×640 space) — NO XML parsing, NO extra disk I/O. This makes calibration
-as fast as a plain eval pass (~5-8 min for the full IDD train set).
 """
 
 import numpy as np
@@ -24,7 +24,7 @@ import torch
 from tqdm import tqdm
 from collections import defaultdict
 
-from core.hyperbolic import busemann
+from core.hyperbolic import pmath
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +84,8 @@ def calibrate(model, train_loader, known_class_names, dataset_root=None, hyp_c=1
     was_training = model.training
     model.eval()
 
-    prototypes = model.prototypes.detach()
-    biases = model.prototype_biases.detach()
+    prototypes = model.prototypes.detach()   # (K, dim) interior points — not used directly
+    # Scoring is done via model.compute_geodesic_scores() which accesses prototypes internally
 
     per_class_scores = defaultdict(list)
     samples_count = defaultdict(int)
@@ -125,7 +125,7 @@ def calibrate(model, train_loader, known_class_names, dataset_root=None, hyp_c=1
                 else:
                     x = model.parent.neck(x)
 
-            hyp_embeddings = model.hyp_projector(x)  # (B, 8400, dim)
+            hyp_embeddings, _ = model.hyp_projector(x)  # (B, 8400, dim), ignore pre_expmap_norms
 
             h, w = data_batch['inputs'].shape[-2:]
             anchor_centers = get_anchor_centers(h, w, device=hyp_embeddings.device)
@@ -162,18 +162,17 @@ def calibrate(model, train_loader, known_class_names, dataset_root=None, hyp_c=1
                           - anchor_centers.unsqueeze(0)) ** 2).sum(-1)  # (M, A)
                 nearest_indices = dists.argmin(dim=1)  # (M,)
 
-                # Batch busemann scores
+                # Batch geodesic scores
                 embs = hyp_embeddings[b_idx, nearest_indices]       # (M, dim)
-                B_vals = busemann(prototypes, embs, c=hyp_c)         # (M, K)
-                horo_scores = -B_vals + biases                       # (M, K)
-                max_horos = horo_scores.max(dim=-1).values           # (M,)
+                geo_scores = model.compute_geodesic_scores(embs)     # (M, K)
+                max_geo = geo_scores.max(dim=-1).values              # (M,)
 
                 # Accumulate per-class
                 for j in range(len(labels)):
                     label_idx = labels[j].item()
                     if 0 <= label_idx < len(known_class_names):
                         cls_name = known_class_names[label_idx]
-                        per_class_scores[cls_name].append(max_horos[j].item())
+                        per_class_scores[cls_name].append(max_geo[j].item())
                         samples_count[cls_name] += 1
 
         except Exception as e:

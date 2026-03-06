@@ -1,6 +1,6 @@
 """
 Hyperbolic geometry modules for open-world object detection.
-Uses Horospherical classification with ideal prototypes on boundary.
+Uses Geodesic Prototypical classification with interior prototypes.
 """
 
 from .pmath import (
@@ -20,6 +20,9 @@ from .nn import ToPoincare, FromPoincare, HyperbolicMLR
 
 from .projector import (
     HyperbolicProjector,
+    GeodesicPrototypeClassifier,
+    GeodesicPrototypeLoss,
+    # Backward-compat aliases
     HorosphericalClassifier,
     HorosphericalLoss,
     HorosphericalLossV2,
@@ -47,8 +50,11 @@ __all__ = [
     'ToPoincare',
     'FromPoincare',
     'HyperbolicMLR',
-    # Projector and classifier
+    # Projector and classifier (Geodesic)
     'HyperbolicProjector',
+    'GeodesicPrototypeClassifier',
+    'GeodesicPrototypeLoss',
+    # Backward compat aliases
     'HorosphericalClassifier',
     'HorosphericalLoss',
     'HorosphericalLossV2',

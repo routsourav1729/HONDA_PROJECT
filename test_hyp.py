@@ -1,14 +1,16 @@
 """
-Horospherical YOLO World Evaluation Script.
+Geodesic Prototypical YOLO World Evaluation Script.
 
-Inference with Busemann function-based OOD detection using
+Inference with geodesic distance-based OOD detection using
 adaptive per-prototype thresholds.
 
 Thresholds are loaded directly from the checkpoint (embedded during training).
-No external JSON file needed — the checkpoint is self-contained.
+No external JSON file needed -- the checkpoint is self-contained.
 
-For each detection assigned to prototype k with max_score < tau_k → unknown,
+For each detection assigned to prototype k with max_geo_score < tau_k -> unknown,
 where tau_k = mean_k - alpha * std_k  (calibrated from training data).
+
+Geodesic scores = -d^2_B(x, z_k): higher = more ID, lower = more OOD.
 """
 
 import os
@@ -158,9 +160,17 @@ if __name__ == "__main__":
     hyp_config = ckpt_data.get('hyp_config', {})
     hyp_c = hyp_config.get('curvature', 1.0)
     hyp_dim = hyp_config.get('embed_dim', 64)
-    clip_r = hyp_config.get('clip_r', 0.95)
+    clip_r = hyp_config.get('clip_r', 2.0)
+    bi_lipschitz = hyp_config.get('bi_lipschitz', False)
+    prototype_init_norm = hyp_config.get('prototype_init_norm', 0.4)
+    beta_reg = hyp_config.get('beta_reg', 0.1)
+    lambda_sep = hyp_config.get('lambda_sep', 1.0)
+    sep_margin = hyp_config.get('sep_margin', 1.0)
+    framework = hyp_config.get('framework', 'geodesic_prototypical')
 
-    print(f"  hyp_config from checkpoint: c={hyp_c}, dim={hyp_dim}, clip_r={clip_r}")
+    print(f"  hyp_config: c={hyp_c}, dim={hyp_dim}, clip_r={clip_r}, framework={framework}")
+    print(f"  prototype_init_norm={prototype_init_norm}, beta_reg={beta_reg}, lambda_sep={lambda_sep}")
+    print(f"  bi_lipschitz={bi_lipschitz}")
 
     # Extract adaptive_stats
     adaptive_stats = ckpt_data.get('adaptive_stats', None)
@@ -196,6 +206,11 @@ if __name__ == "__main__":
         runner.model, unknown_index,
         hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
         num_classifier_classes=classifier_num_classes,
+        bi_lipschitz=bi_lipschitz,
+        prototype_init_norm=prototype_init_norm,
+        beta_reg=beta_reg,
+        lambda_sep=lambda_sep,
+        sep_margin=sep_margin,
     )
     
     model = load_hyp_ckpt(model, args.ckpt,
@@ -209,7 +224,7 @@ if __name__ == "__main__":
     print(f"Task: {args.task}, Dataset: {dataset_key}")
     print(f"Classes: {len(class_names)} + 1 (unknown)")
     print(f"Prototypes: {model.prototypes.shape[0]} (norm={model.prototypes.norm(dim=-1).mean():.3f})")
-    print(f"clip_r: {clip_r} (from checkpoint)")
+    print(f"Framework: geodesic prototypical (clip_r={clip_r})")
 
     # Compute adaptive thresholds
     adaptive_thresholds = None
@@ -247,15 +262,13 @@ if __name__ == "__main__":
                 continue
             
             # --- Step 1: OOD relabeling (BEFORE NMS, matching ovow test.py) ---
-            # ovow: ood_score = -cosinescores.max(dim=1).values
-            #        if ood_score > ood_threshold → unknown
-            # ours:  horo_max_scores = max horosphere score (higher = more ID)
-            #        if horo_max_scores < adaptive_threshold[proto_k] → unknown
+            # Geodesic scores = -d²(x, ẑ_k): higher = more ID, lower = more OOD
+            # If max_geo_score < adaptive_threshold[proto_k] → unknown
             if adaptive_thresholds is not None:
-                if hasattr(pred, 'horo_max_scores') and hasattr(pred, 'horo_assigned_proto'):
-                    proto_indices = pred.horo_assigned_proto.long()
+                if hasattr(pred, 'geo_max_scores') and hasattr(pred, 'geo_assigned_proto'):
+                    proto_indices = pred.geo_assigned_proto.long()
                     per_det_thresholds = adaptive_thresholds[proto_indices]
-                    is_unknown = pred.horo_max_scores < per_det_thresholds
+                    is_unknown = pred.geo_max_scores < per_det_thresholds
                     pred.labels[is_unknown] = unknown_index
                     total_relabeled += is_unknown.sum().item()
             
@@ -285,7 +298,7 @@ if __name__ == "__main__":
     print(f"RESULTS — {strategy_str}")
     print(f"{'='*60}")
     print(f"  Checkpoint: {args.ckpt}")
-    print(f"  clip_r: {clip_r} (from checkpoint)")
+    print(f"  Framework: geodesic prototypical (clip_r={clip_r})")
     print(f"  NMS mode: {args.nms_mode} (iou={args.nms_iou})")
     print(f"  Total detections (pre-NMS): {total_dets}")
     print(f"  Total detections (post-NMS): {total_dets_after_nms}")

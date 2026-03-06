@@ -1,5 +1,5 @@
 """
-Horospherical YOLO World Training Script - Multi-GPU DDP Version.
+Geodesic Prototypical YOLO World Training Script - Multi-GPU DDP Version.
 
 Supports both single-GPU and multi-GPU training.
 Launch:
@@ -165,9 +165,8 @@ if __name__ == "__main__":
     parser.add_argument("--hyp_dim", type=int, default=None)
     parser.add_argument("--clip_r", type=float, default=None)
     parser.add_argument("--hyp_loss_weight", type=float, default=None)
-    parser.add_argument("--dispersion_weight", type=float, default=None)
-    parser.add_argument("--bias_reg_weight", type=float, default=None)
-    parser.add_argument("--compactness_weight", type=float, default=None)
+    parser.add_argument("--beta_reg", type=float, default=None)
+    parser.add_argument("--lambda_sep", type=float, default=None)
     parser.add_argument("--init_protos", type=str, default=None)
     parser.add_argument("--wandb", action="store_true")
     
@@ -244,21 +243,26 @@ if __name__ == "__main__":
     # Hyperbolic config
     hyp_cfg = cfgY.get('hyp_config', {})
     hyp_c = args.hyp_c if args.hyp_c is not None else hyp_cfg.get('curvature', 1.0)
-    hyp_dim = args.hyp_dim if args.hyp_dim is not None else hyp_cfg.get('embed_dim', 256)
-    clip_r = args.clip_r if args.clip_r is not None else hyp_cfg.get('clip_r', 0.95)
+    hyp_dim = args.hyp_dim if args.hyp_dim is not None else hyp_cfg.get('embed_dim', 64)
+    clip_r = args.clip_r if args.clip_r is not None else hyp_cfg.get('clip_r', 2.0)
     hyp_loss_weight = args.hyp_loss_weight if args.hyp_loss_weight is not None else hyp_cfg.get('hyp_loss_weight', 1.0)
-    dispersion_weight = args.dispersion_weight if args.dispersion_weight is not None else hyp_cfg.get('dispersion_weight', 0.0)
-    bias_reg_weight = args.bias_reg_weight if args.bias_reg_weight is not None else hyp_cfg.get('bias_reg_weight', 0.0)
-    compactness_weight = args.compactness_weight if args.compactness_weight is not None else hyp_cfg.get('compactness_weight', 0.0)
+    ce_weight = hyp_cfg.get('ce_weight', 1.0)
+    class_balance_smoothing = hyp_cfg.get('class_balance_smoothing', 0.5)
+    beta_reg = args.beta_reg if args.beta_reg is not None else hyp_cfg.get('beta_reg', 0.1)
+    lambda_sep = args.lambda_sep if args.lambda_sep is not None else hyp_cfg.get('lambda_sep', 1.0)
+    sep_margin = hyp_cfg.get('sep_margin', 1.0)
     init_protos_path = args.init_protos if args.init_protos is not None else hyp_cfg.get('init_protos', '')
     prev_ckpt = args.ckpt if args.ckpt else hyp_cfg.get('prev_ckpt', '')
     bi_lipschitz = hyp_cfg.get('bi_lipschitz', False)
-    tau_init = hyp_cfg.get('tau_init', None)
+    prototype_init_norm = hyp_cfg.get('prototype_init_norm', 0.4)
+    prototype_lr = hyp_cfg.get('prototype_lr', 1e-3)
+    trainable_prototypes = hyp_cfg.get('trainable_prototypes', True)
     
-    print_rank0(f"\n=== Hyperbolic Config ===", rank)
+    print_rank0(f"\n=== Geodesic Prototypical Config ===", rank)
     print_rank0(f"  curvature: {hyp_c}, embed_dim: {hyp_dim}, clip_r: {clip_r}", rank)
-    print_rank0(f"  hyp_loss_weight: {hyp_loss_weight}, dispersion: {dispersion_weight}", rank)
-    print_rank0(f"  bi_lipschitz: {bi_lipschitz}, tau_init: {tau_init}", rank)
+    print_rank0(f"  hyp_loss_weight: {hyp_loss_weight}, beta_reg: {beta_reg}, lambda_sep: {lambda_sep}", rank)
+    print_rank0(f"  sep_margin: {sep_margin}, prototype_init_norm: {prototype_init_norm}", rank)
+    print_rank0(f"  bi_lipschitz: {bi_lipschitz}, prototype_lr: {prototype_lr}", rank)
     
     # Load init prototypes
     init_prototypes = None
@@ -273,22 +277,26 @@ if __name__ == "__main__":
 
     # Build model
     # For T2+, the classifier only holds NOVEL class prototypes.
-    # Base class prototypes are loaded into frozen_directions/frozen_biases by load_hyp_ckpt.
+    # Base class prototypes are loaded into frozen_prototypes buffer by load_hyp_ckpt.
     prev_cls = cfg.TEST.PREV_INTRODUCED_CLS
     cur_cls = cfg.TEST.CUR_INTRODUCED_CLS
     classifier_num_classes = cur_cls if prev_cls > 0 else unknown_index
     
-    print_rank0(f"\n=== Building Horospherical Model ===", rank)
+    print_rank0(f"\n=== Building Geodesic Prototypical Model ===", rank)
     print_rank0(f"  Classifier classes: {classifier_num_classes} ({'novel only' if prev_cls > 0 else 'all'})", rank)
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
         hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
         num_classifier_classes=classifier_num_classes,
         init_prototypes=init_prototypes,
-        dispersion_weight=dispersion_weight,
-        bias_reg_weight=bias_reg_weight,
+        trainable_prototypes=trainable_prototypes,
         bi_lipschitz=bi_lipschitz,
-        tau_init=tau_init,
+        prototype_init_norm=prototype_init_norm,
+        ce_weight=ce_weight,
+        class_balance_smoothing=class_balance_smoothing,
+        beta_reg=beta_reg,
+        lambda_sep=lambda_sep,
+        sep_margin=sep_margin,
     )
     
     if args.resume_from:
@@ -315,8 +323,8 @@ if __name__ == "__main__":
     if is_distributed:
         # find_unused_parameters=False is safe because:
         #   - All frozen params have requires_grad=False (set before wrapping)
-        #   - prototype_direction is a register_buffer (not a parameter)
-        #   - All trainable params (embeddings, projector convs, BN, bias) participate in every forward
+        #   - frozen_prototypes is a register_buffer (not a parameter)
+        #   - All trainable params (projector convs, BN, prototypes) participate in every forward
         model = DDP(
             model,
             device_ids=[local_rank],
@@ -329,13 +337,30 @@ if __name__ == "__main__":
     raw_model = model.module if isinstance(model, DDP) else model
     
     # Optimizer + LR schedule
+    # Separate param groups: prototypes get their own LR
+    proto_params = []
+    other_params = []
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'classifier.prototypes' in name:
+            proto_params.append(param)
+        else:
+            other_params.append(param)
+    
+    param_groups = [
+        {'params': other_params, 'lr': cfgY.base_lr, 'weight_decay': cfgY.weight_decay},
+    ]
+    if proto_params:
+        param_groups.append(
+            {'params': proto_params, 'lr': prototype_lr, 'weight_decay': 0.0}
+        )
+        print_rank0(f"  Prototype LR: {prototype_lr} (separate group, no weight decay)", rank)
+    
     PROTO_FREEZE_EPOCHS = 0
-    optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, raw_model.parameters()),
-        lr=cfgY.base_lr, weight_decay=cfgY.weight_decay
-    )
+    optimizer = optim.AdamW(param_groups)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfgY.max_epochs, eta_min=1e-6)
-    print_rank0(f"Optimizer: AdamW, LR={cfgY.base_lr}, CosineAnnealing", rank)
+    print_rank0(f"Optimizer: AdamW, base_LR={cfgY.base_lr}, CosineAnnealing", rank)
 
     wb = None
     if args.wandb and is_main_process(rank):
@@ -371,13 +396,14 @@ if __name__ == "__main__":
         
         print_rank0(f"\n=== Epoch {epoch} ===", rank)
 
-        # Prototype bias freeze/unfreeze (directions are permanently frozen as buffer)
+        # Prototype freeze/unfreeze
         if epoch < PROTO_FREEZE_EPOCHS:
-            raw_model.hyp_projector.classifier.prototype_bias.requires_grad_(False)
+            raw_model.hyp_projector.classifier.prototypes.requires_grad_(False)
         elif epoch == PROTO_FREEZE_EPOCHS:
-            raw_model.hyp_projector.classifier.prototype_bias.requires_grad_(True)
+            if trainable_prototypes:
+                raw_model.hyp_projector.classifier.prototypes.requires_grad_(True)
 
-        epoch_loss = {'cls': 0, 'dfl': 0, 'bbox': 0, 'horo': 0}
+        epoch_loss = {'cls': 0, 'dfl': 0, 'bbox': 0, 'geo': 0}
         steps = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}", disable=not is_main_process(rank))
@@ -398,33 +424,29 @@ if __name__ == "__main__":
             epoch_loss['cls'] += head_losses['loss_cls'].item()
             epoch_loss['dfl'] += head_losses['loss_dfl'].item()
             epoch_loss['bbox'] += head_losses['loss_bbox'].item()
-            epoch_loss['horo'] += hyp_loss.item()
+            epoch_loss['geo'] += hyp_loss.item()
             
             if steps % 50 == 0 and is_main_process(rank):
                 print(f"  step {steps}: cls={head_losses['loss_cls'].item():.4f} "
-                      f"bbox={head_losses['loss_bbox'].item():.4f} horo={hyp_loss.item():.4f}")
-                # Log prototype stats from the classifier directly (no extra forward)
+                      f"bbox={head_losses['loss_bbox'].item():.4f} geo={hyp_loss.item():.4f}")
                 if steps % 100 == 0:
                     with torch.no_grad():
-                        bias = raw_model.hyp_projector.classifier.prototype_bias
-                        bias_mean = bias.mean().item()
-                        bias_max = bias.max().item()
-                        dirs = raw_model.hyp_projector.classifier.prototype_direction
-                        dirs_n = torch.nn.functional.normalize(dirs, dim=-1)
-                        dist_sq = torch.cdist(dirs_n, dirs_n).pow(2)
-                        K = dirs_n.shape[0]
-                        mask = ~torch.eye(K, dtype=torch.bool, device=dirs_n.device)
-                        disp = torch.log(torch.exp(-dist_sq[mask]).mean()).item()
-                    print(f"    [Proto] bias_mean={bias_mean:.3f} bias_max={bias_max:.3f} "
-                          f"ce={hyp_loss.item():.4f} disp={disp:.4f}")
+                        protos = raw_model.hyp_projector.classifier.prototypes
+                        proto_norms = protos.norm(dim=-1)
+                        print(f"    [Proto] norms: mean={proto_norms.mean():.4f} "
+                              f"min={proto_norms.min():.4f} max={proto_norms.max():.4f}")
                 if wb:
                     wb.log({
                         'cls': head_losses['loss_cls'].item(), 
                         'bbox': head_losses['loss_bbox'].item(), 
-                        'horo': hyp_loss.item()
+                        'geo': hyp_loss.item()
                     }, step=gs)
             
             optimizer.step()
+            
+            # Project prototypes back inside ball after optimizer step
+            raw_model.hyp_projector.classifier.project_prototypes_to_ball()
+            
             steps += 1
             gs += 1
         
@@ -435,13 +457,16 @@ if __name__ == "__main__":
             n = max(steps, 1)
             epoch_time = time.time() - epoch_start
             print(f"Epoch {epoch} done ({epoch_time/60:.1f} min) | "
-                  f"Avg: cls={epoch_loss['cls']/n:.4f} bbox={epoch_loss['bbox']/n:.4f} horo={epoch_loss['horo']/n:.4f}")
+                  f"Avg: cls={epoch_loss['cls']/n:.4f} bbox={epoch_loss['bbox']/n:.4f} geo={epoch_loss['geo']/n:.4f}")
             print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
             
             # Save checkpoints (rank 0 only)
             hyp_config_save = {
                 'curvature': hyp_c, 'embed_dim': hyp_dim, 'clip_r': clip_r,
-                'tau_init': tau_init, 'bi_lipschitz': bi_lipschitz,
+                'bi_lipschitz': bi_lipschitz,
+                'beta_reg': beta_reg, 'lambda_sep': lambda_sep,
+                'sep_margin': sep_margin, 'prototype_init_norm': prototype_init_norm,
+                'framework': 'geodesic_prototypical',
             }
             if epoch % 5 == 0:
                 save_model(model, optimizer, epoch, save_dir, hyp_config=hyp_config_save)
@@ -534,8 +559,12 @@ if __name__ == "__main__":
             'curvature': hyp_c,
             'embed_dim': hyp_dim,
             'clip_r': clip_r,
-            'tau_init': tau_init,
             'bi_lipschitz': bi_lipschitz,
+            'beta_reg': beta_reg,
+            'lambda_sep': lambda_sep,
+            'sep_margin': sep_margin,
+            'prototype_init_norm': prototype_init_norm,
+            'framework': 'geodesic_prototypical',
         }
         
         save_model(model, optimizer, 'final', save_dir,

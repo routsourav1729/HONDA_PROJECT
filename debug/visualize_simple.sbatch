@@ -19,7 +19,7 @@
 BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
 TASK="IDD_HYP/t1"
-CKPT="$BASE_DIR/IDD_HYP/t1/newmethod/model_final.pth"
+CKPT="$BASE_DIR/IDD_HYP/t1/newmodel/model_final.pth"
 
 echo "=========================================="
 echo "POINCARÉ VISUALIZATION"
@@ -57,9 +57,6 @@ python debug/visualize_simple.py \
     --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $CKPT \
-    --hyp_c 1.0 \
-    --hyp_dim 256 \
-    --clip_r 0.95 \
     --output_dir visualizations
 
 echo ""

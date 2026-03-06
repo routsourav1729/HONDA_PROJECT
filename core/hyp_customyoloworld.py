@@ -1,8 +1,10 @@
 """
-Hyperbolic Custom YOLO World with Horospherical Classification.
+Hyperbolic Custom YOLO World with Geodesic Prototypical Classification.
 
-Uses Busemann function with ideal prototypes on boundary for OOD detection.
-Prototypes live on the Poincaré ball boundary (‖p‖ = 1 for c=1).
+Uses geodesic distance to interior prototypes in Poincare ball for OOD detection.
+Prototypes live INSIDE the ball (||z_k|| < R), not on the boundary.
+Classification: softmax over -d^2_B(x, z_k)
+OOD: min_k d^2_B(x, z_k) > threshold -> unknown
 """
 
 import torch
@@ -19,67 +21,84 @@ from mmdet.models.utils import unpack_gt_instances, filter_scores_and_topk
 from mmyolo.models.utils import gt_instances_preprocess
 from mmengine.dist import get_dist_info
 
-from .hyperbolic import HyperbolicProjector, busemann
-from .hyperbolic.projector import HorosphericalLossV2
+from .hyperbolic import HyperbolicProjector
+from .hyperbolic.projector import GeodesicPrototypeLoss
 
 
 def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=False):
     """
-    Load checkpoint for horospherical model.
-    
+    Load checkpoint for geodesic prototype model.
+
     Handles:
     - Text embeddings (frozen_embeddings, embeddings)
-    - Prototype directions + biases (frozen_directions, frozen_biases, trainable)
-    
-    Note: frozen_directions and frozen_biases are registered as buffers (no grad).
+    - Interior prototypes (frozen_prototypes, classifier.prototypes)
+
+    Note: In geodesic framework, there are no bias terms or prototype_direction.
+    Prototypes are nn.Parameter points inside the ball.
     """
     checkpoint = torch.load(checkpoint_path, map_location='cuda')
     state_dict = checkpoint.get('model_state_dict', checkpoint)
-    
+
     # Keys to handle separately
-    exclude_keys = ['embeddings', 'frozen_embeddings', 
+    exclude_keys = ['embeddings', 'frozen_embeddings',
+                    'frozen_prototypes',
+                    # Legacy keys (backward compat with old checkpoints)
                     'frozen_directions', 'frozen_biases',
-                    'prototype_direction', 'prototype_bias']
-    partial_state_dict = {k: v for k, v in state_dict.items() 
+                    'prototype_direction', 'prototype_bias',
+                    # New keys
+                    'classifier.prototypes']
+    partial_state_dict = {k: v for k, v in state_dict.items()
                           if not any(ex in k for ex in exclude_keys)}
     model.load_state_dict(partial_state_dict, strict=False)
-    
+
     if eval:
         # Evaluation: load all embeddings and prototypes
         if state_dict.get('frozen_embeddings') is not None:
             model.frozen_embeddings = nn.Parameter(state_dict['frozen_embeddings'], requires_grad=False)
         if state_dict.get('embeddings') is not None:
             model.embeddings = nn.Parameter(state_dict['embeddings'], requires_grad=False)
-        
-        # Load frozen prototypes as buffers - use register_buffer() method!
-        if state_dict.get('frozen_directions') is not None:
-            model.register_buffer('frozen_directions', state_dict['frozen_directions'].cuda())
-            model.register_buffer('frozen_biases', state_dict['frozen_biases'].cuda())
-        
-        # Load prototypes: directions + biases
-        if state_dict.get('hyp_projector.classifier.prototype_direction') is not None:
-            saved_dir = state_dict['hyp_projector.classifier.prototype_direction']
-            saved_bias = state_dict['hyp_projector.classifier.prototype_bias']
-            device = model.hyp_projector.classifier.prototype_direction.device
-            
-            # Works for both nn.Parameter and buffer
-            if isinstance(model.hyp_projector.classifier.prototype_direction, nn.Parameter):
-                model.hyp_projector.classifier.prototype_direction.data = saved_dir.to(device)
+
+        # Load frozen prototypes (from previous tasks)
+        if state_dict.get('frozen_prototypes') is not None:
+            model.register_buffer('frozen_prototypes', state_dict['frozen_prototypes'].cuda())
+        elif state_dict.get('frozen_directions') is not None:
+            # Legacy: convert boundary directions to interior prototypes
+            frozen_dirs = state_dict['frozen_directions']
+            frozen_protos = F.normalize(frozen_dirs, dim=-1) * 0.4
+            model.register_buffer('frozen_prototypes', frozen_protos.cuda())
+            print(f"  ! Legacy: converted frozen_directions to interior prototypes (norm=0.4)")
+
+        # Load classifier prototypes
+        proto_key = 'hyp_projector.classifier.prototypes'
+        if state_dict.get(proto_key) is not None:
+            saved_protos = state_dict[proto_key]
+            device = model.hyp_projector.classifier.prototypes.device
+            if isinstance(model.hyp_projector.classifier.prototypes, nn.Parameter):
+                model.hyp_projector.classifier.prototypes.data = saved_protos.to(device)
             else:
-                model.hyp_projector.classifier.prototype_direction = saved_dir.to(device)
-            
-            model.hyp_projector.classifier.prototype_bias = nn.Parameter(saved_bias.to(device))
-            is_param = isinstance(model.hyp_projector.classifier.prototype_direction, nn.Parameter)
-            print(f"  ✓ Prototypes loaded ({model.hyp_projector.classifier.num_classes} classes, param={is_param})")
-            print(f"    Biases: {[f'{b:.4f}' for b in model.hyp_projector.classifier.prototype_bias.tolist()]}")
+                model.hyp_projector.classifier.prototypes = saved_protos.to(device)
+            is_param = isinstance(model.hyp_projector.classifier.prototypes, nn.Parameter)
+            proto_norms = saved_protos.norm(dim=-1)
+            print(f"  + Prototypes loaded ({model.hyp_projector.classifier.num_classes} classes, param={is_param})")
+            print(f"    Norms: mean={proto_norms.mean():.4f}, min={proto_norms.min():.4f}, max={proto_norms.max():.4f}")
+        elif state_dict.get('hyp_projector.classifier.prototype_direction') is not None:
+            # Legacy: convert boundary directions to interior prototypes
+            dirs = state_dict['hyp_projector.classifier.prototype_direction']
+            protos = F.normalize(dirs, dim=-1) * 0.4
+            device = model.hyp_projector.classifier.prototypes.device
+            if isinstance(model.hyp_projector.classifier.prototypes, nn.Parameter):
+                model.hyp_projector.classifier.prototypes.data = protos.to(device)
+            else:
+                model.hyp_projector.classifier.prototypes = protos.to(device)
+            print(f"  ! Legacy: converted prototype_direction to interior prototypes (norm=0.4)")
         else:
-            print(f"  ⚠ WARNING: No prototype_direction found in checkpoint — using random init!")
+            print(f"  ! WARNING: No prototypes found in checkpoint -- using random init!")
         return model
-    
+
     # Training mode
     if prev_classes == 0:
         return model  # T1: train from scratch
-    
+
     # T2+: Handle text embeddings
     part_a = state_dict.get('frozen_embeddings')
     part_b = state_dict.get('embeddings')
@@ -87,87 +106,78 @@ def load_hyp_ckpt(model, checkpoint_path, prev_classes, current_classes, eval=Fa
         freeze_emb = torch.cat([part_a, part_b], dim=1)
     else:
         freeze_emb = part_a if part_a is not None else part_b
-    
+
     if freeze_emb is not None:
         model.frozen_embeddings = nn.Parameter(freeze_emb)
         model.embeddings = nn.Parameter(model.text_feats[:, freeze_emb.shape[1]:, :])
-    
-    # T2+: Handle prototypes (directions + biases)
-    dir_a = state_dict.get('frozen_directions')
-    dir_b = state_dict.get('hyp_projector.classifier.prototype_direction')
-    bias_a = state_dict.get('frozen_biases')
-    bias_b = state_dict.get('hyp_projector.classifier.prototype_bias')
-    
-    if dir_a is not None and dir_b is not None:
-        freeze_dirs = torch.cat([dir_a, dir_b], dim=0)
-        freeze_biases = torch.cat([bias_a, bias_b], dim=0)
+
+    # T2+: Handle prototypes
+    proto_key = 'hyp_projector.classifier.prototypes'
+    protos_a = state_dict.get('frozen_prototypes')
+    protos_b = state_dict.get(proto_key)
+
+    # Legacy fallback
+    if protos_a is None and state_dict.get('frozen_directions') is not None:
+        protos_a = F.normalize(state_dict['frozen_directions'], dim=-1) * 0.4
+    if protos_b is None and state_dict.get('hyp_projector.classifier.prototype_direction') is not None:
+        protos_b = F.normalize(state_dict['hyp_projector.classifier.prototype_direction'], dim=-1) * 0.4
+
+    if protos_a is not None and protos_b is not None:
+        freeze_protos = torch.cat([protos_a, protos_b], dim=0)
     else:
-        freeze_dirs = dir_a if dir_a is not None else dir_b
-        freeze_biases = bias_a if bias_a is not None else bias_b
-    
-    if freeze_dirs is not None:
-        # Frozen prototypes are buffers — use register_buffer() method!
-        model.register_buffer('frozen_directions', freeze_dirs.cuda())
-        model.register_buffer('frozen_biases', freeze_biases.cuda())
-        
-        # Re-initialize classifier for novel classes only.
-        existing_dirs = model.hyp_projector.classifier.prototype_direction
-        is_param = isinstance(existing_dirs, nn.Parameter)
-        if existing_dirs.shape[0] == current_classes:
-            print(f"  ✓ T2+: Novel directions from init_protos ({current_classes} classes, param={is_param})")
+        freeze_protos = protos_a if protos_a is not None else protos_b
+
+    if freeze_protos is not None:
+        model.register_buffer('frozen_prototypes', freeze_protos.cuda())
+
+        # Check if classifier needs resizing for novel classes
+        existing = model.hyp_projector.classifier.prototypes
+        is_param = isinstance(existing, nn.Parameter)
+        if existing.shape[0] == current_classes:
+            print(f"  + T2+: Novel prototypes from init_protos ({current_classes} classes, param={is_param})")
         else:
-            # Resize classifier for novel classes (random init fallback)
-            print(f"  ⚠ T2+: Resizing classifier for {current_classes} novel classes (random init)")
-            new_dirs = torch.randn(current_classes, model.hyp_projector.out_dim)
-            import torch.nn.functional as F
-            new_dirs = F.normalize(new_dirs, dim=-1)
+            print(f"  ! T2+: Resizing classifier for {current_classes} novel classes (random init)")
+            new_protos = F.normalize(torch.randn(current_classes, model.hyp_projector.out_dim), dim=-1) * 0.4
             if model.trainable_prototypes:
-                model.hyp_projector.classifier.prototype_direction = nn.Parameter(new_dirs)
+                model.hyp_projector.classifier.prototypes = nn.Parameter(new_protos)
             else:
-                model.hyp_projector.classifier.register_buffer('prototype_direction', new_dirs)
-        
-        # Novel biases: trainable, start at 0
-        model.hyp_projector.classifier.prototype_bias = nn.Parameter(
-            torch.zeros(current_classes))
-    
+                model.hyp_projector.classifier.register_buffer('prototypes', new_protos)
+
     return model
 
 
 class HypCustomYoloWorld(nn.Module):
     """
-    Hyperbolic YOLO World with Horospherical Classification.
-    
+    Hyperbolic YOLO World with Geodesic Prototypical Classification.
+
     Architecture:
     - Wraps frozen YOLO-World backbone/neck/head
-    - HyperbolicProjector: FPN → Poincaré ball
-    - HorosphericalClassifier: Busemann scores for classification
-    - OOD detection: max horosphere score < threshold → unknown
+    - HyperbolicProjector: FPN -> Poincare ball (+ pre-expmap norms for L_reg)
+    - GeodesicPrototypeClassifier: -d^2_B scores for classification
+    - OOD detection: min_k d^2_B > adaptive threshold -> unknown
     """
-    
+
     def __init__(
         self,
         yolo_world_model,
         unknown_index,
         hyp_c=1.0,
         hyp_dim=64,
-        clip_r=0.95,
-        num_classifier_classes=None,  # For T2+: only novel classes (base in frozen_*)
-        init_prototypes=None,  # Pre-computed from init_prototypes.py
+        clip_r=2.0,
+        num_classifier_classes=None,
+        init_prototypes=None,
         trainable_prototypes=True,
-        bi_lipschitz=False,  # BiLipschitz projectors (spectral norm + residual)
-        tau_init=None,       # Learnable temperature for expmap0 (replaces clip_r)
-        # V2 loss weights
+        bi_lipschitz=False,
+        prototype_init_norm=0.4,
+        # Geodesic loss weights
         ce_weight=1.0,
         class_balance_smoothing=0.5,
-        margin=1.0,
-        margin_weight=0.5,
-        pull_weight=0.1,
-        target_norm_fraction=0.85,
-        dispersion_weight=0.1,
-        bias_reg_weight=0.1,
+        beta_reg=0.1,
+        lambda_sep=1.0,
+        sep_margin=1.0,
     ):
         super().__init__()
-        
+
         self.parent = yolo_world_model
         self.bbox_head = yolo_world_model.bbox_head
         self.unknown_index = unknown_index
@@ -175,62 +185,43 @@ class HypCustomYoloWorld(nn.Module):
         self.hyp_dim = hyp_dim
         self.trainable_prototypes = trainable_prototypes
         self.bi_lipschitz = bi_lipschitz
-        self.tau_init = tau_init
-        
-        # num_classes for visualization script compatibility
+
         self.num_classes = unknown_index
-        
-        # Number of classes in the classifier (novel only for T2+, all for T1)
+
         self._classifier_num_classes = num_classifier_classes if num_classifier_classes is not None else unknown_index
-        
+
         # TAL assignment labels
         self.tmp_labels = None
-        # Stash for embeddings during loss (V2 needs them)
-        self.tmp_hyp_embeddings = None
-        
+
         # Text embeddings
         self.frozen_embeddings = None
         self.embeddings = None
-        
+
         # Frozen prototypes from previous tasks (T2+)
-        # Use register_buffer so they don't require gradients
-        self.register_buffer('frozen_directions', None)
-        self.register_buffer('frozen_biases', None)
-        
+        self.register_buffer('frozen_prototypes', None)
+
         self._init_text_embedding()
-        self._init_hyperbolic_projector(clip_r, init_prototypes)
-        print(f"  Classifier: {self._classifier_num_classes} classes in classifier, {unknown_index} total")
-        
-        # V2 loss function
-        self.hyp_loss_fn = HorosphericalLossV2(
+        self._init_hyperbolic_projector(clip_r, init_prototypes, prototype_init_norm)
+        print(f"  Classifier: {self._classifier_num_classes} classes, {unknown_index} total")
+
+        # Geodesic prototype loss
+        self.hyp_loss_fn = GeodesicPrototypeLoss(
             curvature=hyp_c,
             ce_weight=ce_weight,
             class_balance_smoothing=class_balance_smoothing,
-            margin=margin,
-            margin_weight=margin_weight,
-            pull_weight=pull_weight,
-            target_norm_fraction=target_norm_fraction,
-            dispersion_weight=dispersion_weight,
-            bias_reg_weight=bias_reg_weight,
+            beta_reg=beta_reg,
+            lambda_sep=lambda_sep,
+            sep_margin=sep_margin,
         )
-    
+
     def _init_text_embedding(self):
         with torch.no_grad():
             self.texts = copy.deepcopy(self.parent.texts)
             self.text_feats = self.parent.text_feats.clone()
             self.embeddings = nn.Parameter(self.text_feats)
-    
-    def _init_hyperbolic_projector(self, clip_r, init_prototypes=None):
-        """
-        Initialize hyperbolic projector.
-        
-        Parameters
-        ----------
-        clip_r : float
-            Clip radius for ToPoincare
-        init_prototypes : tensor, optional
-            Pre-computed prototype directions from init_prototypes.py (K, hyp_dim)
-        """
+
+    def _init_hyperbolic_projector(self, clip_r, init_prototypes=None, prototype_init_norm=0.4):
+        """Initialize hyperbolic projector with geodesic classifier."""
         self.hyp_projector = HyperbolicProjector(
             in_dims=[384, 768, 768],
             out_dim=self.hyp_dim,
@@ -241,160 +232,144 @@ class HypCustomYoloWorld(nn.Module):
             init_prototypes=init_prototypes,
             trainable_prototypes=self.trainable_prototypes,
             bi_lipschitz=getattr(self, 'bi_lipschitz', False),
-            tau_init=getattr(self, 'tau_init', None)
+            prototype_init_norm=prototype_init_norm,
         )
-    
+
     @property
     def prototypes(self):
-        """All prototypes (frozen + trainable) on boundary."""
+        """All prototypes (frozen + trainable) inside the ball."""
         trainable = self.hyp_projector.prototypes
-        if self.frozen_directions is not None:
-            R = 1.0 / (self.hyp_c ** 0.5)
-            frozen = F.normalize(self.frozen_directions, dim=-1) * R
-            return torch.cat([frozen, trainable], dim=0)
+        if self.frozen_prototypes is not None:
+            return torch.cat([self.frozen_prototypes, trainable], dim=0)
         return trainable
-    
-    @property
-    def prototype_biases(self):
-        """All biases (frozen + trainable)."""
-        trainable = self.hyp_projector.prototype_bias
-        if self.frozen_biases is not None:
-            return torch.cat([self.frozen_biases, trainable], dim=0)
-        return trainable
-    
+
     def add_generic_text(self, class_names, generic_prompt='object', alpha=0.05):
         """Add generic 'object' embedding for unknown class."""
         if len(class_names) <= self.unknown_index:
             class_names.append(generic_prompt)
         self.parent.reparameterize([class_names])
-        
+
         with torch.no_grad():
             self.texts = copy.deepcopy(self.parent.texts)
             self.text_feats = self.parent.text_feats.clone()
-            
-            # Merge embeddings
+
             if self.frozen_embeddings is not None and self.embeddings is not None:
                 freeze = torch.cat([self.frozen_embeddings, self.embeddings], dim=1)
             else:
                 freeze = self.frozen_embeddings if self.frozen_embeddings is not None else self.embeddings
-            
+
             generic = self.text_feats[:, self.unknown_index, :]
             if alpha != 0:
                 mean_emb = F.normalize(freeze, p=2, dim=2).mean(dim=1)
                 generic = generic - alpha * mean_emb
-            
+
             self.frozen_embeddings = nn.Parameter(torch.cat([freeze, generic.unsqueeze(1)], dim=1))
             self.embeddings = None
-    
+
     def extract_feat(self, batch_inputs: Tensor, batch_data_samples: SampleList):
-        """Extract FPN features and project to Poincaré ball."""
-        # Text features
+        """Extract FPN features and project to Poincare ball."""
         if self.frozen_embeddings is not None and self.embeddings is not None:
             txt_feats = torch.cat([self.frozen_embeddings, self.embeddings], dim=1)
         else:
             txt_feats = self.embeddings if self.embeddings is not None else self.frozen_embeddings
-        
-        # Image features
+
         img_feats = self.parent.backbone.forward_image(batch_inputs)
         txt_feats = txt_feats.repeat(img_feats[0].shape[0], 1, 1)
-        
+
         if self.parent.with_neck:
             img_feats = self.parent.neck(img_feats, txt_feats) if self.parent.mm_neck else self.parent.neck(img_feats)
-        
-        # Project to Poincaré ball
-        hyp_embeddings = self.hyp_projector(img_feats)
-        return img_feats, txt_feats, hyp_embeddings
-    
-    def compute_horosphere_scores(self, hyp_embeddings):
-        """Compute horospherical scores using all prototypes."""
-        # Get all prototypes and biases
-        protos = self.prototypes
-        biases = self.prototype_biases
-        
-        # Compute Busemann function
+
+        # Projector returns (poincare_embeddings, pre_expmap_norms)
+        hyp_embeddings, pre_expmap_norms = self.hyp_projector(img_feats)
+        return img_feats, txt_feats, hyp_embeddings, pre_expmap_norms
+
+    def compute_geodesic_scores(self, hyp_embeddings):
+        """Compute geodesic scores using all prototypes (frozen + trainable)."""
+        protos = self.prototypes  # (K_total, D)
+        K = protos.shape[0]
+
         if hyp_embeddings.dim() == 3:
             B, N, D = hyp_embeddings.shape
             x_flat = hyp_embeddings.reshape(B * N, D)
-            B_vals = busemann(protos, x_flat, c=self.hyp_c)
-            scores = (-B_vals + biases).reshape(B, N, -1)
+            # Pairwise distances
+            x_exp = x_flat.unsqueeze(1).expand(B * N, K, D)
+            p_exp = protos.unsqueeze(0).expand(B * N, K, D)
+            from .hyperbolic import pmath
+            dists = pmath.dist(x_exp, p_exp, c=self.hyp_c)  # (B*N, K)
+            scores = -dists.pow(2)
+            return scores.reshape(B, N, K)
         else:
-            B_vals = busemann(protos, hyp_embeddings, c=self.hyp_c)
-            scores = -B_vals + biases
-        return scores
-    
-    def horospherical_loss(self, hyp_embeddings):
-        """Compute V2 horospherical loss (CE + margin + geodesic pull + dispersion + bias_reg)."""
+            N, D = hyp_embeddings.shape
+            x_exp = hyp_embeddings.unsqueeze(1).expand(N, K, D)
+            p_exp = protos.unsqueeze(0).expand(N, K, D)
+            from .hyperbolic import pmath
+            dists = pmath.dist(x_exp, p_exp, c=self.hyp_c)
+            return -dists.pow(2)
+
+    def geodesic_loss(self, hyp_embeddings, pre_expmap_norms):
+        """Compute geodesic prototype loss (CE + L_reg + L_sep)."""
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0)
-        scores = self.compute_horosphere_scores(hyp_embeddings)
+        scores = self.compute_geodesic_scores(hyp_embeddings)
         loss, _ = self.hyp_loss_fn(
             embeddings=hyp_embeddings,
             scores=scores,
             labels=self.tmp_labels,
             prototypes=self.prototypes,
-            biases=self.prototype_biases,
-            prototype_direction=self.hyp_projector.prototype_direction,
-            frozen_directions=self.frozen_directions,
+            pre_expmap_norms=pre_expmap_norms,
         )
         return loss
-    
-    def horospherical_loss_with_breakdown(self, hyp_embeddings):
-        """V2 loss with diagnostics."""
+
+    def geodesic_loss_with_breakdown(self, hyp_embeddings, pre_expmap_norms):
+        """Geodesic loss with diagnostics."""
         if self.tmp_labels is None:
             return hyp_embeddings.new_tensor(0.0), {}
-        scores = self.compute_horosphere_scores(hyp_embeddings)
+        scores = self.compute_geodesic_scores(hyp_embeddings)
         loss, loss_dict = self.hyp_loss_fn(
             embeddings=hyp_embeddings,
             scores=scores,
             labels=self.tmp_labels,
             prototypes=self.prototypes,
-            biases=self.prototype_biases,
-            prototype_direction=self.hyp_projector.prototype_direction,
-            frozen_directions=self.frozen_directions,
+            pre_expmap_norms=pre_expmap_norms,
         )
         return loss, loss_dict
-    
+
     def forward(self, batch_inputs: Tensor, batch_data_samples: SampleList):
-        """Forward pass — dispatches to head_loss.
-        
-        MUST be called through the DDP wrapper during training so that
-        DDP's reducer properly sets up gradient synchronization hooks.
-        """
+        """Forward pass -- dispatches to head_loss."""
         return self.head_loss(batch_inputs, batch_data_samples)
 
     def head_loss(self, batch_inputs: Tensor, batch_data_samples: SampleList):
-        """Compute YOLO + horospherical losses."""
+        """Compute YOLO + geodesic losses."""
         self.bbox_head.num_classes = self.text_feats[0].shape[0]
         self.bbox_head.assigner.num_classes = self.text_feats[0].shape[0]
-        
-        img_feats, txt_feats, hyp_embeddings = self.extract_feat(batch_inputs, batch_data_samples)
+
+        img_feats, txt_feats, hyp_embeddings, pre_expmap_norms = self.extract_feat(batch_inputs, batch_data_samples)
         self.tmp_labels = None
         head_losses = self.bbox_head_loss(img_feats, txt_feats, batch_data_samples)
-        hyp_loss = self.horospherical_loss(hyp_embeddings)
+        hyp_loss = self.geodesic_loss(hyp_embeddings, pre_expmap_norms)
         return head_losses, hyp_loss
-    
+
     def head_loss_with_breakdown(self, batch_inputs: Tensor, batch_data_samples: SampleList):
         """Losses with detailed breakdown."""
         self.bbox_head.num_classes = self.text_feats[0].shape[0]
         self.bbox_head.assigner.num_classes = self.text_feats[0].shape[0]
-        
-        img_feats, txt_feats, hyp_embeddings = self.extract_feat(batch_inputs, batch_data_samples)
+
+        img_feats, txt_feats, hyp_embeddings, pre_expmap_norms = self.extract_feat(batch_inputs, batch_data_samples)
         self.tmp_labels = None
         head_losses = self.bbox_head_loss(img_feats, txt_feats, batch_data_samples)
-        hyp_loss, hyp_breakdown = self.horospherical_loss_with_breakdown(hyp_embeddings)
+        hyp_loss, hyp_breakdown = self.geodesic_loss_with_breakdown(hyp_embeddings, pre_expmap_norms)
         return head_losses, hyp_loss, hyp_breakdown
-    
+
     def bbox_head_loss(self, img_feats, txt_feats, batch_data_samples):
         """YOLO detection loss (extracts TAL assignments for hyp loss)."""
         batch_gt_instances, _, batch_img_metas = unpack_gt_instances(batch_data_samples)
         outs = self.bbox_head(img_feats, txt_feats)
         return self.compute_loss(outs[0], outs[1], outs[2], batch_gt_instances, batch_img_metas)
-    
+
     def compute_loss(self, cls_scores, bbox_preds, bbox_dist_preds, batch_gt_instances, batch_img_metas):
         """YOLO loss computation with TAL assignment extraction."""
         num_imgs = len(batch_img_metas)
-        
-        # Update feature map sizes
+
         current_sizes = [s.shape[2:] for s in cls_scores]
         if current_sizes != self.bbox_head.featmap_sizes_train:
             self.bbox_head.featmap_sizes_train = current_sizes
@@ -403,48 +378,44 @@ class HypCustomYoloWorld(nn.Module):
             self.bbox_head.num_level_priors = [len(p) for p in priors]
             self.bbox_head.flatten_priors_train = torch.cat(priors, dim=0)
             self.bbox_head.stride_tensor = self.bbox_head.flatten_priors_train[..., [2]]
-        
-        # Prepare GT
+
         gt_info = gt_instances_preprocess(batch_gt_instances, num_imgs)
         gt_labels, gt_bboxes = gt_info[:, :, :1], gt_info[:, :, 1:]
         pad_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
-        
-        # Flatten predictions
+
         flat_cls = torch.cat([s.permute(0,2,3,1).reshape(num_imgs, -1, self.bbox_head.num_classes) for s in cls_scores], 1)
         flat_bbox = torch.cat([b.permute(0,2,3,1).reshape(num_imgs, -1, 4) for b in bbox_preds], 1)
         flat_dist = torch.cat([d.reshape(num_imgs, -1, self.bbox_head.head_module.reg_max * 4) for d in bbox_dist_preds], 1)
-        
+
         flat_bbox = self.bbox_head.bbox_coder.decode(
             self.bbox_head.flatten_priors_train[..., :2], flat_bbox, self.bbox_head.stride_tensor[..., 0])
-        
-        # TAL assignment
+
         assigned = self.bbox_head.assigner(
             flat_bbox.detach().type(gt_bboxes.dtype), flat_cls.detach().sigmoid(),
             self.bbox_head.flatten_priors_train, gt_labels, gt_bboxes, pad_flag)
-        
-        # Extract labels for hyperbolic loss
+
+        # Extract labels for geodesic loss
         max_vals, max_idx = assigned['assigned_scores'].max(dim=2)
         max_idx[max_vals <= 0] = -1
         self.tmp_labels = max_idx
-        
-        # Compute losses
+
         scores_sum = assigned['assigned_scores'].sum().clamp(min=1)
         loss_cls = self.bbox_head.loss_cls(flat_cls, assigned['assigned_scores']).sum() / scores_sum
-        
+
         flat_bbox /= self.bbox_head.stride_tensor
         assigned['assigned_bboxes'] /= self.bbox_head.stride_tensor
-        
+
         fg_mask = assigned['fg_mask_pre_prior']
         num_pos = fg_mask.sum()
-        
+
         if num_pos > 0:
             mask4 = fg_mask.unsqueeze(-1).repeat(1, 1, 4)
             pred_pos = flat_bbox[mask4].reshape(-1, 4)
             target_pos = assigned['assigned_bboxes'][mask4].reshape(-1, 4)
             weight = assigned['assigned_scores'].sum(-1)[fg_mask].unsqueeze(-1)
-            
+
             loss_bbox = self.bbox_head.loss_bbox(pred_pos, target_pos, weight=weight) / scores_sum
-            
+
             dist_pos = flat_dist[fg_mask]
             ltrb = self.bbox_head.bbox_coder.encode(
                 self.bbox_head.flatten_priors_train[..., :2] / self.bbox_head.stride_tensor,
@@ -456,107 +427,105 @@ class HypCustomYoloWorld(nn.Module):
         else:
             loss_bbox = flat_bbox.sum() * 0
             loss_dfl = flat_bbox.sum() * 0
-        
+
         world_size = get_dist_info()[1] if self.bbox_head.world_size == -1 else self.bbox_head.world_size
         scale = num_imgs * world_size
         return dict(loss_cls=loss_cls * scale, loss_bbox=loss_bbox * scale, loss_dfl=loss_dfl * scale)
-    
+
     def predict(self, batch_inputs: Tensor, batch_data_samples: SampleList, rescale=True):
-        """Inference with horospherical OOD detection."""
-        img_feats, txt_feats, hyp_embeddings = self.extract_feat(batch_inputs, batch_data_samples)
+        """Inference with geodesic OOD detection."""
+        img_feats, txt_feats, hyp_embeddings, _ = self.extract_feat(batch_inputs, batch_data_samples)
         self.parent.bbox_head.num_classes = txt_feats[0].shape[0]
-        
+
         results = self.predict_by_feat(img_feats, txt_feats, batch_data_samples, hyp_embeddings, rescale)
         return self.parent.add_pred_to_datasample(batch_data_samples, results)
-    
+
     def predict_by_feat(self, img_feats, txt_feats, batch_data_samples, hyp_embeddings, rescale=False):
-        """Prediction with horosphere scoring."""
+        """Prediction with geodesic scoring."""
         batch_img_metas = [d.metainfo for d in batch_data_samples]
         outs = self.bbox_head(img_feats, txt_feats)
-        
+
         cfg = copy.deepcopy(self.bbox_head.test_cfg)
         cfg.multi_label = cfg.multi_label and self.bbox_head.num_classes > 1
         num_imgs = len(batch_img_metas)
-        
-        # Setup priors
+
         sizes = [s.shape[2:] for s in outs[0]]
         if sizes != self.bbox_head.featmap_sizes:
             self.bbox_head.mlvl_priors = self.bbox_head.prior_generator.grid_priors(
                 sizes, dtype=outs[0][0].dtype, device=outs[0][0].device)
             self.bbox_head.featmap_sizes = sizes
-        
+
         priors = torch.cat(self.bbox_head.mlvl_priors)
         strides = torch.cat([priors.new_full((s.numel() * self.bbox_head.num_base_priors,), st)
                             for s, st in zip(sizes, self.bbox_head.featmap_strides)])
-        
-        # Flatten predictions
+
         flat_cls = torch.cat([s.permute(0,2,3,1).reshape(num_imgs, -1, self.bbox_head.num_classes) for s in outs[0]], 1).sigmoid()
         flat_bbox = torch.cat([b.permute(0,2,3,1).reshape(num_imgs, -1, 4) for b in outs[1]], 1)
         flat_bbox = self.bbox_head.bbox_coder.decode(priors[None], flat_bbox, strides)
-        
-        # Note: during inference, head returns only (cls, bbox), no objectness
+
         flat_obj = None
         if len(outs) > 2 and outs[2] is not None:
             flat_obj = torch.cat([o.permute(0,2,3,1).reshape(num_imgs, -1) for o in outs[2]], 1).sigmoid()
-        
+
         results = []
         for idx, (bboxes, scores, img_meta) in enumerate(zip(flat_bbox, flat_cls, batch_img_metas)):
             obj = flat_obj[idx] if flat_obj is not None else None
             hyp_emb = hyp_embeddings[idx]
-            
-            # Score threshold filter
+
             if obj is not None and cfg.get('score_thr', -1) > 0 and not cfg.get('yolox_style', False):
                 mask = obj > cfg.score_thr
                 bboxes, scores, obj, hyp_emb = bboxes[mask], scores[mask], obj[mask], hyp_emb[mask]
-            
+
             if obj is not None:
                 scores = scores * obj[:, None]
-            
+
             if scores.shape[0] == 0:
                 empty = InstanceData(bboxes=bboxes, scores=scores[:, 0], labels=scores[:, 0].int(), ood_scores=scores[:, 0])
                 results.append(empty)
                 continue
-            
-            # Top-k selection
+
             if not cfg.multi_label:
                 scores, labels = scores.max(1, keepdim=True)
                 scores, _, keep, res = filter_scores_and_topk(scores, cfg.score_thr, cfg.get('nms_pre', 100000), dict(labels=labels[:, 0]))
                 labels = res['labels']
             else:
                 scores, labels, keep, _ = filter_scores_and_topk(scores, cfg.score_thr, cfg.get('nms_pre', 100000))
-            
-            # Compute OOD scores (negative max horosphere score)
+
+            # Compute geodesic OOD scores
             kept_emb = hyp_emb[keep]
-            horo_scores = self.compute_horosphere_scores(kept_emb)  # (N, K)
-            max_horo, assigned_proto = horo_scores.max(dim=-1)  # max score & which prototype
-            ood_scores = -max_horo  # Higher = more OOD
-            
+            geo_scores = self.compute_geodesic_scores(kept_emb)  # (N, K)
+            # max geodesic score (= -min_d^2) and which prototype
+            max_geo, assigned_proto = geo_scores.max(dim=-1)
+            # OOD score = min_k d^2_B = -max_k(-d^2_B) = -max_geo
+            ood_scores = -max_geo  # Higher = more OOD
+
             result = InstanceData(
                 scores=scores, labels=labels, bboxes=bboxes[keep],
                 ood_scores=ood_scores,
-                horo_max_scores=max_horo,       # max horosphere score per detection
-                horo_assigned_proto=assigned_proto,  # which prototype gave max score
+                geo_max_scores=max_geo,            # max geodesic score per detection
+                geo_assigned_proto=assigned_proto,  # which prototype gave max score
+                # Legacy aliases for test_hyp.py compatibility
+                horo_max_scores=max_geo,
+                horo_assigned_proto=assigned_proto,
             )
-            
-            # Rescale
+
             if rescale:
                 pad = img_meta.get('pad_param')
                 if pad is not None:
                     result.bboxes -= result.bboxes.new_tensor([pad[2], pad[0], pad[2], pad[0]])
                 result.bboxes /= result.bboxes.new_tensor(img_meta['scale_factor']).repeat(1, 2)
-            
+
             if cfg.get('yolox_style', False):
                 cfg.max_per_img = len(result)
-            
-            # NMS + post-process (InstanceData preserves ood_scores through indexing)
+
             result = self.bbox_head._bbox_post_process(result, cfg, rescale=False, with_nms=True, img_meta=img_meta)
-            
+
             result.bboxes[:, 0::2].clamp_(0, img_meta['ori_shape'][1])
             result.bboxes[:, 1::2].clamp_(0, img_meta['ori_shape'][0])
             results.append(result)
-        
+
         return results
-    
+
     def enable_projector_grad(self, index):
         """Enable gradients for training."""
         if index == 0:
@@ -564,11 +533,11 @@ class HypCustomYoloWorld(nn.Module):
             for p in self.hyp_projector.parameters():
                 p.requires_grad = True
             n_trainable = sum(p.numel() for p in self.hyp_projector.parameters() if p.requires_grad)
-            proto_trainable = self.hyp_projector.classifier.prototype_direction.requires_grad
+            proto_trainable = self.hyp_projector.classifier.prototypes.requires_grad
             print(f"  [T1] Training projector convs + classifier (trainable_protos={proto_trainable})")
             print(f"  [T1] Total trainable params: {n_trainable:,}")
         else:
-            # T2+: Freeze Conv, train only classifier (biases + prototypes if trainable)
+            # T2+: Freeze Conv, train only classifier prototypes
             for name, p in self.hyp_projector.named_parameters():
                 p.requires_grad = 'classifier' in name
-            print("  [T2+] Training only classifier params (directions trainable={self.trainable_prototypes})")
+            print(f"  [T2+] Training only classifier params (protos trainable={self.trainable_prototypes})")

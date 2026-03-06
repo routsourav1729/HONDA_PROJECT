@@ -1,13 +1,15 @@
 """
-Hyperbolic Projector with Horospherical Classifier — V2.
+Hyperbolic Projector with Geodesic Prototypical Classifier.
 
-Projects visual features from YOLO backbone to Poincaré ball,
-then classifies using Busemann function with ideal prototypes on boundary.
+Projects visual features from YOLO backbone to Poincare ball,
+then classifies using geodesic distance to interior prototypes.
 
-V2 changes:
-- embed_dim 256 → 64 (14 classes only need d >= K-1 = 13)
-- Prototypes trainable on unit sphere via Riemannian gradient (manual projection)
-- HorosphericalLossV2: class-balanced CE + margin + geodesic pull + dispersion + bias reg
+Replaces the Horospherical (Busemann) framework:
+- Prototypes are interior points (||z|| < R), NOT on boundary
+- Classification: softmax over -d^2_B(x, z_k)
+- OOD detection: min_k d^2_B(x, z_k) -- far from all protos = unknown
+- L_reg on pre-expmap norms prevents tanh saturation
+- L_sep enforces minimum geodesic separation between prototypes
 """
 
 import torch
@@ -18,18 +20,18 @@ from .nn import ToPoincare
 from . import pmath
 
 
-class HorosphericalClassifier(nn.Module):
+# =========================================================================
+# Geodesic Prototype Classifier
+# =========================================================================
+
+class GeodesicPrototypeClassifier(nn.Module):
     """
-    Classification via Busemann function with ideal prototypes on boundary.
-    
-    Score: ξ_k(x) = -B_{p_k}(x) + a_k
-    Prediction: argmax_k softmax(ξ_k(x))
-    
-    For OOD detection: max_k ξ_k(x) < threshold → unknown
-    
-    V2: Prototypes are now TRAINABLE nn.Parameters that stay on the unit sphere
-    via manual Riemannian projection after each optimizer step.
-    
+    Classification via geodesic distance to interior prototypes in Poincare ball.
+
+    Score: s_k(x) = -d^2_B(x, z_k)
+    Prediction: argmax_k s_k(x)
+    OOD: min_k d^2_B(x, z_k) > threshold -> unknown
+
     Parameters
     ----------
     num_classes : int
@@ -37,292 +39,207 @@ class HorosphericalClassifier(nn.Module):
     embed_dim : int
         Embedding dimension
     curvature : float
-        Poincaré ball curvature (default: 1.0)
+        Poincare ball curvature (default: 1.0)
     init_directions : tensor, optional
-        Pre-computed prototype directions from init_prototypes.py (K, embed_dim)
+        Pre-computed prototype directions from init_prototypes.py (K, embed_dim).
+        Will be scaled to prototype_init_norm inside the ball.
+    prototype_init_norm : float
+        Initial Poincare norm for prototypes (default: 0.4)
     trainable_prototypes : bool
-        Whether prototype directions are trainable (default: True for V2)
+        Whether prototypes are trainable (default: True)
     """
-    
+
     def __init__(self, num_classes, embed_dim, curvature=1.0, init_directions=None,
-                 trainable_prototypes=True):
+                 trainable_prototypes=True, prototype_init_norm=0.4):
         super().__init__()
         self.c = curvature
         self.R = 1.0 / (curvature ** 0.5)  # Ball radius
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.trainable_prototypes = trainable_prototypes
-        
+
+        # Initialize prototypes INSIDE the ball (not on boundary)
+        init_norm = min(prototype_init_norm, self.R * 0.95)
         if init_directions is not None:
             assert init_directions.shape == (num_classes, embed_dim), \
                 f"init_directions shape mismatch: {init_directions.shape} vs ({num_classes}, {embed_dim})"
             directions = F.normalize(init_directions.clone(), dim=-1)
+            protos = directions * init_norm
         else:
-            # Placeholder — will be overwritten by load_hyp_ckpt()
             directions = F.normalize(torch.randn(num_classes, embed_dim), dim=-1)
-        
+            protos = directions * init_norm
+
         if trainable_prototypes:
-            # TRAINABLE on unit sphere. After each optimizer.step(), call
-            # project_prototypes_to_sphere() to re-normalize.
-            self.prototype_direction = nn.Parameter(directions)
-            print(f"  ✓ Prototype directions TRAINABLE on S^{embed_dim-1} ({num_classes} classes)")
+            self.prototypes = nn.Parameter(protos)
+            print(f"  + Geodesic prototypes TRAINABLE inside ball "
+                  f"(||z||={init_norm:.3f}, {num_classes} classes)")
         else:
-            # FROZEN (v1 behavior)
-            self.register_buffer('prototype_direction', directions)
-            print(f"  ✓ Prototype directions FROZEN from pre-computed tensor (not trainable)")
-        
-        # Learnable bias per class - controls horosphere position
-        self.prototype_bias = nn.Parameter(torch.zeros(num_classes))
-    
+            self.register_buffer('prototypes', protos)
+            print(f"  + Geodesic prototypes FROZEN (||z||={init_norm:.3f}, {num_classes} classes)")
+
     @torch.no_grad()
-    def project_prototypes_to_sphere(self):
-        """Project prototype directions back to unit sphere after optimizer step.
-        
-        This implements the Riemannian constraint: prototypes must lie on S^{d-1}.
+    def project_prototypes_to_ball(self):
+        """Project prototypes back inside the Poincare ball after optimizer step.
+
+        Ensures ||z_k|| < R for all k. Uses pmath.project() for safe clamping.
         Call this after every optimizer.step() during training.
         """
-        if self.trainable_prototypes and isinstance(self.prototype_direction, nn.Parameter):
-            self.prototype_direction.data = F.normalize(self.prototype_direction.data, dim=-1)
-    
-    @property
-    def prototypes(self):
-        """Ideal prototypes on the Poincaré ball boundary (‖p‖ = R = 1/√c)."""
-        direction = F.normalize(self.prototype_direction, dim=-1)
-        return direction * self.R
-    
-    def busemann_scores(self, x):
+        if self.trainable_prototypes and isinstance(self.prototypes, nn.Parameter):
+            self.prototypes.data = pmath.project(self.prototypes.data, c=self.c)
+
+    def _pairwise_dist(self, x, protos):
+        """Geodesic distance from each point to each prototype.
+
+        x: (N, D), protos: (K, D) -> output: (N, K)
         """
-        Compute horospherical logits: ξ_k(x) = -B_{p_k}(x) + a_k
-        
-        Higher score = closer to prototype = more likely that class.
-        
+        N, D = x.shape
+        K = protos.shape[0]
+        x_exp = x.unsqueeze(1).expand(N, K, D)      # (N, K, D)
+        p_exp = protos.unsqueeze(0).expand(N, K, D)  # (N, K, D)
+        dists = pmath.dist(x_exp, p_exp, c=self.c)   # (N, K)
+        return dists
+
+    def geodesic_distances(self, x):
+        """
+        Compute geodesic distances from embeddings to all prototypes.
+
         Parameters
         ----------
         x : tensor (N, D) or (B, N, D)
-            Points in Poincaré ball
-        
+            Points in Poincare ball
+
         Returns
         -------
         tensor (N, K) or (B, N, K)
-            Horospherical scores for each class
+            Geodesic distances d_B(x, z_k) for each class
         """
-        p = self.prototypes  # (K, D) on boundary
-        
-        # Handle batched input
+        protos = pmath.project(self.prototypes, c=self.c)  # (K, D), safe
+
         if x.dim() == 3:
-            B_vals = pmath.busemann_batch(p, x, c=self.c)  # (B, N, K)
+            B, N, D = x.shape
+            K = protos.shape[0]
+            x_flat = x.reshape(B * N, D)
+            dists = self._pairwise_dist(x_flat, protos)
+            return dists.reshape(B, N, K)
         else:
-            B_vals = pmath.busemann(p, x, c=self.c)  # (N, K)
-        
-        # Score = -Busemann + bias (higher = closer to prototype)
-        scores = -B_vals + self.prototype_bias
-        return scores
-    
+            return self._pairwise_dist(x, protos)
+
+    def geodesic_scores(self, x):
+        """
+        Compute classification logits: s_k(x) = -d^2_B(x, z_k)
+
+        Higher score = closer to prototype = more likely that class.
+
+        Parameters
+        ----------
+        x : tensor (N, D) or (B, N, D)
+            Points in Poincare ball
+
+        Returns
+        -------
+        tensor (N, K) or (B, N, K)
+            Classification scores for each class
+        """
+        dists = self.geodesic_distances(x)
+        return -dists.pow(2)
+
     def forward(self, x):
-        """Returns horospherical logits for classification."""
-        return self.busemann_scores(x)
-    
+        """Returns geodesic classification logits."""
+        return self.geodesic_scores(x)
+
     def get_ood_scores(self, x):
         """
-        OOD score: negative of max horosphere score.
+        OOD score: minimum geodesic distance squared to any prototype.
         Higher value = more OOD (far from all prototypes).
         """
-        scores = self.busemann_scores(x)
-        max_scores = scores.max(dim=-1).values
-        return -max_scores
-    
-    def uniform_dispersion_loss(self):
-        """
-        Uniform loss (Wang & Isola 2020 / Berg et al. IJCV 2025 Eq. 17).
-
-        L_unif = log( mean_{i≠j} exp(-||p_i - p_j||^2) )
-
-        Continuous gradient on ALL pairs; strongest for closest prototypes.
-        """
-        directions = F.normalize(self.prototype_direction, dim=-1)  # (K, D)
-        K = directions.shape[0]
-        if K <= 1:
-            return directions.new_tensor(0.0)
-        dist_sq = torch.cdist(directions, directions).pow(2)  # (K, K)
-        mask = ~torch.eye(K, dtype=torch.bool, device=directions.device)
-        return torch.log(torch.exp(-dist_sq[mask]).mean())
-
-
-class HorosphericalLoss(nn.Module):
-    """Backward-compatible alias for HorosphericalLossV2."""
-    pass  # Kept for import compatibility — V2 is the actual class now
+        dists_sq = self.geodesic_distances(x).pow(2)
+        min_dist_sq = dists_sq.min(dim=-1).values
+        return min_dist_sq
 
 
 # =========================================================================
-# V2 Loss Helper Functions
+# Geodesic Prototype Loss
 # =========================================================================
 
 def compute_class_weights(labels, num_classes, smoothing=0.5):
     """
     Compute sqrt-inverse-frequency weights for class balancing.
-    
+
     Args:
         labels: (N,) tensor of class indices for foreground anchors
         num_classes: int, total number of known classes
         smoothing: float, power for inverse frequency (0.5 = sqrt)
-    
+
     Returns:
         weights: (num_classes,) tensor of per-class weights, normalized so mean=1
     """
     counts = torch.bincount(labels, minlength=num_classes).float().clamp(min=1.0)
     max_count = counts.max()
-    weights = (max_count / counts) ** smoothing  # sqrt inverse frequency
-    weights = weights / weights.mean()  # normalize so mean weight = 1
+    weights = (max_count / counts) ** smoothing
+    weights = weights / weights.mean()
     return weights
 
 
-def busemann_margin_loss(scores, labels, margin=1.0):
+class GeodesicPrototypeLoss(nn.Module):
     """
-    Busemann margin loss for horospherical classification.
-    
-    For each foreground anchor, enforce: ξ_{y_i}(x_i) - ξ_k(x_i) >= margin ∀ k ≠ y_i
-    
-    Args:
-        scores: (N, K) Busemann-based horosphere scores
-        labels: (N,) ground-truth class indices
-        margin: float, required score gap
-    
-    Returns:
-        loss: scalar, mean hinge loss over all foreground anchors
-    """
-    N, K = scores.shape
-    if N == 0:
-        return scores.sum() * 0.0
-    
-    # Get correct class score for each anchor: (N,)
-    correct_scores = scores.gather(1, labels.unsqueeze(1)).squeeze(1)
-    
-    # margin - (correct_score - other_score) for each class
-    margins = margin - correct_scores.unsqueeze(1) + scores  # (N, K)
-    
-    # Zero out the correct class (no self-comparison)
-    mask = torch.ones_like(margins, dtype=torch.bool)
-    mask.scatter_(1, labels.unsqueeze(1), False)
-    
-    # Hinge: max(0, margin - gap)
-    violations = torch.clamp(margins[mask].view(N, K - 1), min=0.0)
-    
-    return violations.mean()
+    Geodesic prototype loss with 3 components:
 
+    A) Class-balanced cross-entropy over -d^2_B scores
+    B) L_reg: norm regularization on pre-expmap Euclidean features
+    C) L_sep: prototype separation loss (minimum geodesic distance)
 
-def geodesic_prototype_pull(embeddings, labels, prototypes, c=1.0, target_norm_fraction=0.85):
+    Total: L = ce_weight * L_cls + beta_reg * L_reg + lambda_sep * L_sep
     """
-    Pull embeddings toward target points near their class prototype.
-    
-    Instead of pulling to the boundary (which causes collapse), pull toward
-    a point at target_norm_fraction * R in the prototype's direction.
-    
-    Args:
-        embeddings: (N, D) points in Poincaré ball
-        labels: (N,) class indices
-        prototypes: (K, D) ideal prototypes on boundary (norm = R = 1/√c)
-        c: float, curvature
-        target_norm_fraction: float in (0, 1), how close to boundary the target is
-    
-    Returns:
-        loss: scalar, mean geodesic distance to target points
-    """
-    if embeddings.shape[0] == 0:
-        return embeddings.sum() * 0.0
-    
-    R = 1.0 / (c ** 0.5)  # ball radius
-    
-    # Target points: scale prototypes inward from boundary
-    # prototypes have norm R, targets have norm target_norm_fraction * R
-    target_points = prototypes[labels] * target_norm_fraction  # (N, D)
-    
-    # Geodesic distance in Poincaré ball
-    # d_H(x,y) = acosh(1 + 2||x-y||² / ((1 - c||x||²)(1 - c||y||²)))
-    diff_sq = (embeddings - target_points).pow(2).sum(dim=-1)  # (N,)
-    emb_sq = (embeddings.pow(2).sum(dim=-1)).clamp(max=R**2 - 1e-5)
-    tgt_sq = (target_points.pow(2).sum(dim=-1)).clamp(max=R**2 - 1e-5)
-    
-    denom = (1.0 - c * emb_sq) * (1.0 - c * tgt_sq)
-    denom = denom.clamp(min=1e-8)
-    
-    argument = 1.0 + 2.0 * c * diff_sq / denom
-    argument = argument.clamp(min=1.0 + 1e-7)  # numerical safety for acosh
-    
-    dist = torch.acosh(argument)
-    
-    return dist.mean()
 
-
-class HorosphericalLossV2(nn.Module):
-    """
-    Horospherical loss V2 with 5 components:
-    
-    A) Class-balanced cross-entropy (sqrt-inverse-frequency weighting)
-    B) Busemann margin loss (enforce gap between correct and other scores)
-    C) Geodesic prototype pull (pull embeddings toward target in Poincaré ball)
-    D) Direction dispersion loss (push prototypes apart on sphere) — kept from V1
-    E) Bias L2 regularization (keep horospheres tight) — kept from V1
-    
-    Replaces V1's compactness loss with geodesic pull + margin loss.
-    """
-    
-    def __init__(self, 
+    def __init__(self,
                  curvature=1.0,
-                 # CE
                  ce_weight=1.0,
                  class_balance_smoothing=0.5,
-                 # Margin
-                 margin=1.0,
-                 margin_weight=0.5,
-                 # Geodesic pull
-                 pull_weight=0.1,
-                 target_norm_fraction=0.85,
-                 # Dispersion (from V1)
-                 dispersion_weight=0.1,
-                 # Bias reg (from V1)
-                 bias_reg_weight=0.1):
+                 beta_reg=0.1,
+                 lambda_sep=1.0,
+                 sep_margin=1.0):
         super().__init__()
         self.c = curvature
         self.ce_weight = ce_weight
         self.class_balance_smoothing = class_balance_smoothing
-        self.margin = margin
-        self.margin_weight = margin_weight
-        self.pull_weight = pull_weight
-        self.target_norm_fraction = target_norm_fraction
-        self.dispersion_weight = dispersion_weight
-        self.bias_reg_weight = bias_reg_weight
-    
-    def direction_dispersion_loss(self, prototype_direction, frozen_directions=None):
+        self.beta_reg = beta_reg
+        self.lambda_sep = lambda_sep
+        self.sep_margin = sep_margin
+
+    def prototype_separation_loss(self, prototypes):
         """
-        Uniform loss (Wang & Isola 2020): continuous repulsion on ALL pairs.
-        Includes cross-repulsion with frozen base directions at T2+.
+        L_sep = mean_{i!=j} max(0, m - d_B(z_i, z_j))
+
+        Forces prototypes to be at least sep_margin apart in geodesic distance.
         """
-        dirs = F.normalize(prototype_direction, dim=-1)
-        if frozen_directions is not None and frozen_directions.numel() > 0:
-            all_dirs = torch.cat([dirs, F.normalize(frozen_directions, dim=-1)], dim=0)
-        else:
-            all_dirs = dirs
-        K = all_dirs.shape[0]
+        K = prototypes.shape[0]
         if K <= 1:
-            return dirs.new_tensor(0.0)
-        dist_sq = torch.cdist(all_dirs, all_dirs).pow(2)
-        mask = ~torch.eye(K, dtype=torch.bool, device=dirs.device)
-        return torch.log(torch.exp(-dist_sq[mask]).mean())
-    
-    def forward(self, embeddings, scores, labels, prototypes, biases,
-                prototype_direction=None, frozen_directions=None):
+            return prototypes.new_tensor(0.0)
+
+        protos = pmath.project(prototypes, c=self.c)
+
+        # Pairwise geodesic distances
+        p1 = protos.unsqueeze(1).expand(K, K, -1)
+        p2 = protos.unsqueeze(0).expand(K, K, -1)
+        pair_dists = pmath.dist(p1, p2, c=self.c)  # (K, K)
+
+        mask = ~torch.eye(K, dtype=torch.bool, device=prototypes.device)
+        violations = torch.clamp(self.sep_margin - pair_dists[mask], min=0.0)
+
+        return violations.mean()
+
+    def forward(self, embeddings, scores, labels, prototypes,
+                pre_expmap_norms=None):
         """
-        Compute V2 loss.
-        
+        Compute geodesic prototype loss.
+
         Args:
-            embeddings: (M, D) Poincaré ball embeddings for ALL B×8400 anchors
-            scores: (M, K) horosphere scores ξ_k(x) = -B_pk(x) + a_k
-            labels: (M,) ground truth, -1 for background/ignore
-            prototypes: (K, D) ideal prototypes on boundary
-            biases: (K,) learnable bias terms
-            prototype_direction: (K_train, D) trainable directions for dispersion
-            frozen_directions: (K_frozen, D) frozen directions for cross-dispersion
-        
+            embeddings: (M, D) or (B, N, D) Poincare ball embeddings
+            scores: (M, K) or (B, N, K) geodesic scores = -d^2_B(x, z_k)
+            labels: (M,) or (B, N) ground truth, -1 for background/ignore
+            prototypes: (K, D) interior prototypes in Poincare ball
+            pre_expmap_norms: (M,) or (B, N) Euclidean norms BEFORE expmap0
+
         Returns:
             loss: scalar total loss
             loss_dict: dict of individual loss values for logging
@@ -333,167 +250,142 @@ class HorosphericalLossV2(nn.Module):
             scores = scores.reshape(B * N, K)
             labels = labels.reshape(B * N)
             embeddings = embeddings.reshape(B * N, embeddings.shape[-1])
-        
+
+        if pre_expmap_norms is not None and pre_expmap_norms.dim() == 2:
+            pre_expmap_norms = pre_expmap_norms.reshape(-1)
+
         valid = labels >= 0
         num_classes = prototypes.shape[0]
-        
+
         if valid.sum() == 0:
             zero = scores.sum() * 0.0
             return zero, {
-                'ce_loss': 0.0, 'margin_loss': 0.0, 'pull_loss': 0.0,
-                'disp_loss': 0.0, 'bias_reg': 0.0, 'total': 0.0,
+                'ce_loss': 0.0, 'reg_loss': 0.0, 'sep_loss': 0.0,
+                'total': 0.0,
             }
-        
-        fg_embeddings = embeddings[valid]   # (N, D)
-        fg_scores = scores[valid]           # (N, K)
-        fg_labels = labels[valid]           # (N,)
-        
-        # --- A: Class-balanced CE ---
-        class_weights = compute_class_weights(fg_labels, num_classes, self.class_balance_smoothing)
-        ce_loss = F.cross_entropy(fg_scores, fg_labels, weight=class_weights.to(fg_scores.device))
-        
-        # --- B: Busemann margin loss ---
-        margin_loss = busemann_margin_loss(fg_scores, fg_labels, self.margin)
-        
-        # --- C: Geodesic prototype pull ---
-        pull_loss = geodesic_prototype_pull(
-            fg_embeddings, fg_labels, prototypes,
-            c=self.c, target_norm_fraction=self.target_norm_fraction
-        )
-        
-        # --- D: Dispersion ---
-        disp_loss = scores.new_tensor(0.0)
-        if prototype_direction is not None and self.dispersion_weight > 0:
-            disp_loss = self.direction_dispersion_loss(prototype_direction, frozen_directions)
-        
-        # --- E: Bias regularization ---
-        bias_reg = (biases ** 2).mean()
-        
+
+        fg_scores = scores[valid]
+        fg_labels = labels[valid]
+        fg_embeddings = embeddings[valid]
+
+        # --- A: Class-balanced CE over geodesic scores ---
+        class_weights = compute_class_weights(fg_labels, num_classes,
+                                              self.class_balance_smoothing)
+        ce_loss = F.cross_entropy(fg_scores, fg_labels,
+                                  weight=class_weights.to(fg_scores.device))
+
+        # --- B: L_reg (pre-expmap norm regularization) ---
+        # Regularize ALL anchors (FG + BG) to keep pre-expmap norms small
+        if pre_expmap_norms is not None:
+            reg_loss = pre_expmap_norms.pow(2).mean()
+        else:
+            reg_loss = scores.new_tensor(0.0)
+
+        # --- C: L_sep (prototype separation) ---
+        sep_loss = self.prototype_separation_loss(prototypes)
+
         # --- Total ---
         total = (self.ce_weight * ce_loss
-                + self.margin_weight * margin_loss
-                + self.pull_weight * pull_loss
-                + self.dispersion_weight * disp_loss
-                + self.bias_reg_weight * bias_reg)
-        
+                 + self.beta_reg * reg_loss
+                 + self.lambda_sep * sep_loss)
+
         loss_dict = {
             'ce_loss': ce_loss.item(),
-            'margin_loss': margin_loss.item(),
-            'pull_loss': pull_loss.item(),
-            'disp_loss': disp_loss.item(),
-            'bias_reg': bias_reg.item(),
+            'reg_loss': reg_loss.item() if isinstance(reg_loss, torch.Tensor) else reg_loss,
+            'sep_loss': sep_loss.item(),
             'total': total.item(),
-            'margin_violations': (busemann_margin_loss(fg_scores, fg_labels, self.margin) > 0).float().mean().item() if fg_scores.shape[0] > 0 else 0.0,
         }
-        
-        # Additional diagnostics
+
+        # Diagnostics
         with torch.no_grad():
-            pos_scores = fg_scores.gather(1, fg_labels.unsqueeze(1)).squeeze(1)
-            max_scores = fg_scores.max(dim=-1).values
-            loss_dict['pos_score_mean'] = pos_scores.mean().item()
-            loss_dict['pos_score_std'] = pos_scores.std().item() if len(pos_scores) > 1 else 0.0
-            loss_dict['max_score_mean'] = max_scores.mean().item()
-            loss_dict['score_margin'] = (max_scores - pos_scores).mean().item()
-            loss_dict['emb_norm_mean'] = fg_embeddings.norm(dim=-1).mean().item()
-            loss_dict['emb_norm_max'] = fg_embeddings.norm(dim=-1).max().item()
-            loss_dict['emb_norm_min'] = fg_embeddings.norm(dim=-1).min().item()
-        
+            fg_dists_sq = -fg_scores  # scores = -d^2
+            pos_dists_sq = fg_dists_sq.gather(1, fg_labels.unsqueeze(1)).squeeze(1)
+            min_dists_sq = fg_dists_sq.min(dim=-1).values
+
+            loss_dict['pos_dist_sq_mean'] = pos_dists_sq.mean().item()
+            loss_dict['min_dist_sq_mean'] = min_dists_sq.mean().item()
+            loss_dict['emb_poincare_norm_mean'] = fg_embeddings.norm(dim=-1).mean().item()
+            loss_dict['emb_poincare_norm_max'] = fg_embeddings.norm(dim=-1).max().item()
+            loss_dict['proto_norm_mean'] = prototypes.norm(dim=-1).mean().item()
+
+            if pre_expmap_norms is not None:
+                loss_dict['pre_expmap_norm_mean'] = pre_expmap_norms.mean().item()
+                loss_dict['pre_expmap_norm_max'] = pre_expmap_norms.max().item()
+
+            preds = fg_scores.argmax(dim=-1)
+            loss_dict['cls_acc'] = (preds == fg_labels).float().mean().item()
+
         return total, loss_dict
 
+
+# =========================================================================
+# BiLipschitz Projector (unchanged)
+# =========================================================================
 
 class BiLipschitzProjector(nn.Module):
     """
     Distance-aware projector (SNGP-style, Liu et al. NeurIPS 2020).
-    
+
     Spectral norm = upper Lipschitz bound (prevents catapulting OOD inputs)
     Residual skip = lower Lipschitz bound (preserves input distances)
-    
-    Together: if FPN feature is far from known-class features,
-    output will be far from known-class outputs (near-boundary region)
-    → naturally lands near origin → low Busemann score → flagged OOD.
-    
-    NOTE: We use GroupNorm instead of BatchNorm after spectral norm.
-    BN re-normalizes activations to unit variance, which partially
-    undoes the Lipschitz constraint. GroupNorm preserves the bound.
     """
     def __init__(self, in_dim, out_dim, num_groups=16):
         super().__init__()
         from torch.nn.utils import spectral_norm
-        # Main path: spectrally-normed convs with GroupNorm
-        # GroupNorm (not BN) so we don't undo the Lipschitz constraint
         self.main = nn.Sequential(
             spectral_norm(nn.Conv2d(in_dim, in_dim, 1, bias=False)),
             nn.GroupNorm(min(num_groups, in_dim), in_dim),
             nn.ReLU(inplace=True),
             spectral_norm(nn.Conv2d(in_dim, out_dim, 1, bias=False)),
         )
-        # Skip connection: linear projection (also spectral-normed)
-        # Ensures lower Lipschitz bound — distances can't collapse
         self.skip = spectral_norm(nn.Conv2d(in_dim, out_dim, 1, bias=False))
-    
+
     def forward(self, x):
         return self.main(x) + self.skip(x)
 
 
+# =========================================================================
+# Hyperbolic Projector (updated for Geodesic framework)
+# =========================================================================
+
 class HyperbolicProjector(nn.Module):
     """
-    Projects multi-scale FPN features to Poincaré ball with horospherical classification.
-    
+    Projects multi-scale FPN features to Poincare ball with geodesic classification.
+
     Architecture:
     - 3 Conv projectors for FPN scales (P3, P4, P5)
-    - ToPoincare layer for Euclidean → Poincaré mapping
-    - HorosphericalClassifier with ideal prototypes on boundary
-    
-    Parameters
-    ----------
-    in_dims : list of int
-        Input dims for each FPN scale [P3, P4, P5]. Default: [384, 768, 768]
-    out_dim : int
-        Output embedding dimension (default: 256)
-    curvature : float
-        Poincaré ball curvature (default: 1.0)
-    num_classes : int
-        Number of class prototypes
-    clip_r : float
-        Clip radius for ToPoincare. Must be < 1/√c (default: 0.95 for c=1)
-    bi_lipschitz : bool
-        Use BiLipschitz projectors (spectral norm + residual) for OOD-aware
-        distance preservation. Default: False (backward compatible).
+    - ToPoincare layer for Euclidean -> Poincare mapping
+    - GeodesicPrototypeClassifier with interior prototypes
     """
-    
+
     def __init__(
         self,
         in_dims=[384, 768, 768],
         out_dim=64,
         curvature=1.0,
         num_classes=20,
-        clip_r=0.95,
+        clip_r=2.0,
         riemannian=True,
         init_prototypes=None,
         trainable_prototypes=True,
         bi_lipschitz=False,
-        tau_init=None
+        prototype_init_norm=0.4,
     ):
         super().__init__()
-        
+
         self.in_dims = in_dims
         self.out_dim = out_dim
         self.c = curvature
         self.num_classes = num_classes
         self.clip_r = clip_r
         self.bi_lipschitz = bi_lipschitz
-        
+
         if bi_lipschitz:
-            # BiLipschitz projectors: spectral norm + residual skip
-            # Preserves distance structure → unknowns naturally get lower norms
-            print(f"  ✓ Using BiLipschitz projectors (spectral norm + residual)")
+            print(f"  + Using BiLipschitz projectors (spectral norm + residual)")
             self.proj_p3 = BiLipschitzProjector(in_dims[0], out_dim)
             self.proj_p4 = BiLipschitzProjector(in_dims[1], out_dim)
             self.proj_p5 = BiLipschitzProjector(in_dims[2], out_dim)
         else:
-            # Original: unconstrained Conv projectors
-            #   Conv1: in_dim → in_dim (1×1) + BN + ReLU
-            #   Conv2: in_dim → out_dim (1×1)
             self.proj_p3 = nn.Sequential(
                 nn.Conv2d(in_dims[0], in_dims[0], kernel_size=1, bias=False),
                 nn.BatchNorm2d(in_dims[0]),
@@ -512,8 +404,8 @@ class HyperbolicProjector(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv2d(in_dims[2], out_dim, kernel_size=1, bias=False),
             )
-        
-        # ToPoincare layer
+
+        # ToPoincare -- clip_r is SAFETY net, L_reg keeps norms small
         self.to_poincare = ToPoincare(
             c=curvature,
             train_c=False,
@@ -521,29 +413,26 @@ class HyperbolicProjector(nn.Module):
             ball_dim=out_dim,
             riemannian=riemannian,
             clip_r=clip_r,
-            tau_init=tau_init
+            tau_init=None  # No learnable tau -- L_reg handles norms
         )
-        
-        # Horospherical classifier
-        # init_prototypes should come from init_prototypes.py!
-        self.classifier = HorosphericalClassifier(
+
+        # Geodesic prototype classifier (interior prototypes)
+        self.classifier = GeodesicPrototypeClassifier(
             num_classes=num_classes,
             embed_dim=out_dim,
             curvature=curvature,
             init_directions=init_prototypes,
-            trainable_prototypes=trainable_prototypes
+            trainable_prototypes=trainable_prototypes,
+            prototype_init_norm=prototype_init_norm,
         )
-        
+
         if not bi_lipschitz:
             self._init_weights()
-        # BiLipschitz: spectral_norm handles its own normalization;
-        # Kaiming init would be overridden by SN's power iteration anyway.
-    
+
     def _init_weights(self):
         """Initialize Conv weights (only for non-BiLipschitz projectors)."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                # Skip if spectral norm is applied (has weight_orig attribute)
                 if hasattr(m, 'weight_orig'):
                     continue
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -552,52 +441,36 @@ class HyperbolicProjector(nn.Module):
             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-    
+
     @property
     def prototypes(self):
-        """Ideal prototypes on boundary (for compatibility)."""
+        """Interior prototypes in Poincare ball."""
         return self.classifier.prototypes
-    
-    @property
-    def prototype_direction(self):
-        """Access to prototype directions (for checkpoint saving)."""
-        return self.classifier.prototype_direction
-    
-    @property
-    def prototype_bias(self):
-        """Access to prototype biases (for checkpoint saving)."""
-        return self.classifier.prototype_bias
-    
+
     def forward(self, img_feats):
         """
-        Project FPN features to Poincaré ball.
-        
-        Parameters
-        ----------
-        img_feats : tuple of tensor
-            FPN features (P3, P4, P5)
-        
+        Project FPN features to Poincare ball.
+
         Returns
         -------
-        tensor (B, N_anchors, out_dim)
-            Hyperbolic embeddings in Poincaré ball
+        poincare_embeddings : tensor (B, N_anchors, out_dim)
+        pre_expmap_norms : tensor (B, N_anchors)
+            Euclidean norms BEFORE expmap0 (for L_reg)
         """
         p3, p4, p5 = img_feats[0], img_feats[1], img_feats[2]
         B = p3.shape[0]
-        
-        # Project each scale
+
         z3 = self.proj_p3(p3).permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
         z4 = self.proj_p4(p4).permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
         z5 = self.proj_p5(p5).permute(0, 2, 3, 1).reshape(B, -1, self.out_dim)
-        
-        # Concatenate
-        z = torch.cat([z3, z4, z5], dim=1)
-        
-        # Cache intermediate norms for diagnostic analysis
-        # Activating: model.hyp_projector.store_norms = True
+
+        z = torch.cat([z3, z4, z5], dim=1)  # (B, 8400, out_dim)
+
+        # Cache pre-expmap norms for L_reg
+        pre_expmap_norms = z.norm(dim=-1)  # (B, 8400)
+
+        # Diagnostic norms
         if getattr(self, 'store_norms', False):
-            # FPN input norms (global-avg-pooled per anchor is too expensive,
-            # so we store per-anchor Euclidean norms of the PROJECTED features pre-clip)
             fpn3 = p3.permute(0, 2, 3, 1).reshape(B, -1, p3.shape[1])
             fpn4 = p4.permute(0, 2, 3, 1).reshape(B, -1, p4.shape[1])
             fpn5 = p5.permute(0, 2, 3, 1).reshape(B, -1, p5.shape[1])
@@ -605,77 +478,73 @@ class HyperbolicProjector(nn.Module):
                 fpn3.norm(dim=-1),
                 fpn4.norm(dim=-1),
                 fpn5.norm(dim=-1),
-            ], dim=1)  # (B, N_anchors)
-            self._cached_fpn_norms = fpn_all       # per-anchor FPN norms
-            self._cached_pre_clip_norms = z.norm(dim=-1)  # per-anchor post-proj Euclidean norms
-        
-        return self.to_poincare(z)
-    
+            ], dim=1)
+            self._cached_fpn_norms = fpn_all
+            self._cached_pre_clip_norms = pre_expmap_norms
+
+        poincare_embeddings = self.to_poincare(z)
+
+        return poincare_embeddings, pre_expmap_norms
+
     def compute_scores(self, embeddings):
-        """Compute horospherical classification scores."""
+        """Compute geodesic classification scores."""
         return self.classifier(embeddings)
-    
+
     def get_ood_scores(self, embeddings):
-        """OOD scores via negative max horosphere score."""
+        """OOD scores: min geodesic distance squared to any prototype."""
         return self.classifier.get_ood_scores(embeddings)
-    
+
     def extra_repr(self):
         return (f"in_dims={self.in_dims}, out_dim={self.out_dim}, "
                 f"c={self.c}, num_classes={self.num_classes}")
 
 
 # =============================================================================
-# TEST FUNCTIONS
+# BACKWARD COMPATIBILITY ALIASES
 # =============================================================================
+HorosphericalClassifier = GeodesicPrototypeClassifier
+HorosphericalLoss = GeodesicPrototypeLoss
+HorosphericalLossV2 = GeodesicPrototypeLoss
 
-def test_horospherical():
+
+# =============================================================================
+# TEST
+# =============================================================================
+def test_geodesic():
     """Quick test to verify shapes and gradients."""
-    print("Testing HorosphericalClassifier + HyperbolicProjector...")
-    
-    # Create projector with c=1.0
+    print("Testing GeodesicPrototypeClassifier + HyperbolicProjector...")
+
     projector = HyperbolicProjector(
         in_dims=[384, 768, 768],
-        out_dim=256,
+        out_dim=64,
         curvature=1.0,
-        num_classes=10,
-        clip_r=0.95
+        num_classes=8,
+        clip_r=2.0,
+        bi_lipschitz=True,
+        prototype_init_norm=0.4,
     )
-    
-    # Dummy FPN features
+
     B = 2
     p3 = torch.randn(B, 384, 80, 80)
     p4 = torch.randn(B, 768, 40, 40)
     p5 = torch.randn(B, 768, 20, 20)
-    
-    # Forward
-    z_hyp = projector((p3, p4, p5))
-    print(f"  Output shape: {z_hyp.shape} (expected: {(B, 8400, 256)})")
-    
-    # Check embeddings are inside ball (‖x‖ < 1 for c=1)
-    norms = z_hyp.norm(dim=-1)
-    print(f"  Embedding norms: min={norms.min():.4f}, max={norms.max():.4f}, bound=1.0")
-    
-    # Check prototypes are on boundary (‖p‖ = 1 for c=1)
-    proto_norms = projector.prototypes.norm(dim=-1)
-    print(f"  Prototype norms: {proto_norms.mean():.4f} (should be ~1.0)")
-    
-    # Compute scores
+
+    z_hyp, pre_norms = projector((p3, p4, p5))
+    print(f"  Poincare output: {z_hyp.shape}")
+    print(f"  Pre-expmap norms: {pre_norms.shape}")
+
     scores = projector.compute_scores(z_hyp)
-    print(f"  Scores shape: {scores.shape} (expected: {(B, 8400, 10)})")
-    
-    # Test loss
-    labels = torch.randint(-1, 10, (B, 8400))
-    loss_fn = HorosphericalLoss(curvature=1.0)
-    loss = loss_fn(scores, labels)
+    print(f"  Scores shape: {scores.shape}")
+
+    labels = torch.randint(-1, 8, (B, 8400))
+    loss_fn = GeodesicPrototypeLoss(curvature=1.0)
+    loss, loss_dict = loss_fn(z_hyp, scores, labels, projector.prototypes, pre_norms)
     print(f"  Loss: {loss.item():.4f}")
-    
-    # Test gradient flow
+    print(f"  Breakdown: {loss_dict}")
+
     loss.backward()
-    print(f"  Gradient OK: direction={projector.prototype_direction.grad.norm():.4f}, "
-          f"bias={projector.prototype_bias.grad.norm():.4f}")
-    
-    print("✓ All tests passed!\n")
+    print("+ All tests passed!")
 
 
 if __name__ == "__main__":
-    test_horospherical()
+    test_geodesic()
