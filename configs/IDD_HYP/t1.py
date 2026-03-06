@@ -59,8 +59,8 @@ hyp_config = dict(
     prototype_init_norm=0.4,     # Initial Poincaré norm for prototypes inside ball
     
     # Prototype initialization (REQUIRED!)
-    # Run: python init_prototypes.py --classes "car,motorcycle,..." --out_dim 64 --output init_protos_t1.pt
-    init_protos='init_protos_t1.pt',
+    # Run: bash scripts/init_protos.sh  (outputs to datasets/prototype/init_protos_t1.pt)
+    init_protos='datasets/prototype/init_protos_t1.pt',
     
     # OOD detection threshold (for inference)
     ood_threshold=0.0,           # Higher score = more OOD; adjust after calibration
