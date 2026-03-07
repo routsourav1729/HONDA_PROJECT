@@ -163,13 +163,15 @@ if __name__ == "__main__":
     clip_r = hyp_config.get('clip_r', 2.0)
     bi_lipschitz = hyp_config.get('bi_lipschitz', False)
     prototype_init_norm = hyp_config.get('prototype_init_norm', 0.4)
+    max_proto_norm = hyp_config.get('max_proto_norm', 0.5)
     beta_reg = hyp_config.get('beta_reg', 0.1)
     lambda_sep = hyp_config.get('lambda_sep', 1.0)
     sep_margin = hyp_config.get('sep_margin', 1.0)
     framework = hyp_config.get('framework', 'geodesic_prototypical')
 
     print(f"  hyp_config: c={hyp_c}, dim={hyp_dim}, clip_r={clip_r}, framework={framework}")
-    print(f"  prototype_init_norm={prototype_init_norm}, beta_reg={beta_reg}, lambda_sep={lambda_sep}")
+    print(f"  prototype_init_norm={prototype_init_norm}, max_proto_norm={max_proto_norm}")
+    print(f"  beta_reg={beta_reg}, lambda_sep={lambda_sep}")
     print(f"  bi_lipschitz={bi_lipschitz}")
 
     # Extract adaptive_stats
@@ -208,6 +210,7 @@ if __name__ == "__main__":
         num_classifier_classes=classifier_num_classes,
         bi_lipschitz=bi_lipschitz,
         prototype_init_norm=prototype_init_norm,
+        max_proto_norm=max_proto_norm,
         beta_reg=beta_reg,
         lambda_sep=lambda_sep,
         sep_margin=sep_margin,

@@ -10,12 +10,20 @@ Launch:
 import os
 import time
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
+
+# CRITICAL: Must be set before ANY CUDA call.
+# Default 'fork' inherits CUDA context into dataloader workers → deadlock.
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # already set
 
 from core import DatasetMapper, add_config
 from core.util.model_ema import add_model_ema_configs
@@ -255,6 +263,7 @@ if __name__ == "__main__":
     prev_ckpt = args.ckpt if args.ckpt else hyp_cfg.get('prev_ckpt', '')
     bi_lipschitz = hyp_cfg.get('bi_lipschitz', False)
     prototype_init_norm = hyp_cfg.get('prototype_init_norm', 0.4)
+    max_proto_norm = hyp_cfg.get('max_proto_norm', 0.5)
     prototype_lr = hyp_cfg.get('prototype_lr', 1e-3)
     trainable_prototypes = hyp_cfg.get('trainable_prototypes', True)
     
@@ -262,6 +271,7 @@ if __name__ == "__main__":
     print_rank0(f"  curvature: {hyp_c}, embed_dim: {hyp_dim}, clip_r: {clip_r}", rank)
     print_rank0(f"  hyp_loss_weight: {hyp_loss_weight}, beta_reg: {beta_reg}, lambda_sep: {lambda_sep}", rank)
     print_rank0(f"  sep_margin: {sep_margin}, prototype_init_norm: {prototype_init_norm}", rank)
+    print_rank0(f"  max_proto_norm: {max_proto_norm}", rank)
     print_rank0(f"  bi_lipschitz: {bi_lipschitz}, prototype_lr: {prototype_lr}", rank)
     
     # Load init prototypes
@@ -292,6 +302,7 @@ if __name__ == "__main__":
         trainable_prototypes=trainable_prototypes,
         bi_lipschitz=bi_lipschitz,
         prototype_init_norm=prototype_init_norm,
+        max_proto_norm=max_proto_norm,
         ce_weight=ce_weight,
         class_balance_smoothing=class_balance_smoothing,
         beta_reg=beta_reg,
@@ -466,6 +477,7 @@ if __name__ == "__main__":
                 'bi_lipschitz': bi_lipschitz,
                 'beta_reg': beta_reg, 'lambda_sep': lambda_sep,
                 'sep_margin': sep_margin, 'prototype_init_norm': prototype_init_norm,
+                'max_proto_norm': max_proto_norm,
                 'framework': 'geodesic_prototypical',
             }
             if epoch % 5 == 0:
@@ -564,6 +576,7 @@ if __name__ == "__main__":
             'lambda_sep': lambda_sep,
             'sep_margin': sep_margin,
             'prototype_init_norm': prototype_init_norm,
+            'max_proto_norm': max_proto_norm,
             'framework': 'geodesic_prototypical',
         }
         

@@ -169,6 +169,7 @@ class HypCustomYoloWorld(nn.Module):
         trainable_prototypes=True,
         bi_lipschitz=False,
         prototype_init_norm=0.4,
+        max_proto_norm=0.5,
         # Geodesic loss weights
         ce_weight=1.0,
         class_balance_smoothing=0.5,
@@ -201,7 +202,7 @@ class HypCustomYoloWorld(nn.Module):
         self.register_buffer('frozen_prototypes', None)
 
         self._init_text_embedding()
-        self._init_hyperbolic_projector(clip_r, init_prototypes, prototype_init_norm)
+        self._init_hyperbolic_projector(clip_r, init_prototypes, prototype_init_norm, max_proto_norm)
         print(f"  Classifier: {self._classifier_num_classes} classes, {unknown_index} total")
 
         # Geodesic prototype loss
@@ -220,7 +221,7 @@ class HypCustomYoloWorld(nn.Module):
             self.text_feats = self.parent.text_feats.clone()
             self.embeddings = nn.Parameter(self.text_feats)
 
-    def _init_hyperbolic_projector(self, clip_r, init_prototypes=None, prototype_init_norm=0.4):
+    def _init_hyperbolic_projector(self, clip_r, init_prototypes=None, prototype_init_norm=0.4, max_proto_norm=0.5):
         """Initialize hyperbolic projector with geodesic classifier."""
         self.hyp_projector = HyperbolicProjector(
             in_dims=[384, 768, 768],
@@ -233,6 +234,7 @@ class HypCustomYoloWorld(nn.Module):
             trainable_prototypes=self.trainable_prototypes,
             bi_lipschitz=getattr(self, 'bi_lipschitz', False),
             prototype_init_norm=prototype_init_norm,
+            max_proto_norm=max_proto_norm,
         )
 
     @property
@@ -285,7 +287,8 @@ class HypCustomYoloWorld(nn.Module):
 
     def compute_geodesic_scores(self, hyp_embeddings):
         """Compute geodesic scores using all prototypes (frozen + trainable)."""
-        protos = self.prototypes  # (K_total, D)
+        from .hyperbolic import pmath
+        protos = pmath.project(self.prototypes, c=self.hyp_c)  # (K_total, D) safe project
         K = protos.shape[0]
 
         if hyp_embeddings.dim() == 3:
@@ -294,7 +297,6 @@ class HypCustomYoloWorld(nn.Module):
             # Pairwise distances
             x_exp = x_flat.unsqueeze(1).expand(B * N, K, D)
             p_exp = protos.unsqueeze(0).expand(B * N, K, D)
-            from .hyperbolic import pmath
             dists = pmath.dist(x_exp, p_exp, c=self.hyp_c)  # (B*N, K)
             scores = -dists.pow(2)
             return scores.reshape(B, N, K)
@@ -302,7 +304,6 @@ class HypCustomYoloWorld(nn.Module):
             N, D = hyp_embeddings.shape
             x_exp = hyp_embeddings.unsqueeze(1).expand(N, K, D)
             p_exp = protos.unsqueeze(0).expand(N, K, D)
-            from .hyperbolic import pmath
             dists = pmath.dist(x_exp, p_exp, c=self.hyp_c)
             return -dists.pow(2)
 

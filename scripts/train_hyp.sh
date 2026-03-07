@@ -1,4 +1,3 @@
-\
 #!/bin/bash
 # ============================================================================
 # Hyperbolic YOLO-World Training Script (DDP)

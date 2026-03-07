@@ -86,7 +86,10 @@ echo "=========================================="
 echo "Starting TRAINING"
 echo "=========================================="
 
-python dev_hyp.py \
+torchrun \
+    --nproc_per_node=1 \
+    --master_port=29500 \
+    dev_hyp_ddp.py \
     --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $PRETRAINED_CKPT \
@@ -96,6 +99,5 @@ python dev_hyp.py \
 echo ""
 echo "=========================================="
 echo "Job finished at: $(date)"
-echo "To sync WandB: ./sync_wandb.sh"
 echo "=========================================="
 

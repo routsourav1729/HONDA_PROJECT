@@ -50,13 +50,18 @@ class GeodesicPrototypeClassifier(nn.Module):
     """
 
     def __init__(self, num_classes, embed_dim, curvature=1.0, init_directions=None,
-                 trainable_prototypes=True, prototype_init_norm=0.4):
+                 trainable_prototypes=True, prototype_init_norm=0.4,
+                 max_proto_norm=0.5):
         super().__init__()
         self.c = curvature
         self.R = 1.0 / (curvature ** 0.5)  # Ball radius
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.trainable_prototypes = trainable_prototypes
+        # Hard ceiling on prototype norm — prevents optimizer from pushing
+        # prototypes toward boundary (which would inflate geodesic distances
+        # and kill OOD discrimination, same problem as boundary prototypes).
+        self.max_proto_norm = min(max_proto_norm, self.R * 0.95)
 
         # Initialize prototypes INSIDE the ball (not on boundary)
         init_norm = min(prototype_init_norm, self.R * 0.95)
@@ -79,13 +84,17 @@ class GeodesicPrototypeClassifier(nn.Module):
 
     @torch.no_grad()
     def project_prototypes_to_ball(self):
-        """Project prototypes back inside the Poincare ball after optimizer step.
+        """Clamp prototype norms to max_proto_norm after optimizer step.
 
-        Ensures ||z_k|| < R for all k. Uses pmath.project() for safe clamping.
-        Call this after every optimizer.step() during training.
+        Without this, the optimizer pushes prototypes to ||z||~0.999 (the
+        pmath.project limit) to maximize geodesic-distance discrimination.
+        That recreates the boundary-prototype problem we're trying to avoid.
         """
         if self.trainable_prototypes and isinstance(self.prototypes, nn.Parameter):
-            self.prototypes.data = pmath.project(self.prototypes.data, c=self.c)
+            norms = self.prototypes.data.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            # Clamp to max_proto_norm (e.g., 0.5), not the ball boundary (0.999)
+            scale = torch.clamp(self.max_proto_norm / norms, max=1.0)
+            self.prototypes.data = self.prototypes.data * scale
 
     def _pairwise_dist(self, x, protos):
         """Geodesic distance from each point to each prototype.
@@ -197,7 +206,8 @@ class GeodesicPrototypeLoss(nn.Module):
                  class_balance_smoothing=0.5,
                  beta_reg=0.1,
                  lambda_sep=1.0,
-                 sep_margin=1.0):
+                 sep_margin=1.0,
+                 score_scale=0.1):
         super().__init__()
         self.c = curvature
         self.ce_weight = ce_weight
@@ -205,6 +215,7 @@ class GeodesicPrototypeLoss(nn.Module):
         self.beta_reg = beta_reg
         self.lambda_sep = lambda_sep
         self.sep_margin = sep_margin
+        self.score_scale = score_scale  # divides -d^2 scores before CE to avoid cold-start saturation
 
     def prototype_separation_loss(self, prototypes):
         """
@@ -271,7 +282,10 @@ class GeodesicPrototypeLoss(nn.Module):
         # --- A: Class-balanced CE over geodesic scores ---
         class_weights = compute_class_weights(fg_labels, num_classes,
                                               self.class_balance_smoothing)
-        ce_loss = F.cross_entropy(fg_scores, fg_labels,
+        # score_scale prevents cold-start saturation:
+        # early embeddings near boundary -> large d^2 -> scores in [-25, -4]
+        # dividing by score_scale brings them into a healthy softmax range
+        ce_loss = F.cross_entropy(fg_scores * self.score_scale, fg_labels,
                                   weight=class_weights.to(fg_scores.device))
 
         # --- B: L_reg (pre-expmap norm regularization) ---
@@ -370,6 +384,7 @@ class HyperbolicProjector(nn.Module):
         trainable_prototypes=True,
         bi_lipschitz=False,
         prototype_init_norm=0.4,
+        max_proto_norm=0.5,
     ):
         super().__init__()
 
@@ -424,6 +439,7 @@ class HyperbolicProjector(nn.Module):
             init_directions=init_prototypes,
             trainable_prototypes=trainable_prototypes,
             prototype_init_norm=prototype_init_norm,
+            max_proto_norm=max_proto_norm,
         )
 
         if not bi_lipschitz:

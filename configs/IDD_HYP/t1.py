@@ -56,7 +56,7 @@ hyp_config = dict(
     # Trainable prototypes — interior points, not on boundary
     trainable_prototypes=True,
     prototype_lr=1e-3,           # Separate LR for prototypes (standard Adam, project after step)
-    prototype_init_norm=0.4,     # Initial Poincaré norm for prototypes inside ball
+    prototype_init_norm=0.4,     # Initial Poincaré norm for prototypes inside ball\n    max_proto_norm=0.5,          # Hard ceiling on prototype norm (prevents boundary drift)
     
     # Prototype initialization (REQUIRED!)
     # Run: bash scripts/init_protos.sh  (outputs to datasets/prototype/init_protos_t1.pt)

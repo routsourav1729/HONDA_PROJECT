@@ -2,14 +2,14 @@
 #SBATCH --job-name=hyp_t1
 #SBATCH --output=slurm_logs/hyp_ddp_%j.out
 #SBATCH --error=slurm_logs/hyp_ddp_%j.err
-#SBATCH --partition=a40
-#SBATCH --qos=a40
-#SBATCH --exclude=cn21-a40
+#SBATCH --partition=dgx
+#SBATCH --qos=dgx
+#SBATCH --exclude=cn15-dgx
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:1
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:2
+#SBATCH --mem=128G
 #SBATCH --time=30:00:00
 
 # ============================================================================
@@ -23,7 +23,7 @@
 # Arguments
 SPLIT=${1:-t1}
 EXP_NAME=${2:-hyp_v2}
-NUM_GPUS=${3:-1}
+NUM_GPUS=${3:-2}
 
 TASK="IDD_HYP/$SPLIT"
 PRETRAINED_CKPT="yolo_world_v2_xl_obj365v1_goldg_cc3mlite_pretrain-5daf1395.pth"
