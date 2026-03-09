@@ -1,24 +1,44 @@
-"""
-Poincaré Ball Visualization for Horospherical Classifiers — FULL TEST SET
+vcxz"""
+Poincaré Ball Visualization for Geodesic Prototypical Classifiers — FULL TEST SET
 
-Visualizes ALL test-set hyperbolic embeddings (known + unknown) via UMAP
-projection to the Poincaré disk, with horosphere decision boundaries drawn.
+Visualises ALL test-set hyperbolic embeddings (known + unknown) via UMAP
+projection to the Poincaré disk, with geodesic Voronoi boundaries and
+adaptive-threshold analysis.
 
-Key design choices:
-- Uses XML parsing (not dataloader GT) to get BOTH known and unknown boxes
-- Iterates the ENTIRE test dataloader — no subsampling
-- Projects high-dim Poincaré embeddings → 2D Poincaré disk via UMAP
-- Draws per-class horospheres as circles on the 2D disk
+Key diagnostic panels
+---------------------
+ 1. UMAP Poincaré disk — all classes colour-coded
+ 2. Geodesic Voronoi decision boundaries (replaces old horospheres)
+ 3. Score distributions + adaptive thresholds overlay
+ 4. Per-class geodesic detail (3×3 grid)
+ 5. Known-only UMAP
+ 6. Unknown-only UMAP
+ 7. Embedding norms (zoomed + per-class box)
+ 8. Distance heatmap: mean d²(cls, proto_k)
+ 9. Norm pipeline (FPN → projector → Poincaré)
+10. Per-class projector output norms
+11. Prototype analysis: inter-prototype distances + norm bar chart
+12. Statistical summary: AUROC, Cohen's d, per-class calibration table
+
+Design changes vs v1 (Horospherical → Geodesic):
+- busemann() replaced by model.compute_geodesic_scores()
+- prototype_biases removed (no bias in geodesic classifier)
+- Horosphere circles replaced by geodesic Voronoi boundaries
+- Interior prototypes visualised AT true norm (not pushed to boundary)
+- Adaptive thresholds from calibration stats overlaid on score plots
+- Added AUROC / Cohen-d / separation metrics
 """
 
 import os
 import sys
 import xml.etree.ElementTree as ET
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize as mplNorm
 from pathlib import Path
 from tqdm import tqdm
 from collections import defaultdict
@@ -27,7 +47,8 @@ from core import add_config
 from core.util.model_ema import add_model_ema_configs
 from core.pascal_voc import register_pascal_voc, inital_prompts
 from core.hyp_customyoloworld import HypCustomYoloWorld, load_hyp_ckpt
-from core.hyperbolic import busemann
+from core.hyperbolic import pmath
+from core.calibrate_thresholds import compute_thresholds
 
 from mmengine.config import Config
 from mmengine.runner import Runner
@@ -106,8 +127,21 @@ def _expmap0_numpy(v, c):
     return np.tanh(sqrt_c * v_norm) / (sqrt_c * v_norm + 1e-15) * v
 
 
+def _poincare_dist_2d(x, y, c=1.0):
+    """Poincaré distance between two 2D points (numpy)."""
+    x, y = np.asarray(x), np.asarray(y)
+    diff = x - y
+    nx2 = (x ** 2).sum(-1)
+    ny2 = (y ** 2).sum(-1)
+    num = (diff ** 2).sum(-1)
+    denom = (1 - c * nx2) * (1 - c * ny2)
+    denom = np.clip(denom, 1e-15, None)
+    arg = 1 + 2 * c * num / denom
+    return (1.0 / np.sqrt(c)) * np.arccosh(np.clip(arg, 1.0, None))
+
+
 # ============================================================================
-# XML parsing — gets ALL boxes (known + unknown)
+# XML parsing
 # ============================================================================
 
 def parse_all_xml_boxes(dataset_root, img_id, known_set):
@@ -152,12 +186,15 @@ def parse_all_xml_boxes(dataset_root, img_id, known_set):
 
 def collect_embeddings(model, data_loader, known_class_names, dataset_root, hyp_c):
     """
-    Iterate the ENTIRE test dataloader and collect hyperbolic embeddings for
-    ALL GT boxes (known + unknown) via XML annotation parsing.
+    Iterate the ENTIRE test dataloader and collect:
+      - Poincaré embeddings
+      - Geodesic scores (-d²) to each prototype
+      - Assigned prototype per sample
+      - FPN / pre-clip / Poincaré norms for pipeline analysis
     """
     total_images = len(data_loader.dataset) if hasattr(data_loader, 'dataset') else '?'
     print(f"\n{'='*60}")
-    print(f"COLLECTING EMBEDDINGS — FULL TEST SET (XML parsing)")
+    print(f"COLLECTING EMBEDDINGS — FULL TEST SET (geodesic framework)")
     print(f"  Known classes: {known_class_names}")
     print(f"  Total images: {total_images}")
     print(f"{'='*60}")
@@ -168,20 +205,18 @@ def collect_embeddings(model, data_loader, known_class_names, dataset_root, hyp_
     all_embeddings = []
     all_class_names = []
     all_is_known = []
-    all_max_horo = []
-    all_assigned_proto = []
-    all_fpn_norms = []        # FPN feature norms (pre-projector)
-    all_pre_clip_norms = []   # Projector output norms (pre-ToPoincare clip)
+    all_geo_scores = []       # Full score vector per sample (K,)
+    all_max_score = []        # max_k(-d²) per sample
+    all_assigned_proto = []   # argmax_k per sample
+    all_fpn_norms = []
+    all_pre_clip_norms = []
     samples_count = defaultdict(int)
 
-    prototypes = model.prototypes.detach()
-    biases = model.prototype_biases.detach()
-
     with torch.no_grad():
-        # Enable norm caching for pipeline analysis
+        # Enable norm caching
         model.hyp_projector.store_norms = True
-        
-        for i, batch in enumerate(tqdm(data_loader, desc="Collecting (full test set)")):
+
+        for i, batch in enumerate(tqdm(data_loader, desc="Collecting embeddings")):
             if i > 0 and i % 500 == 0:
                 n_known = sum(v for k, v in samples_count.items() if k in known_set)
                 n_unk = sum(v for k, v in samples_count.items() if k not in known_set)
@@ -198,7 +233,13 @@ def collect_embeddings(model, data_loader, known_class_names, dataset_root, hyp_
                     else:
                         x = model.parent.neck(x)
 
-                hyp_embeddings = model.hyp_projector(x)  # (B, 8400, dim)
+                hyp_embeddings = model.hyp_projector(x)
+                # hyp_projector returns (poincare_embs, pre_expmap_norms)
+                if isinstance(hyp_embeddings, tuple):
+                    hyp_embeddings, _ = hyp_embeddings
+
+                # Geodesic scores via model API
+                geo_scores = model.compute_geodesic_scores(hyp_embeddings)  # (B, 8400, K)
 
                 h, w = data_batch['inputs'].shape[-2:]
                 anchor_centers = get_anchor_centers(h, w, device=hyp_embeddings.device)
@@ -237,20 +278,20 @@ def collect_embeddings(model, data_loader, known_class_names, dataset_root, hyp_
                         dists = (anchor_centers[:, 0] - cx)**2 + (anchor_centers[:, 1] - cy)**2
                         nearest_idx = dists.argmin().item()
 
-                        emb = hyp_embeddings[b_idx, nearest_idx]
+                        emb = hyp_embeddings[b_idx, nearest_idx]       # (D,)
+                        scores = geo_scores[b_idx, nearest_idx]         # (K,)
 
-                        # Capture pipeline norms at same spatial location
+                        # Pipeline norms
                         fpn_norm_val = model.hyp_projector._cached_fpn_norms[b_idx, nearest_idx].item()
                         pre_clip_norm_val = model.hyp_projector._cached_pre_clip_norms[b_idx, nearest_idx].item()
 
-                        B_vals = busemann(prototypes, emb.unsqueeze(0), c=hyp_c)
-                        horo_scores = (-B_vals + biases).squeeze(0)
-                        max_horo, assigned = horo_scores.max(dim=0)
+                        max_score, assigned = scores.max(dim=0)
 
                         all_embeddings.append(emb.cpu())
                         all_class_names.append(cls_name)
                         all_is_known.append(is_known)
-                        all_max_horo.append(max_horo.item())
+                        all_geo_scores.append(scores.cpu())
+                        all_max_score.append(max_score.item())
                         all_assigned_proto.append(assigned.item())
                         all_fpn_norms.append(fpn_norm_val)
                         all_pre_clip_norms.append(pre_clip_norm_val)
@@ -274,27 +315,30 @@ def collect_embeddings(model, data_loader, known_class_names, dataset_root, hyp_
     print(f"  Total known: {n_known}, Total unknown: {n_unk}")
 
     if len(all_embeddings) == 0:
-        return None, None, None, None, None, None, None
+        return None
 
     embeddings = torch.stack(all_embeddings)
-    return (embeddings,
-            np.array(all_class_names),
-            np.array(all_is_known),
-            np.array(all_max_horo),
-            np.array(all_assigned_proto),
-            np.array(all_fpn_norms),
-            np.array(all_pre_clip_norms))
-
+    geo_scores = torch.stack(all_geo_scores)
+    return {
+        'embeddings': embeddings,
+        'class_names': np.array(all_class_names),
+        'is_known': np.array(all_is_known),
+        'geo_scores': geo_scores,          # (N, K) — full score vectors
+        'max_score': np.array(all_max_score),
+        'assigned_proto': np.array(all_assigned_proto),
+        'fpn_norms': np.array(all_fpn_norms),
+        'pre_clip_norms': np.array(all_pre_clip_norms),
+    }
 
 
 # ============================================================================
-# UMAP projection — high-dim Poincaré → 2D Poincaré disk
+# UMAP projection
 # ============================================================================
 
 def project_umap(embeddings, prototypes, curvature=1.0, n_neighbors=15, min_dist=0.1):
     """
-    Project high-dim Poincaré embeddings + prototypes to 2D Poincaré disk
-    via UMAP with hyperboloid output metric.
+    Project high-dim Poincaré embeddings + interior prototypes to 2D Poincaré disk.
+    Prototypes are kept at THEIR ACTUAL relative norm (not pushed to boundary).
     """
     import umap
 
@@ -303,12 +347,8 @@ def project_umap(embeddings, prototypes, curvature=1.0, n_neighbors=15, min_dist
     if torch.is_tensor(prototypes):
         prototypes = prototypes.detach().cpu().numpy()
 
-    # Scale boundary prototypes slightly inside for logmap0
-    proto_norms = np.linalg.norm(prototypes, axis=-1, keepdims=True)
-    prototypes_scaled = prototypes * (0.9 / (proto_norms + 1e-8))
-
     emb_tangent = _logmap0_numpy(embeddings, curvature)
-    proto_tangent = _logmap0_numpy(prototypes_scaled, curvature)
+    proto_tangent = _logmap0_numpy(prototypes, curvature)
 
     combined = np.vstack([emb_tangent, proto_tangent])
     combined = np.nan_to_num(combined, nan=0.0, posinf=0.0, neginf=0.0)
@@ -333,52 +373,15 @@ def project_umap(embeddings, prototypes, curvature=1.0, n_neighbors=15, min_dist
     embeddings_2d = np.stack([disk_x[:n_emb], disk_y[:n_emb]], axis=1)
     prototypes_2d = np.stack([disk_x[n_emb:], disk_y[n_emb:]], axis=1)
 
-    # Push prototypes back to boundary in 2D
-    p2d_norms = np.linalg.norm(prototypes_2d, axis=-1, keepdims=True)
-    prototypes_2d = prototypes_2d * (0.99 / (p2d_norms + 1e-8))
+    # NOTE: Unlike v1, we do NOT push prototypes to the boundary.
+    # Interior prototypes stay at their UMAP-projected position.
 
     return embeddings_2d, prototypes_2d
 
 
 # ============================================================================
-# Horosphere drawing on 2D Poincaré disk
+# Drawing helpers
 # ============================================================================
-
-def draw_horosphere_2d(ax, prototype_2d, bias, curvature=1.0, color='gray',
-                       label=None, linestyle='-', alpha=0.25):
-    """
-    Draw a horosphere on the 2D Poincaré disk.
-
-    In the Poincaré disk, a horosphere at ideal point p with Busemann level
-    B_p(x) = bias  is a Euclidean circle internally tangent to the boundary
-    at p.
-
-    For the unit disk (c=1):
-        Euclidean radius   r = 1 / (1 + exp(bias))
-        Centre             = p * (1 - r)
-
-    Positive bias -> smaller horosphere (tighter acceptance).
-    Negative bias -> larger horosphere (looser acceptance).
-    """
-    R = 1.0 / np.sqrt(curvature)
-    p = prototype_2d / (np.linalg.norm(prototype_2d) + 1e-15)  # unit direction
-
-    r = R / (1.0 + np.exp(bias))
-    centre = p * (R - r)
-
-    theta = np.linspace(0, 2 * np.pi, 200)
-    circle_x = centre[0] + r * np.cos(theta)
-    circle_y = centre[1] + r * np.sin(theta)
-
-    # Clip to inside the disk
-    inside = (circle_x**2 + circle_y**2) <= R**2 * 1.01
-    circle_x[~inside] = np.nan
-    circle_y[~inside] = np.nan
-
-    ax.plot(circle_x, circle_y, color=color, linestyle=linestyle,
-            linewidth=2.0, alpha=0.8, label=label)
-    ax.fill(circle_x, circle_y, color=color, alpha=alpha)
-
 
 def _draw_disk(ax):
     """Draw the unit Poincaré disk boundary."""
@@ -387,9 +390,40 @@ def _draw_disk(ax):
     ax.fill(np.cos(theta), np.sin(theta), alpha=0.03, color='gray')
 
 
-# ============================================================================
-# Plotting
-# ============================================================================
+def draw_geodesic_voronoi(ax, prototypes_2d, known_class_names, color_map,
+                          curvature=1.0, resolution=200, alpha=0.12):
+    """
+    Draw approximate geodesic Voronoi regions on the 2D Poincaré disk.
+
+    For each point on a dense grid inside the disk, assign it to the nearest
+    prototype (by Poincaré distance) and colour the background accordingly.
+    This replaces horosphere circles for the geodesic framework.
+    """
+    lin = np.linspace(-0.99, 0.99, resolution)
+    xx, yy = np.meshgrid(lin, lin)
+    pts = np.stack([xx.ravel(), yy.ravel()], axis=-1)       # (res*res, 2)
+    inside = (pts ** 2).sum(-1) < 0.99  # inside disk
+
+    K = len(prototypes_2d)
+    dists = np.full((len(pts), K), np.inf)
+    for k in range(K):
+        dists[inside, k] = _poincare_dist_2d(pts[inside], prototypes_2d[k], c=curvature)
+
+    assignment = np.argmin(dists, axis=-1)
+    assignment[~inside] = -1
+
+    # Create coloured image
+    img = np.ones((resolution, resolution, 4))  # RGBA white
+    for k in range(K):
+        cls = known_class_names[k] if k < len(known_class_names) else f'proto_{k}'
+        c = color_map.get(cls, [0.5, 0.5, 0.5, 1.0])
+        mask_k = (assignment.reshape(resolution, resolution) == k)
+        for ch in range(3):
+            img[:, :, ch][mask_k] = c[ch] if hasattr(c, '__len__') else c
+        img[:, :, 3][mask_k] = alpha
+
+    ax.imshow(img, extent=(-0.99, 0.99, -0.99, 0.99), origin='lower', aspect='equal', zorder=0)
+
 
 def make_versioned_dir(base_dir):
     """Create a versioned subdirectory: v1, v2, ... inside base_dir."""
@@ -403,24 +437,79 @@ def make_versioned_dir(base_dir):
         version += 1
 
 
-def plot_full_visualization(embeddings_2d, class_names_arr, is_known_arr,
-                            max_horo_arr, prototypes_2d, known_class_names,
-                            biases, save_dir, curvature=1.0,
-                            embeddings_hd=None, prototypes_hd=None, hyp_c=1.0,
-                            fpn_norms=None, pre_clip_norms=None):
+# ============================================================================
+# Metric helpers
+# ============================================================================
+
+def compute_auroc(known_scores, unknown_scores):
+    """AUROC for OOD detection (known = positive, higher score = more ID)."""
+    try:
+        from sklearn.metrics import roc_auc_score
+        labels = np.concatenate([np.ones(len(known_scores)), np.zeros(len(unknown_scores))])
+        scores = np.concatenate([known_scores, unknown_scores])
+        return roc_auc_score(labels, scores)
+    except Exception:
+        return float('nan')
+
+
+def compute_cohens_d(a, b):
+    """Effect size: Cohen's d between two distributions."""
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return float('nan')
+    va, vb = a.var(ddof=1), b.var(ddof=1)
+    pooled_std = np.sqrt(((na - 1) * va + (nb - 1) * vb) / (na + nb - 2))
+    if pooled_std < 1e-12:
+        return float('nan')
+    return (a.mean() - b.mean()) / pooled_std
+
+
+def compute_fpr_at_tpr(known_scores, unknown_scores, tpr_level=0.95):
+    """FPR@TPR95: fraction of unknowns misclassified as known at 95% known recall."""
+    try:
+        from sklearn.metrics import roc_curve
+        labels = np.concatenate([np.ones(len(known_scores)), np.zeros(len(unknown_scores))])
+        scores = np.concatenate([known_scores, unknown_scores])
+        fpr, tpr, _ = roc_curve(labels, scores)
+        idx = np.searchsorted(tpr, tpr_level)
+        return fpr[min(idx, len(fpr) - 1)]
+    except Exception:
+        return float('nan')
+
+
+# ============================================================================
+# Plotting — all diagnostic panels
+# ============================================================================
+
+def plot_all_diagnostics(data, prototypes_2d, embeddings_2d, prototypes_hd,
+                         known_class_names, save_dir, curvature=1.0,
+                         adaptive_stats=None):
     """
-    Create 9 figures:
-      1. UMAP Poincaré disk — all classes colour-coded (combined)
-      2. Same disk + horosphere circles
-      3. Score distributions (known vs unknown)
-      4. Per-class horosphere detail (3x3 grid)
-      5. Known-only UMAP (see cluster tightness)
-      6. Unknown-only UMAP (see where unknowns project)
-      7. Embedding norms (fixed: zoomed, per-class)
-      8. Per-class score heatmap (unknown → known prototype affinity)
-      9. Norm pipeline: FPN → projector → Poincaré (known vs unknown)
+    Generate all diagnostic visualisations.
+
+    Parameters
+    ----------
+    data : dict from collect_embeddings
+    prototypes_2d : (K, 2) array — 2D Poincaré positions
+    embeddings_2d : (N, 2) array — 2D Poincaré positions
+    prototypes_hd : tensor (K, D) — high-dimensional prototypes
+    known_class_names : list[str]
+    save_dir : str
+    curvature : float
+    adaptive_stats : dict or None — calibration data from checkpoint
     """
+    class_names_arr = data['class_names']
+    is_known_arr = data['is_known']
+    max_score_arr = data['max_score']
+    assigned_proto_arr = data['assigned_proto']
+    geo_scores = data['geo_scores']  # (N, K) tensor
+    embeddings_hd = data['embeddings']
+    fpn_norms = data['fpn_norms']
+    pre_clip_norms = data['pre_clip_norms']
+
     known_set = set(known_class_names)
+    known_mask = is_known_arr.astype(bool)
+    unk_mask = ~known_mask
     n_protos = len(known_class_names)
 
     unique_known = sorted([c for c in np.unique(class_names_arr) if c in known_set])
@@ -434,29 +523,33 @@ def plot_full_visualization(embeddings_2d, class_names_arr, is_known_arr,
     for i, c in enumerate(unique_unknown):
         color_map[c] = cmap_unknown[i]
 
-    biases_np = biases.detach().cpu().numpy() if torch.is_tensor(biases) else np.asarray(biases)
+    # Compute adaptive thresholds if stats available
+    thresholds = None
+    alpha_used = None
+    if adaptive_stats is not None and adaptive_stats.get('per_class'):
+        thresholds, alpha_used = compute_thresholds(adaptive_stats, known_class_names)
+        thresholds = thresholds.numpy()
 
-    # ---- Figure 1: Colour-coded UMAP (no horospheres) ----
+    # ==================================================================
+    # Figure 1: UMAP Poincaré disk — all classes (no boundaries)
+    # ==================================================================
     fig1, ax1 = plt.subplots(1, 1, figsize=(14, 14))
     _draw_disk(ax1)
 
     for cls in unique_known:
         mask = class_names_arr == cls
-        n = mask.sum()
         ax1.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1],
-                    c=[color_map[cls]], s=12, alpha=0.5, label=f'{cls} ({n})')
-
+                    c=[color_map[cls]], s=12, alpha=0.5, label=f'{cls} ({mask.sum()})')
     for cls in unique_unknown:
         mask = class_names_arr == cls
-        n = mask.sum()
         ax1.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1],
                     c=[color_map[cls]], s=12, alpha=0.5, marker='x',
-                    label=f'*{cls} ({n})')
+                    label=f'*{cls} ({mask.sum()})')
 
     for i in range(n_protos):
+        c = color_map.get(known_class_names[i], 'gray')
         ax1.scatter(prototypes_2d[i, 0], prototypes_2d[i, 1],
-                    c=[color_map.get(known_class_names[i], 'gray')],
-                    s=400, marker='*', edgecolors='black', linewidths=1.5, zorder=5)
+                    c=[c], s=400, marker='*', edgecolors='black', linewidths=1.5, zorder=5)
         direction = prototypes_2d[i] / (np.linalg.norm(prototypes_2d[i]) + 1e-8)
         label_pos = direction * 1.12
         ax1.annotate(known_class_names[i], label_pos, fontsize=8, ha='center',
@@ -466,27 +559,23 @@ def plot_full_visualization(embeddings_2d, class_names_arr, is_known_arr,
     ax1.set_xlim(-1.25, 1.25); ax1.set_ylim(-1.25, 1.25)
     ax1.set_aspect('equal')
     ax1.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=7, markerscale=2)
-    ax1.set_title('Poincare Disk -- Full Test Set UMAP (star = ideal prototypes)\n'
+    ax1.set_title('Poincare Disk — Geodesic Prototypical (star = interior prototypes)\n'
                   '(dot = known,  x = unknown)', fontsize=13)
     ax1.grid(True, alpha=0.2)
     plt.tight_layout()
-    path1 = os.path.join(save_dir, 'umap_full_testset.png')
-    fig1.savefig(path1, dpi=150, bbox_inches='tight')
+    fig1.savefig(os.path.join(save_dir, '01_umap_full_testset.png'), dpi=150, bbox_inches='tight')
     plt.close(fig1)
-    print(f"  Saved: {path1}")
+    print(f"  Saved: 01_umap_full_testset.png")
 
-    # ---- Figure 2: UMAP + Horospheres ----
+    # ==================================================================
+    # Figure 2: UMAP + Geodesic Voronoi boundaries
+    # ==================================================================
     fig2, ax2 = plt.subplots(1, 1, figsize=(14, 14))
     _draw_disk(ax2)
 
-    for i in range(n_protos):
-        c = color_map.get(known_class_names[i], 'gray')
-        draw_horosphere_2d(
-            ax2, prototypes_2d[i], biases_np[i],
-            curvature=curvature, color=c,
-            label=f'Horo {known_class_names[i]} (a={biases_np[i]:.3f})',
-            alpha=0.10,
-        )
+    print("  Drawing geodesic Voronoi boundaries ...")
+    draw_geodesic_voronoi(ax2, prototypes_2d, known_class_names, color_map,
+                          curvature=curvature, resolution=250, alpha=0.10)
 
     for cls in unique_known:
         mask = class_names_arr == cls
@@ -498,9 +587,9 @@ def plot_full_visualization(embeddings_2d, class_names_arr, is_known_arr,
                     c=[color_map[cls]], s=10, alpha=0.4, marker='x')
 
     for i in range(n_protos):
+        c = color_map.get(known_class_names[i], 'gray')
         ax2.scatter(prototypes_2d[i, 0], prototypes_2d[i, 1],
-                    c=[color_map.get(known_class_names[i], 'gray')],
-                    s=400, marker='*', edgecolors='black', linewidths=1.5, zorder=5)
+                    c=[c], s=400, marker='*', edgecolors='black', linewidths=1.5, zorder=5)
         direction = prototypes_2d[i] / (np.linalg.norm(prototypes_2d[i]) + 1e-8)
         label_pos = direction * 1.12
         ax2.annotate(known_class_names[i], label_pos, fontsize=8, ha='center',
@@ -509,55 +598,79 @@ def plot_full_visualization(embeddings_2d, class_names_arr, is_known_arr,
 
     ax2.set_xlim(-1.25, 1.25); ax2.set_ylim(-1.25, 1.25)
     ax2.set_aspect('equal')
-    ax2.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=7)
-    ax2.set_title('Poincare Disk + Horosphere Boundaries (xi=0 level set)\n'
-                  'Points INSIDE a horosphere -> classified as that class', fontsize=13)
+    ax2.set_title('Poincare Disk + Geodesic Voronoi Decision Boundaries\n'
+                  'Coloured regions = nearest-prototype assignment', fontsize=13)
     ax2.grid(True, alpha=0.2)
     plt.tight_layout()
-    path2 = os.path.join(save_dir, 'umap_with_horospheres.png')
-    fig2.savefig(path2, dpi=150, bbox_inches='tight')
+    fig2.savefig(os.path.join(save_dir, '02_umap_voronoi.png'), dpi=150, bbox_inches='tight')
     plt.close(fig2)
-    print(f"  Saved: {path2}")
+    print(f"  Saved: 02_umap_voronoi.png")
 
-    # ---- Figure 3: Score distributions ----
-    fig3, axes3 = plt.subplots(1, 2, figsize=(20, 8))
+    # ==================================================================
+    # Figure 3: Score distributions + adaptive threshold overlay
+    # ==================================================================
+    known_scores = max_score_arr[known_mask]
+    unknown_scores = max_score_arr[unk_mask] if unk_mask.any() else np.array([])
 
+    fig3, axes3 = plt.subplots(1, 3, figsize=(24, 7))
+
+    # Left: overall known vs unknown
     ax = axes3[0]
-    known_scores = max_horo_arr[is_known_arr]
-    unknown_scores = max_horo_arr[~is_known_arr]
-    lo = min(known_scores.min(), unknown_scores.min()) - 0.2 if len(unknown_scores) > 0 else known_scores.min() - 0.2
-    hi = max(known_scores.max(), unknown_scores.max()) + 0.2 if len(unknown_scores) > 0 else known_scores.max() + 0.2
-    bins = np.linspace(lo, hi, 60)
+    all_scores = np.concatenate([known_scores, unknown_scores]) if len(unknown_scores) > 0 else known_scores
+    lo, hi = all_scores.min() - 0.5, all_scores.max() + 0.5
+    bins = np.linspace(lo, hi, 80)
     ax.hist(known_scores, bins=bins, alpha=0.6, color='blue',
             label=f'Known (n={len(known_scores)})', density=True)
     if len(unknown_scores) > 0:
         ax.hist(unknown_scores, bins=bins, alpha=0.6, color='red',
                 label=f'Unknown (n={len(unknown_scores)})', density=True)
-    ax.axvline(0, color='black', linestyle=':', linewidth=1.5, label='tau=0')
-    ax.set_xlabel('Max Horosphere Score (xi = -B + a)')
+    if thresholds is not None:
+        global_tau = thresholds.mean()
+        ax.axvline(global_tau, color='green', linestyle='--', linewidth=2,
+                   label=f'Mean threshold tau={global_tau:.2f}')
+    ax.set_xlabel('Max Geodesic Score  max_k(-d^2)')
     ax.set_ylabel('Density')
-    ax.set_title('Known vs Unknown: Max Horosphere Score')
-    ax.legend(); ax.grid(True, alpha=0.3)
+    ax.set_title('Known vs Unknown: Max Geodesic Score\n(higher = more in-distribution)')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
+    # Middle: per-known-class with individual thresholds
     ax = axes3[1]
+    for ci, cls in enumerate(known_class_names[:9]):  # max 9
+        mask = class_names_arr == cls
+        if mask.sum() > 0:
+            ax.hist(max_score_arr[mask], bins=40, alpha=0.4,
+                    label=f'{cls} ({mask.sum()})', density=True)
+            if thresholds is not None and ci < len(thresholds):
+                ax.axvline(thresholds[ci], linestyle=':', linewidth=1.5,
+                           color=color_map.get(cls, 'gray')[:3])
+    ax.set_xlabel('Max Geodesic Score')
+    ax.set_ylabel('Density')
+    ax.set_title(f'Per-Known-Class Scores\n(dotted lines = adaptive tau, alpha={alpha_used or "N/A"})')
+    ax.legend(fontsize=6); ax.grid(True, alpha=0.3)
+
+    # Right: per-unknown-class
+    ax = axes3[2]
     for cls in unique_unknown:
         mask = class_names_arr == cls
         if mask.sum() > 0:
-            ax.hist(max_horo_arr[mask], bins=30, alpha=0.5,
+            ax.hist(max_score_arr[mask], bins=30, alpha=0.5,
                     label=f'{cls} ({mask.sum()})', density=True)
-    ax.axvline(0, color='black', linestyle=':', linewidth=1.5, label='tau=0')
-    ax.set_xlabel('Max Horosphere Score')
+    if thresholds is not None:
+        ax.axvline(thresholds.mean(), color='green', linestyle='--',
+                   linewidth=2, label=f'Mean tau={thresholds.mean():.2f}')
+    ax.set_xlabel('Max Geodesic Score')
     ax.set_ylabel('Density')
-    ax.set_title('Per Unknown Subclass: Score Distributions')
+    ax.set_title('Per-Unknown-Class Score Distributions')
     ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    path3 = os.path.join(save_dir, 'score_distributions.png')
-    fig3.savefig(path3, dpi=150, bbox_inches='tight')
+    fig3.savefig(os.path.join(save_dir, '03_score_distributions.png'), dpi=150, bbox_inches='tight')
     plt.close(fig3)
-    print(f"  Saved: {path3}")
+    print(f"  Saved: 03_score_distributions.png")
 
-    # ---- Figure 4: Per-known-class horosphere detail (3x3) ----
+    # ==================================================================
+    # Figure 4: Per-class geodesic detail (3x3 grid)
+    # ==================================================================
     n_grid = min(n_protos, 9)
     ncols = 3
     nrows = (n_grid + ncols - 1) // ncols
@@ -566,132 +679,123 @@ def plot_full_visualization(embeddings_2d, class_names_arr, is_known_arr,
         axes4 = axes4[np.newaxis, :]
 
     for idx in range(n_grid):
-        r, c = idx // ncols, idx % ncols
-        ax = axes4[r][c]
+        r, c_idx = idx // ncols, idx % ncols
+        ax = axes4[r][c_idx]
         cls = known_class_names[idx]
         _draw_disk(ax)
-
-        draw_horosphere_2d(ax, prototypes_2d[idx], biases_np[idx],
-                           curvature=curvature,
-                           color=color_map.get(cls, 'blue'), alpha=0.08)
 
         mask_k = (class_names_arr == cls)
         if mask_k.sum() > 0:
             ax.scatter(embeddings_2d[mask_k, 0], embeddings_2d[mask_k, 1],
                        c='blue', s=8, alpha=0.4, label=f'{cls} ({mask_k.sum()})')
-
-        mask_u = ~is_known_arr
-        if mask_u.sum() > 0:
-            ax.scatter(embeddings_2d[mask_u, 0], embeddings_2d[mask_u, 1],
-                       c='red', s=6, alpha=0.15, marker='x', label=f'Unknowns ({mask_u.sum()})')
+        if unk_mask.sum() > 0:
+            ax.scatter(embeddings_2d[unk_mask, 0], embeddings_2d[unk_mask, 1],
+                       c='red', s=6, alpha=0.15, marker='x', label=f'Unknowns ({unk_mask.sum()})')
 
         ax.scatter(prototypes_2d[idx, 0], prototypes_2d[idx, 1],
                    c='gold', s=300, marker='*', edgecolors='black', linewidths=1.5, zorder=5)
 
+        # Draw distance circles around prototype (iso-distance contours)
+        for radius_frac in [0.3, 0.6, 0.9]:
+            theta = np.linspace(0, 2 * np.pi, 100)
+            circ_x = prototypes_2d[idx, 0] + radius_frac * np.cos(theta)
+            circ_y = prototypes_2d[idx, 1] + radius_frac * np.sin(theta)
+            inside = (circ_x**2 + circ_y**2) < 0.99
+            circ_x[~inside] = np.nan
+            circ_y[~inside] = np.nan
+            ax.plot(circ_x, circ_y, 'k:', linewidth=0.5, alpha=0.3)
+
         ax.set_xlim(-1.2, 1.2); ax.set_ylim(-1.2, 1.2)
         ax.set_aspect('equal')
-        ax.set_title(f'{cls} (bias={biases_np[idx]:.3f})', fontsize=10)
+        tau_str = f', tau={thresholds[idx]:.1f}' if thresholds is not None and idx < len(thresholds) else ''
+        ax.set_title(f'{cls}{tau_str}', fontsize=10)
         ax.legend(fontsize=6, loc='lower right')
 
     for idx in range(n_grid, nrows * ncols):
-        r, c = idx // ncols, idx % ncols
-        axes4[r][c].set_visible(False)
+        r, c_idx = idx // ncols, idx % ncols
+        axes4[r][c_idx].set_visible(False)
 
-    plt.suptitle('Per-Class Horosphere: Known (blue) vs Unknown (red)', fontsize=14, y=1.01)
+    plt.suptitle('Per-Class Geodesic Detail: Known (blue) vs Unknown (red)', fontsize=14, y=1.01)
     plt.tight_layout()
-    path4 = os.path.join(save_dir, 'per_class_horosphere.png')
-    fig4.savefig(path4, dpi=150, bbox_inches='tight')
+    fig4.savefig(os.path.join(save_dir, '04_per_class_detail.png'), dpi=150, bbox_inches='tight')
     plt.close(fig4)
-    print(f"  Saved: {path4}")
+    print(f"  Saved: 04_per_class_detail.png")
 
-    # ---- Figure 5: Known-only UMAP ----
+    # ==================================================================
+    # Figure 5: Known-only UMAP
+    # ==================================================================
     fig5, ax5 = plt.subplots(1, 1, figsize=(14, 14))
     _draw_disk(ax5)
+    draw_geodesic_voronoi(ax5, prototypes_2d, known_class_names, color_map,
+                          curvature=curvature, resolution=150, alpha=0.06)
 
-    known_mask = is_known_arr
     for cls in unique_known:
         mask = class_names_arr == cls
-        n = mask.sum()
         ax5.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1],
-                    c=[color_map[cls]], s=14, alpha=0.5, label=f'{cls} ({n})')
-
+                    c=[color_map[cls]], s=14, alpha=0.5, label=f'{cls} ({mask.sum()})')
     for i in range(n_protos):
         c = color_map.get(known_class_names[i], 'gray')
-        draw_horosphere_2d(ax5, prototypes_2d[i], biases_np[i],
-                           curvature=curvature, color=c, alpha=0.06)
         ax5.scatter(prototypes_2d[i, 0], prototypes_2d[i, 1],
                     c=[c], s=400, marker='*', edgecolors='black', linewidths=1.5, zorder=5)
         direction = prototypes_2d[i] / (np.linalg.norm(prototypes_2d[i]) + 1e-8)
-        label_pos = direction * 1.12
-        ax5.annotate(known_class_names[i], label_pos, fontsize=8, ha='center',
+        ax5.annotate(known_class_names[i], direction * 1.12, fontsize=8, ha='center',
                      va='center', fontweight='bold',
                      bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
 
     ax5.set_xlim(-1.25, 1.25); ax5.set_ylim(-1.25, 1.25)
     ax5.set_aspect('equal')
     ax5.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=7, markerscale=2)
-    ax5.set_title('KNOWN CLASSES ONLY — Poincare Disk UMAP\n'
-                  '(Check: are clusters tight around their prototype?)', fontsize=13)
+    ax5.set_title('KNOWN CLASSES ONLY — Geodesic Prototypical UMAP\n'
+                  '(Are clusters tight around their interior prototype?)', fontsize=13)
     ax5.grid(True, alpha=0.2)
     plt.tight_layout()
-    path5 = os.path.join(save_dir, 'umap_known_only.png')
-    fig5.savefig(path5, dpi=150, bbox_inches='tight')
+    fig5.savefig(os.path.join(save_dir, '05_umap_known_only.png'), dpi=150, bbox_inches='tight')
     plt.close(fig5)
-    print(f"  Saved: {path5}")
+    print(f"  Saved: 05_umap_known_only.png")
 
-    # ---- Figure 6: Unknown-only UMAP ----
+    # ==================================================================
+    # Figure 6: Unknown-only UMAP
+    # ==================================================================
     fig6, ax6 = plt.subplots(1, 1, figsize=(14, 14))
     _draw_disk(ax6)
+    draw_geodesic_voronoi(ax6, prototypes_2d, known_class_names, color_map,
+                          curvature=curvature, resolution=150, alpha=0.04)
 
     for cls in unique_unknown:
         mask = class_names_arr == cls
-        n = mask.sum()
         ax6.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1],
                     c=[color_map[cls]], s=20, alpha=0.6, marker='x',
-                    label=f'{cls} ({n})')
-
-    # Show prototypes and horospheres as reference
+                    label=f'{cls} ({mask.sum()})')
     for i in range(n_protos):
         c = color_map.get(known_class_names[i], 'gray')
-        draw_horosphere_2d(ax6, prototypes_2d[i], biases_np[i],
-                           curvature=curvature, color=c, alpha=0.04)
         ax6.scatter(prototypes_2d[i, 0], prototypes_2d[i, 1],
                     c=[c], s=400, marker='*', edgecolors='black', linewidths=1.5, zorder=5)
         direction = prototypes_2d[i] / (np.linalg.norm(prototypes_2d[i]) + 1e-8)
-        label_pos = direction * 1.12
-        ax6.annotate(known_class_names[i], label_pos, fontsize=8, ha='center',
+        ax6.annotate(known_class_names[i], direction * 1.12, fontsize=8, ha='center',
                      va='center', fontweight='bold',
                      bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
 
     ax6.set_xlim(-1.25, 1.25); ax6.set_ylim(-1.25, 1.25)
     ax6.set_aspect('equal')
     ax6.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=7, markerscale=2)
-    ax6.set_title('UNKNOWN CLASSES ONLY — Poincare Disk UMAP\n'
-                  '(Ideal: unknowns near center/origin, FAR from prototypes)', fontsize=13)
+    ax6.set_title('UNKNOWN CLASSES ONLY — Geodesic Prototypical UMAP\n'
+                  '(Ideal: unknowns far from prototypes, scattered or near center)', fontsize=13)
     ax6.grid(True, alpha=0.2)
     plt.tight_layout()
-    path6 = os.path.join(save_dir, 'umap_unknown_only.png')
-    fig6.savefig(path6, dpi=150, bbox_inches='tight')
+    fig6.savefig(os.path.join(save_dir, '06_umap_unknown_only.png'), dpi=150, bbox_inches='tight')
     plt.close(fig6)
-    print(f"  Saved: {path6}")
+    print(f"  Saved: 06_umap_unknown_only.png")
 
-    # ---- Figure 7: Embedding norms (zoomed + box plot) ----
+    # ==================================================================
+    # Figure 7: Embedding norms (zoomed + per-class box)
+    # ==================================================================
+    embhd = embeddings_hd.numpy() if torch.is_tensor(embeddings_hd) else embeddings_hd
+    all_poincare_norms = np.linalg.norm(embhd, axis=-1)
+    known_norms_hd = all_poincare_norms[known_mask]
+    unknown_norms_hd = all_poincare_norms[unk_mask] if unk_mask.any() else np.array([])
+
     fig7, (ax7a, ax7b) = plt.subplots(1, 2, figsize=(18, 6))
 
-    known_norms_2d = np.linalg.norm(embeddings_2d[known_mask], axis=-1)
-    unknown_norms_2d = np.linalg.norm(embeddings_2d[~known_mask], axis=-1) if (~known_mask).any() else np.array([])
-
-    # Use high-dim norms if available, otherwise 2D norms
-    if embeddings_hd is not None:
-        embhd = embeddings_hd.numpy() if torch.is_tensor(embeddings_hd) else embeddings_hd
-        all_norms = np.linalg.norm(embhd, axis=-1)
-        known_norms_hd = all_norms[known_mask]
-        unknown_norms_hd = all_norms[~known_mask] if (~known_mask).any() else np.array([])
-    else:
-        known_norms_hd = known_norms_2d
-        unknown_norms_hd = unknown_norms_2d
-
-    # Left: Zoomed histogram with proper range
     all_n = np.concatenate([known_norms_hd, unknown_norms_hd]) if len(unknown_norms_hd) > 0 else known_norms_hd
     lo, hi = all_n.min() - 0.01, all_n.max() + 0.01
     bins = np.linspace(lo, hi, 80)
@@ -700,213 +804,360 @@ def plot_full_visualization(embeddings_2d, class_names_arr, is_known_arr,
     if len(unknown_norms_hd) > 0:
         ax7a.hist(unknown_norms_hd, bins=bins, alpha=0.5, color='red',
                   label=f'Unknown (n={len(unknown_norms_hd)})', density=True)
-    ax7a.axvline(0.95, color='green', linestyle='--', label='clip_r=0.95')
-    ax7a.set_xlabel('||x|| (Poincare ball norm)')
+    ax7a.set_xlabel('||x||_Poincare')
     ax7a.set_ylabel('Density')
-    ax7a.set_title('Embedding Norm Distribution (zoomed to data range)')
-    ax7a.legend(fontsize=8)
-    ax7a.grid(True, alpha=0.3)
+    ax7a.set_title('Poincare Norm Distribution\n(higher = closer to boundary = more "confident")')
+    ax7a.legend(fontsize=8); ax7a.grid(True, alpha=0.3)
 
-    # Right: Per-class boxplot of norms
+    # Per-class boxplot
     class_norm_data = []
     class_norm_labels = []
     class_norm_colors = []
     for cls_name in known_class_names:
         m = class_names_arr == cls_name
         if m.sum() > 0:
-            norms_cls = np.linalg.norm(embhd[m], axis=-1) if embeddings_hd is not None else np.linalg.norm(embeddings_2d[m], axis=-1)
-            class_norm_data.append(norms_cls)
+            class_norm_data.append(np.linalg.norm(embhd[m], axis=-1))
             class_norm_labels.append(f'{cls_name}\n(n={m.sum()})')
             class_norm_colors.append('steelblue')
-    for cls_name in unique_unknown[:6]:  # top 6 unknown classes
+    for cls_name in unique_unknown[:6]:
         m = class_names_arr == cls_name
         if m.sum() > 0:
-            norms_cls = np.linalg.norm(embhd[m], axis=-1) if embeddings_hd is not None else np.linalg.norm(embeddings_2d[m], axis=-1)
-            class_norm_data.append(norms_cls)
+            class_norm_data.append(np.linalg.norm(embhd[m], axis=-1))
             class_norm_labels.append(f'*{cls_name}\n(n={m.sum()})')
             class_norm_colors.append('coral')
     if class_norm_data:
         bp = ax7b.boxplot(class_norm_data, labels=class_norm_labels, patch_artist=True, vert=True)
         for patch, col in zip(bp['boxes'], class_norm_colors):
-            patch.set_facecolor(col)
-            patch.set_alpha(0.5)
+            patch.set_facecolor(col); patch.set_alpha(0.5)
         ax7b.tick_params(axis='x', rotation=45, labelsize=7)
-        ax7b.set_ylabel('||x|| (Poincare ball norm)')
-        ax7b.set_title('Per-Class Embedding Norms\n(blue=known, red=unknown)')
+        ax7b.set_ylabel('||x||_Poincare')
+        ax7b.set_title('Per-Class Embedding Norms (blue=known, red=unknown)')
         ax7b.grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()
-    path7 = os.path.join(save_dir, 'embedding_norms.png')
-    fig7.savefig(path7, dpi=150, bbox_inches='tight')
+    fig7.savefig(os.path.join(save_dir, '07_embedding_norms.png'), dpi=150, bbox_inches='tight')
     plt.close(fig7)
-    print(f"  Saved: {path7}")
+    print(f"  Saved: 07_embedding_norms.png")
 
-    # ---- Figure 8: Score heatmap — unknown mean horo score per known prototype ----
-    if len(unique_unknown) > 0:
-        # Also add known classes for reference comparison
-        all_classes_for_heatmap = list(unique_known) + list(unique_unknown)
-        heatmap_data = []
-        heatmap_labels = []
-        heatmap_counts = []
-        for cls_name in all_classes_for_heatmap:
-            mask = class_names_arr == cls_name
-            if mask.sum() < 3:
-                continue
-            heatmap_labels.append(cls_name)
-            heatmap_counts.append(int(mask.sum()))
-            # For each sample of this class, we only have max_horo + assigned_proto
-            # We can show: what fraction gets assigned to each prototype
-            assign_fracs = np.zeros(n_protos)
-            for cls_idx in range(n_protos):
-                # This requires assigned_proto_arr — check if accessible
-                pass
-            heatmap_data.append(max_horo_arr[mask].mean())  # placeholder
+    # ==================================================================
+    # Figure 8: Distance heatmap — mean geodesic score per class per proto
+    # ==================================================================
+    geo_np = geo_scores.numpy() if torch.is_tensor(geo_scores) else geo_scores  # (N, K)
 
-        # Better approach: show the norm-distance from disk center as proxy
-        # Actually, the most useful is a radial distance from each prototype in 2D
-        proto_dist_matrix = np.zeros((len(all_classes_for_heatmap), n_protos))
-        valid_rows = []
-        valid_labels = []
-        for ri, cls_name in enumerate(all_classes_for_heatmap):
-            mask = class_names_arr == cls_name
-            if mask.sum() < 3:
-                continue
-            valid_rows.append(ri)
-            is_k = cls_name in known_set
-            valid_labels.append(f"{'[K]' if is_k else '[U]'} {cls_name} (n={mask.sum()})")
-            emb_cls = embeddings_2d[mask]  # (n_cls, 2)
-            for pi in range(n_protos):
-                # Mean euclidean distance in 2D disk from this class to prototype pi
-                dists = np.linalg.norm(emb_cls - prototypes_2d[pi], axis=-1)
-                proto_dist_matrix[ri, pi] = dists.mean()
+    all_classes_for_heatmap = list(unique_known) + list(unique_unknown)
+    valid_labels = []
+    mat_rows = []
+    for cls_name in all_classes_for_heatmap:
+        mask = class_names_arr == cls_name
+        if mask.sum() < 3:
+            continue
+        is_k = cls_name in known_set
+        valid_labels.append(f"{'[K]' if is_k else '[U]'} {cls_name} (n={mask.sum()})")
+        # Mean geodesic score (-d²) to each prototype — less negative = closer
+        mat_rows.append(geo_np[mask].mean(axis=0))  # (K,)
 
-        if len(valid_rows) > 0:
-            mat = proto_dist_matrix[valid_rows]
-            fig8, ax8 = plt.subplots(figsize=(12, max(5, len(valid_labels) * 0.4)))
-            im = ax8.imshow(mat, cmap='RdYlGn_r', aspect='auto')  # green=close, red=far
-            ax8.set_xticks(range(n_protos))
-            ax8.set_xticklabels(known_class_names, rotation=45, ha='right', fontsize=9)
-            ax8.set_yticks(range(len(valid_labels)))
-            ax8.set_yticklabels(valid_labels, fontsize=7)
-            ax8.set_xlabel('Known Prototype')
-            ax8.set_ylabel('Class ([K]=known, [U]=unknown)')
-            ax8.set_title('Mean 2D Distance to Each Prototype\n'
-                          '(green=close, red=far — known classes should be green for own proto)')
-            for i in range(len(valid_labels)):
-                for j in range(n_protos):
-                    ax8.text(j, i, f'{mat[i,j]:.2f}', ha='center', va='center', fontsize=6)
-            plt.colorbar(im, ax=ax8, label='Mean Euclidean dist in 2D disk', shrink=0.8)
-            plt.tight_layout()
-            path8 = os.path.join(save_dir, 'prototype_distance_heatmap.png')
-            fig8.savefig(path8, dpi=150, bbox_inches='tight')
-            plt.close(fig8)
-            print(f"  Saved: {path8}")
-
-    # ---- Figure 9: Norm Pipeline Analysis (FPN → Projector → Poincaré) ----
-    if fpn_norms is not None and pre_clip_norms is not None:
-        poincare_norms = np.array([np.linalg.norm(e) for e in
-            (embeddings_hd.numpy() if torch.is_tensor(embeddings_hd) else embeddings_hd)])
-        
-        known_mask = is_known_arr.astype(bool)
-        unk_mask = ~known_mask
-        
-        stages = ['FPN Output', 'Post-Projector\n(pre-clip)', 'Poincaré\n(post-expmap0)']
-        known_data = [fpn_norms[known_mask], pre_clip_norms[known_mask], poincare_norms[known_mask]]
-        unk_data =   [fpn_norms[unk_mask],   pre_clip_norms[unk_mask],   poincare_norms[unk_mask]]
-        
-        fig9, axes9 = plt.subplots(1, 3, figsize=(20, 6))
-        fig9.suptitle('Norm Pipeline: Where Does Information Collapse?', fontsize=16, fontweight='bold')
-        
-        for idx, (ax, stage, kd, ud) in enumerate(zip(axes9, stages, known_data, unk_data)):
-            # Box plots side by side
-            data = [kd, ud]
-            bp = ax.boxplot(data, labels=['Known', 'Unknown'], widths=0.5,
-                           patch_artist=True, showfliers=False)
-            bp['boxes'][0].set_facecolor('#4CAF50')
-            bp['boxes'][0].set_alpha(0.7)
-            bp['boxes'][1].set_facecolor('#F44336')
-            bp['boxes'][1].set_alpha(0.7)
-            
-            ax.set_title(stage, fontsize=13, fontweight='bold')
-            ax.set_ylabel('||x||' if idx == 0 else '')
-            
-            # Add mean markers
-            k_mean = kd.mean() if len(kd) > 0 else 0
-            u_mean = ud.mean() if len(ud) > 0 else 0
-            ax.scatter([1], [k_mean], marker='D', color='darkgreen', s=60, zorder=5, label=f'μ={k_mean:.3f}')
-            ax.scatter([2], [u_mean], marker='D', color='darkred', s=60, zorder=5, label=f'μ={u_mean:.3f}')
-            ax.legend(fontsize=9)
-            
-            # Annotate separation
-            if k_mean > 0 and u_mean > 0:
-                ratio = u_mean / k_mean
-                ax.text(0.5, 0.02, f'unk/known ratio: {ratio:.3f}',
-                       transform=ax.transAxes, ha='center', fontsize=10,
-                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-        
+    if len(mat_rows) > 0:
+        mat = np.stack(mat_rows)
+        fig8, ax8 = plt.subplots(figsize=(12, max(5, len(valid_labels) * 0.4)))
+        im = ax8.imshow(mat, cmap='RdYlGn', aspect='auto')  # green=high score(close), red=low(far)
+        ax8.set_xticks(range(n_protos))
+        ax8.set_xticklabels(known_class_names, rotation=45, ha='right', fontsize=9)
+        ax8.set_yticks(range(len(valid_labels)))
+        ax8.set_yticklabels(valid_labels, fontsize=7)
+        ax8.set_xlabel('Known Prototype')
+        ax8.set_ylabel('Class')
+        ax8.set_title('Mean Geodesic Score -d^2 to Each Prototype\n'
+                      '(green = high score / close,  red = low score / far)')
+        for i in range(len(valid_labels)):
+            for j in range(n_protos):
+                ax8.text(j, i, f'{mat[i,j]:.1f}', ha='center', va='center', fontsize=6)
+        plt.colorbar(im, ax=ax8, label='Mean -d^2', shrink=0.8)
         plt.tight_layout()
-        path9 = os.path.join(save_dir, 'norm_pipeline.png')
-        fig9.savefig(path9, dpi=150, bbox_inches='tight')
-        plt.close(fig9)
-        print(f"  Saved: {path9}")
-        
-        # ---- Figure 10: Per-class norm breakdown (pre-clip) ----
-        fig10, (ax10a, ax10b) = plt.subplots(2, 1, figsize=(16, 10))
-        fig10.suptitle('Per-Class Projector Output Norms (Pre-Clip Euclidean)', fontsize=14, fontweight='bold')
-        
-        # Top: known classes
-        known_classes = sorted(set(class_names_arr[known_mask]))
-        known_vals = [pre_clip_norms[class_names_arr == c] for c in known_classes]
-        if known_vals:
-            bp_k = ax10a.boxplot(known_vals, labels=known_classes, patch_artist=True, showfliers=False)
-            for box in bp_k['boxes']:
-                box.set_facecolor('#4CAF50')
-                box.set_alpha(0.6)
-            ax10a.axhline(y=1.0, color='red', linestyle='--', linewidth=2, label=f'clip_r = 1.0')
-            ax10a.set_title('Known Classes', fontsize=12)
-            ax10a.set_ylabel('Pre-clip Euclidean norm')
-            ax10a.tick_params(axis='x', rotation=30)
-            ax10a.legend()
-        
-        # Bottom: unknown classes
-        unk_classes = sorted(set(class_names_arr[unk_mask]))
-        unk_vals = [pre_clip_norms[class_names_arr == c] for c in unk_classes]
-        if unk_vals:
-            bp_u = ax10b.boxplot(unk_vals, labels=unk_classes, patch_artist=True, showfliers=False)
-            for box in bp_u['boxes']:
-                box.set_facecolor('#F44336')
-                box.set_alpha(0.6)
-            ax10b.axhline(y=1.0, color='red', linestyle='--', linewidth=2, label=f'clip_r = 1.0')
-            ax10b.set_title('Unknown Classes (*)', fontsize=12)
-            ax10b.set_ylabel('Pre-clip Euclidean norm')
-            ax10b.tick_params(axis='x', rotation=30)
-            ax10b.legend()
-        
-        plt.tight_layout()
-        path10 = os.path.join(save_dir, 'per_class_projector_norms.png')
-        fig10.savefig(path10, dpi=150, bbox_inches='tight')
-        plt.close(fig10)
-        print(f"  Saved: {path10}")
-        
-        # ---- Print summary table to stdout ----
-        print(f"\n{'='*70}")
-        print(f"NORM PIPELINE SUMMARY")
-        print(f"{'='*70}")
-        print(f"{'Stage':<25s} {'Known (μ±σ)':<20s} {'Unknown (μ±σ)':<20s} {'Ratio unk/kn':<15s}")
-        print(f"{'-'*70}")
-        for stage, kd, ud in zip(['FPN output', 'Post-projector', 'Poincaré'], known_data, unk_data):
-            km, ks = (kd.mean(), kd.std()) if len(kd) > 0 else (0, 0)
-            um, us = (ud.mean(), ud.std()) if len(ud) > 0 else (0, 0)
-            ratio = um / km if km > 0 else float('inf')
-            print(f"{stage:<25s} {km:.4f}±{ks:.4f}      {um:.4f}±{us:.4f}      {ratio:.4f}")
-        print(f"{'-'*70}")
-        clip_r_val = getattr(embeddings_hd, '_clip_r', 1.0) if embeddings_hd is not None else 1.0
-        pct_clipped_known = (pre_clip_norms[known_mask] >= 0.999).mean() * 100
-        pct_clipped_unk = (pre_clip_norms[unk_mask] >= 0.999).mean() * 100 if unk_mask.any() else 0
-        print(f"% clipped (norm≥clip_r):  Known={pct_clipped_known:.1f}%  Unknown={pct_clipped_unk:.1f}%")
-        print(f"{'='*70}")
+        fig8.savefig(os.path.join(save_dir, '08_geodesic_score_heatmap.png'), dpi=150, bbox_inches='tight')
+        plt.close(fig8)
+        print(f"  Saved: 08_geodesic_score_heatmap.png")
+
+    # ==================================================================
+    # Figure 9: Norm pipeline (FPN → Projector → Poincaré)
+    # ==================================================================
+    poincare_norms = all_poincare_norms
+    stages = ['FPN Output', 'Post-Projector\n(pre-clip)', 'Poincare\n(post-expmap0)']
+    known_data = [fpn_norms[known_mask], pre_clip_norms[known_mask], poincare_norms[known_mask]]
+    unk_data = [fpn_norms[unk_mask], pre_clip_norms[unk_mask], poincare_norms[unk_mask]]
+
+    fig9, axes9 = plt.subplots(1, 3, figsize=(20, 6))
+    fig9.suptitle('Norm Pipeline: Where Does Information Collapse?', fontsize=16, fontweight='bold')
+
+    for idx, (ax, stage, kd, ud) in enumerate(zip(axes9, stages, known_data, unk_data)):
+        bp_data = [kd]
+        bp_labels = ['Known']
+        if len(ud) > 0:
+            bp_data.append(ud)
+            bp_labels.append('Unknown')
+        bp = ax.boxplot(bp_data, labels=bp_labels, widths=0.5,
+                        patch_artist=True, showfliers=False)
+        bp['boxes'][0].set_facecolor('#4CAF50'); bp['boxes'][0].set_alpha(0.7)
+        if len(ud) > 0 and len(bp['boxes']) > 1:
+            bp['boxes'][1].set_facecolor('#F44336'); bp['boxes'][1].set_alpha(0.7)
+
+        ax.set_title(stage, fontsize=13, fontweight='bold')
+        ax.set_ylabel('||x||' if idx == 0 else '')
+
+        k_mean = kd.mean() if len(kd) > 0 else 0
+        u_mean = ud.mean() if len(ud) > 0 else 0
+        ax.scatter([1], [k_mean], marker='D', color='darkgreen', s=60, zorder=5, label=f'mu={k_mean:.3f}')
+        if len(ud) > 0:
+            ax.scatter([2], [u_mean], marker='D', color='darkred', s=60, zorder=5, label=f'mu={u_mean:.3f}')
+        ax.legend(fontsize=9)
+
+        if k_mean > 0 and u_mean > 0:
+            ratio = u_mean / k_mean
+            ax.text(0.5, 0.02, f'unk/known ratio: {ratio:.3f}',
+                    transform=ax.transAxes, ha='center', fontsize=10,
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    plt.tight_layout()
+    fig9.savefig(os.path.join(save_dir, '09_norm_pipeline.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig9)
+    print(f"  Saved: 09_norm_pipeline.png")
+
+    # ==================================================================
+    # Figure 10: Per-class projector output norms
+    # ==================================================================
+    fig10, (ax10a, ax10b) = plt.subplots(2, 1, figsize=(16, 10))
+    fig10.suptitle('Per-Class Projector Output Norms (Pre-Clip Euclidean)', fontsize=14, fontweight='bold')
+
+    known_classes_sorted = sorted(set(class_names_arr[known_mask]))
+    known_vals = [pre_clip_norms[class_names_arr == c] for c in known_classes_sorted]
+    if known_vals:
+        bp_k = ax10a.boxplot(known_vals, labels=known_classes_sorted, patch_artist=True, showfliers=False)
+        for box in bp_k['boxes']:
+            box.set_facecolor('#4CAF50'); box.set_alpha(0.6)
+        ax10a.set_title('Known Classes'); ax10a.set_ylabel('Pre-clip ||v||'); ax10a.tick_params(axis='x', rotation=30)
+
+    unk_classes_sorted = sorted(set(class_names_arr[unk_mask]))
+    unk_vals = [pre_clip_norms[class_names_arr == c] for c in unk_classes_sorted]
+    if unk_vals:
+        bp_u = ax10b.boxplot(unk_vals, labels=unk_classes_sorted, patch_artist=True, showfliers=False)
+        for box in bp_u['boxes']:
+            box.set_facecolor('#F44336'); box.set_alpha(0.6)
+        ax10b.set_title('Unknown Classes'); ax10b.set_ylabel('Pre-clip ||v||'); ax10b.tick_params(axis='x', rotation=30)
+
+    plt.tight_layout()
+    fig10.savefig(os.path.join(save_dir, '10_per_class_projector_norms.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig10)
+    print(f"  Saved: 10_per_class_projector_norms.png")
+
+    # ==================================================================
+    # Figure 11: Prototype analysis — inter-distances + norm bar chart
+    # ==================================================================
+    proto_np = prototypes_hd.cpu().numpy() if torch.is_tensor(prototypes_hd) else prototypes_hd
+    proto_norms = np.linalg.norm(proto_np, axis=-1)
+    K = len(proto_np)
+
+    # Pairwise geodesic distances between prototypes (using torch pmath)
+    proto_t = torch.tensor(proto_np, dtype=torch.float32)
+    pair_dists = np.zeros((K, K))
+    for i in range(K):
+        for j in range(K):
+            if i != j:
+                pair_dists[i, j] = pmath.dist(proto_t[i:i+1], proto_t[j:j+1], c=curvature).item()
+
+    fig11, (ax11a, ax11b) = plt.subplots(1, 2, figsize=(18, 7))
+    fig11.suptitle('Prototype Analysis', fontsize=16, fontweight='bold')
+
+    # Left: pairwise distance heatmap
+    im = ax11a.imshow(pair_dists, cmap='YlOrRd', aspect='equal')
+    ax11a.set_xticks(range(K)); ax11a.set_xticklabels(known_class_names, rotation=45, ha='right', fontsize=8)
+    ax11a.set_yticks(range(K)); ax11a.set_yticklabels(known_class_names, fontsize=8)
+    for i in range(K):
+        for j in range(K):
+            ax11a.text(j, i, f'{pair_dists[i,j]:.2f}', ha='center', va='center', fontsize=6)
+    plt.colorbar(im, ax=ax11a, label='Geodesic dist d(z_i, z_j)', shrink=0.8)
+    ax11a.set_title('Inter-Prototype Geodesic Distances\n(Are prototypes well-separated?)')
+
+    # Right: prototype norm bar chart
+    bars = ax11b.bar(range(K), proto_norms, color='steelblue', alpha=0.8)
+    ax11b.set_xticks(range(K)); ax11b.set_xticklabels(known_class_names, rotation=45, ha='right', fontsize=8)
+    ax11b.set_ylabel('||z_k||_Poincare')
+    ax11b.set_title('Prototype Norms (should be <= max_proto_norm)')
+    ax11b.axhline(0.5, color='red', linestyle='--', linewidth=2, label='max_proto_norm=0.5')
+    ax11b.axhline(0.4, color='orange', linestyle=':', linewidth=1.5, label='init_norm=0.4')
+    ax11b.legend()
+    for i, (bar, n) in enumerate(zip(bars, proto_norms)):
+        ax11b.text(bar.get_x() + bar.get_width()/2, n + 0.01, f'{n:.3f}',
+                   ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+    fig11.savefig(os.path.join(save_dir, '11_prototype_analysis.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig11)
+    print(f"  Saved: 11_prototype_analysis.png")
+
+    # ==================================================================
+    # Figure 12: Statistical summary dashboard
+    # ==================================================================
+    auroc = compute_auroc(known_scores, unknown_scores) if len(unknown_scores) > 0 else float('nan')
+    cohens_d = compute_cohens_d(known_scores, unknown_scores) if len(unknown_scores) > 0 else float('nan')
+    fpr95 = compute_fpr_at_tpr(known_scores, unknown_scores) if len(unknown_scores) > 0 else float('nan')
+
+    fig12, axes12 = plt.subplots(2, 2, figsize=(18, 14))
+    fig12.suptitle('Statistical Diagnostic Summary', fontsize=16, fontweight='bold')
+
+    # Top-left: OOD metrics summary text
+    ax = axes12[0, 0]
+    ax.axis('off')
+    summary_lines = [
+        f"AUROC (known vs unknown):  {auroc:.4f}",
+        f"Cohen's d:                 {cohens_d:.4f}",
+        f"FPR@95% TPR:               {fpr95:.4f}",
+        "",
+        f"Known samples:    {len(known_scores)}",
+        f"Unknown samples:  {len(unknown_scores)}",
+        "",
+        f"Known score:   mu={known_scores.mean():.2f}  sigma={known_scores.std():.2f}",
+    ]
+    if len(unknown_scores) > 0:
+        summary_lines.append(f"Unknown score: mu={unknown_scores.mean():.2f}  sigma={unknown_scores.std():.2f}")
+        gap = known_scores.mean() - unknown_scores.mean()
+        summary_lines.append(f"Score gap (mu_k - mu_u): {gap:.2f}")
+    summary_lines += [
+        "",
+        f"Prototype norms:  min={proto_norms.min():.4f}  max={proto_norms.max():.4f}  mean={proto_norms.mean():.4f}",
+        f"Emb norms (known):  mu={known_norms_hd.mean():.4f}  sigma={known_norms_hd.std():.4f}",
+    ]
+    if len(unknown_norms_hd) > 0:
+        summary_lines.append(f"Emb norms (unk):    mu={unknown_norms_hd.mean():.4f}  sigma={unknown_norms_hd.std():.4f}")
+
+    summary_lines += [
+        "",
+        f"Inter-proto dist:  min={pair_dists[pair_dists > 0].min():.4f}" if (pair_dists > 0).any() else "",
+        f"                   max={pair_dists.max():.4f}  mean={pair_dists[pair_dists > 0].mean():.4f}" if (pair_dists > 0).any() else "",
+    ]
+
+    if thresholds is not None:
+        summary_lines += [
+            "",
+            f"Thresholds (alpha={alpha_used:.2f}):",
+        ]
+        for ci, cls in enumerate(known_class_names):
+            if ci < len(thresholds):
+                summary_lines.append(f"  {cls}: tau={thresholds[ci]:.2f}")
+
+    ax.text(0.05, 0.95, '\n'.join(summary_lines), transform=ax.transAxes,
+            fontsize=10, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
+
+    # Top-right: per-class calibration quality (mean +/- std per class)
+    ax = axes12[0, 1]
+    if adaptive_stats is not None and adaptive_stats.get('per_class'):
+        cal = adaptive_stats['per_class']
+        cls_labels_cal = []
+        means = []
+        stds = []
+        for cls_name in known_class_names:
+            if cls_name in cal and cal[cls_name]['count'] > 0:
+                cls_labels_cal.append(cls_name)
+                means.append(cal[cls_name]['mean'])
+                stds.append(cal[cls_name]['std'])
+        if cls_labels_cal:
+            y_pos = np.arange(len(cls_labels_cal))
+            ax.barh(y_pos, means, xerr=stds, height=0.6, color='steelblue', alpha=0.7,
+                    capsize=3, label='mu +/- sigma (training calibration)')
+            if thresholds is not None:
+                for yi, ci in enumerate(range(len(cls_labels_cal))):
+                    if ci < len(thresholds):
+                        ax.plot(thresholds[ci], yi, 'rv', markersize=8, zorder=5)
+                ax.plot([], [], 'rv', markersize=8, label='Threshold tau')
+            ax.set_yticks(y_pos); ax.set_yticklabels(cls_labels_cal, fontsize=8)
+            ax.set_xlabel('Geodesic Score (-d^2)')
+            ax.set_title('Per-Class Calibration (training set)\nbar=mu, whisker=sigma, triangle=tau')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3, axis='x')
     else:
-        print("  [SKIP] Norm pipeline analysis — no FPN/pre-clip data available")
+        ax.text(0.5, 0.5, 'No adaptive_stats\nin checkpoint', transform=ax.transAxes,
+                ha='center', va='center', fontsize=14, color='gray')
+        ax.set_title('Per-Class Calibration')
+
+    # Bottom-left: prototype utilization (how many test samples assigned to each proto)
+    ax = axes12[1, 0]
+    proto_counts = np.zeros(n_protos)
+    for pi in range(n_protos):
+        proto_counts[pi] = (assigned_proto_arr == pi).sum()
+    bars = ax.bar(range(n_protos), proto_counts, color='steelblue', alpha=0.8)
+    for i, bar in enumerate(bars):
+        c = color_map.get(known_class_names[i], 'steelblue')
+        bar.set_facecolor(c)
+    ax.set_xticks(range(n_protos))
+    ax.set_xticklabels(known_class_names, rotation=45, ha='right', fontsize=8)
+    ax.set_ylabel('# Test Samples Assigned')
+    ax.set_title('Prototype Utilization (test set)\n(Unbalanced = some prototypes attract too many/few)')
+    for i, (bar, cnt) in enumerate(zip(bars, proto_counts)):
+        ax.text(bar.get_x() + bar.get_width()/2, cnt + 0.5, f'{int(cnt)}',
+                ha='center', va='bottom', fontsize=8)
+
+    # Bottom-right: known vs unknown prototype assignment confusion
+    ax = axes12[1, 1]
+    known_correct = 0
+    known_total = 0
+    for ci, cls in enumerate(known_class_names):
+        mask = (class_names_arr == cls) & known_mask
+        if mask.sum() > 0:
+            known_total += mask.sum()
+            known_correct += (assigned_proto_arr[mask] == ci).sum()
+
+    unk_proto_hist = np.zeros(n_protos)
+    if unk_mask.any():
+        for pi in range(n_protos):
+            unk_proto_hist[pi] = ((assigned_proto_arr == pi) & unk_mask).sum()
+
+    accuracy = known_correct / max(known_total, 1)
+    bars = ax.bar(range(n_protos), unk_proto_hist, color='#F44336', alpha=0.6, label='Unknowns')
+    ax.set_xticks(range(n_protos))
+    ax.set_xticklabels(known_class_names, rotation=45, ha='right', fontsize=8)
+    ax.set_ylabel('# Unknown Samples Assigned')
+    ax.set_title(f'Unknown -> Prototype Attraction\n'
+                 f'(Known assignment accuracy: {accuracy:.1%} [{known_correct}/{known_total}])')
+    ax.legend()
+    for i, (bar, cnt) in enumerate(zip(bars, unk_proto_hist)):
+        if cnt > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, cnt + 0.5, f'{int(cnt)}',
+                    ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+    fig12.savefig(os.path.join(save_dir, '12_statistical_summary.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig12)
+    print(f"  Saved: 12_statistical_summary.png")
+
+    # ==================================================================
+    # Print norm pipeline summary to stdout
+    # ==================================================================
+    print(f"\n{'='*70}")
+    print(f"NORM PIPELINE SUMMARY")
+    print(f"{'='*70}")
+    print(f"{'Stage':<25s} {'Known (mu+/-sigma)':<20s} {'Unknown (mu+/-sigma)':<20s} {'Ratio unk/kn':<15s}")
+    print(f"{'-'*70}")
+    for stage, kd, ud in zip(['FPN output', 'Post-projector', 'Poincare'], known_data, unk_data):
+        km, ks = (kd.mean(), kd.std()) if len(kd) > 0 else (0, 0)
+        um, us = (ud.mean(), ud.std()) if len(ud) > 0 else (0, 0)
+        ratio = um / km if km > 0 else float('inf')
+        print(f"{stage:<25s} {km:.4f}+/-{ks:.4f}      {um:.4f}+/-{us:.4f}      {ratio:.4f}")
+    pct_clipped_known = (pre_clip_norms[known_mask] >= 0.999).mean() * 100
+    pct_clipped_unk = (pre_clip_norms[unk_mask] >= 0.999).mean() * 100 if unk_mask.any() else 0
+    print(f"% clipped (norm>=clip_r):  Known={pct_clipped_known:.1f}%  Unknown={pct_clipped_unk:.1f}%")
+    print(f"{'='*70}")
+
+    # Print OOD detection metrics
+    print(f"\n{'='*70}")
+    print(f"OOD DETECTION METRICS (Geodesic Prototypical)")
+    print(f"{'='*70}")
+    print(f"  AUROC:              {auroc:.4f}")
+    print(f"  Cohen's d:          {cohens_d:.4f}")
+    print(f"  FPR@95%TPR:         {fpr95:.4f}")
+    print(f"  Known score (mu+/-sigma):  {known_scores.mean():.2f} +/- {known_scores.std():.2f}")
+    if len(unknown_scores) > 0:
+        print(f"  Unk   score (mu+/-sigma):  {unknown_scores.mean():.2f} +/- {unknown_scores.std():.2f}")
+    print(f"  Proto norms:        min={proto_norms.min():.4f} max={proto_norms.max():.4f}")
+    print(f"{'='*70}")
 
 
 # ============================================================================
@@ -916,32 +1167,25 @@ def plot_full_visualization(embeddings_2d, class_names_arr, is_known_arr,
 if __name__ == "__main__":
     parser = default_argument_parser()
     parser.add_argument("--task", default="IDD_HYP/t1")
-    parser.add_argument("--ckpt", default="IDD_HYP/t1/horospherical/model_5.pth")
+    parser.add_argument("--ckpt", default="")
     parser.add_argument("--hyp_c", type=float, default=1.0)
     parser.add_argument("--hyp_dim", type=int, default=64)
-    parser.add_argument("--clip_r", type=float, default=0.95)
+    parser.add_argument("--clip_r", type=float, default=2.0)
     parser.add_argument("--output_dir", default="visualizations")
     parser.add_argument("--n_neighbors", type=int, default=15)
     parser.add_argument("--min_dist", type=float, default=0.1)
-    parser.add_argument("--num_batches", type=int, default=100,
-                        help="Ignored (full test set used), kept for CLI compat")
-    parser.add_argument("--samples_per_class", type=int, default=50,
-                        help="Ignored (full test set used), kept for CLI compat")
-    parser.add_argument("--projection", type=str, default="hyperbolic_umap",
-                        help="Ignored (always hyperbolic UMAP), kept for CLI compat")
 
     args = parser.parse_args()
     print("Command Line Args:", args)
     cfg = setup(args)
 
-    # Normalise --task: accept both absolute paths and relative like "IDD_HYP/t1"
+    # Parse task
     task_parts = args.task.rstrip('/').split('/')
-    task_name = task_parts[-2]   # e.g. "IDD_HYP"
-    split_name = task_parts[-1]  # e.g. "t1"
+    task_name = task_parts[-2]
+    split_name = task_parts[-1]
     base_dataset = task_name.replace('_HYP', '')
     dataset_key = base_dataset
 
-    # Auto-merge task-specific yaml if base.yaml was used (so class counts are correct)
     task_yaml = os.path.join("./configs", task_name, split_name + ".yaml")
     if os.path.exists(task_yaml) and 'base' in args.config_file:
         print(f"  Auto-merging task config: {task_yaml}")
@@ -959,17 +1203,13 @@ if __name__ == "__main__":
     print(f"\n=== Configuration ===")
     print(f"  Task: {args.task}")
     print(f"  Known classes ({unknown_index}): {known_class_names}")
-    print(f"  Curvature: {args.hyp_c}")
     print(f"  Checkpoint: {args.ckpt}")
 
-    # Model config
     config_file = os.path.join("./configs", task_name, split_name + ".py")
     cfgY = Config.fromfile(config_file)
     cfgY.work_dir = "."
 
-    # Initialize YOLO-World
     runner = Runner.from_cfg(cfgY)
-    # Strip EMA hook — it deep-copies the entire XL model (~20 min!) and is unused
     runner._hooks = [h for h in runner._hooks if not h.__class__.__name__.startswith('EMA')]
     runner.call_hook("before_run")
     runner.load_or_resume()
@@ -977,7 +1217,6 @@ if __name__ == "__main__":
     runner.model.reparameterize([known_class_names])
     runner.model.eval()
 
-    # Build TEST dataloader (not train!)
     test_loader = Runner.build_dataloader(cfgY.test_dataloader)
 
     # --- Auto-detect hyp config from checkpoint ---
@@ -986,76 +1225,81 @@ if __name__ == "__main__":
     hyp_c = hyp_config.get('curvature', args.hyp_c)
     hyp_dim = hyp_config.get('embed_dim', args.hyp_dim)
     clip_r = hyp_config.get('clip_r', args.clip_r)
-    tau_init = hyp_config.get('tau_init', None)
     bi_lipschitz = hyp_config.get('bi_lipschitz', False)
+    prototype_init_norm = hyp_config.get('prototype_init_norm', 0.4)
+    max_proto_norm = hyp_config.get('max_proto_norm', 0.5)
+    adaptive_stats = ckpt_data.get('adaptive_stats', None)
+
     if hyp_dim != args.hyp_dim:
-        print(f"  NOTE: Using hyp_dim={hyp_dim} from checkpoint (CLI default was {args.hyp_dim})")
+        print(f"  NOTE: Using hyp_dim={hyp_dim} from checkpoint (CLI was {args.hyp_dim})")
     if hyp_c != args.hyp_c:
-        print(f"  NOTE: Using hyp_c={hyp_c} from checkpoint (CLI default was {args.hyp_c})")
-    if tau_init is not None:
-        print(f"  NOTE: Using learnable τ (tau_init={tau_init}) — clip_r is ignored")
+        print(f"  NOTE: Using hyp_c={hyp_c} from checkpoint (CLI was {args.hyp_c})")
     if bi_lipschitz:
         print(f"  NOTE: Using BiLipschitz projectors")
-    del ckpt_data  # free memory
+    if adaptive_stats:
+        print(f"  NOTE: Loaded adaptive_stats from checkpoint ({len(adaptive_stats.get('per_class', {}))} classes)")
+    else:
+        print(f"  WARNING: No adaptive_stats in checkpoint")
 
-    # Build hyperbolic model
+    del ckpt_data
+
+    # For T2+ eval
+    prev_cls = cfg.TEST.PREV_INTRODUCED_CLS
+    cur_cls = cfg.TEST.CUR_INTRODUCED_CLS
+    classifier_num_classes = cur_cls if prev_cls > 0 else unknown_index
+
+    # Build geodesic prototypical model
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
         hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
+        num_classifier_classes=classifier_num_classes,
         bi_lipschitz=bi_lipschitz,
-        tau_init=tau_init,
+        prototype_init_norm=prototype_init_norm,
+        max_proto_norm=max_proto_norm,
     )
 
     print(f"\n=== Loading Checkpoint: {args.ckpt} ===")
     with torch.no_grad():
-        model = load_hyp_ckpt(model, args.ckpt,
-                              cfg.TEST.PREV_INTRODUCED_CLS, cfg.TEST.CUR_INTRODUCED_CLS, eval=True)
+        model = load_hyp_ckpt(model, args.ckpt, prev_cls, cur_cls, eval=True)
         model = model.cuda()
-        # IMPORTANT: add_generic_text MUTATES known_class_names in-place (appends 'object')
-        # Copy the original known class names BEFORE mutation for visualization
         known_class_names_orig = list(known_class_names)
         model.add_generic_text(known_class_names, generic_prompt='object', alpha=0.4)
     model.eval()
 
     prototypes = model.prototypes.detach()
-    biases = model.prototype_biases.detach()
 
     print(f"\n=== Model Info ===")
-    print(f"  Prototypes: {prototypes.shape[0]} (norms: {[f'{n:.4f}' for n in prototypes.norm(dim=-1).tolist()]})")
-    print(f"  Biases: {[f'{b:.4f}' for b in biases.cpu().tolist()]}")
-    print(f"  Classes: {known_class_names}")
+    proto_norms = prototypes.norm(dim=-1)
+    print(f"  Prototypes: {prototypes.shape[0]} classes")
+    print(f"  Proto norms: {[f'{n:.4f}' for n in proto_norms.tolist()]}")
+    print(f"  Max proto norm: {proto_norms.max():.4f} (ceiling: {max_proto_norm})")
+    print(f"  Known classes: {known_class_names}")
 
     # ---- Collect embeddings from FULL test set ----
-    result = collect_embeddings(
-        model, test_loader, known_class_names,
-        dataset_root='./datasets',
-        hyp_c=args.hyp_c,
-    )
+    data = collect_embeddings(model, test_loader, known_class_names,
+                              dataset_root='./datasets', hyp_c=hyp_c)
 
-    if result[0] is None:
+    if data is None:
         print("ERROR: No embeddings collected!")
         sys.exit(1)
 
-    embeddings, class_names_arr, is_known_arr, max_horo_arr, assigned_proto_arr, fpn_norms_arr, pre_clip_norms_arr = result
-
+    embeddings = data['embeddings']
     poincare_norms = embeddings.norm(dim=-1).numpy()
     print(f"\n  Total embeddings: {len(embeddings)}")
     print(f"  Embedding dim: {embeddings.shape[1]}")
-    print(f"  Poincaré norms: min={poincare_norms.min():.4f}, max={poincare_norms.max():.4f}")
-    print(f"  Pre-clip Euclidean norms: min={pre_clip_norms_arr.min():.4f}, max={pre_clip_norms_arr.max():.4f}")
-    print(f"  FPN norms: min={fpn_norms_arr.min():.4f}, max={fpn_norms_arr.max():.4f}")
+    print(f"  Poincare norms: min={poincare_norms.min():.4f}, max={poincare_norms.max():.4f}")
+    print(f"  Pre-clip norms: min={data['pre_clip_norms'].min():.4f}, max={data['pre_clip_norms'].max():.4f}")
+    print(f"  FPN norms: min={data['fpn_norms'].min():.4f}, max={data['fpn_norms'].max():.4f}")
+    print(f"  Geodesic scores: min={data['max_score'].min():.4f}, max={data['max_score'].max():.4f}")
 
     # ---- UMAP projection ----
-    print(f"\n=== UMAP Projection (hyperboloid output metric) ===")
+    print(f"\n=== UMAP Projection ===")
     embeddings_2d, prototypes_2d = project_umap(
         embeddings, prototypes.cpu(),
-        curvature=args.hyp_c,
+        curvature=hyp_c,
         n_neighbors=args.n_neighbors,
         min_dist=args.min_dist,
     )
-
-    print(f"  Embeddings 2D: {embeddings_2d.shape}")
-    print(f"  Prototypes 2D: {prototypes_2d.shape}")
     print(f"  2D norms: min={np.linalg.norm(embeddings_2d, axis=-1).min():.4f}, "
           f"max={np.linalg.norm(embeddings_2d, axis=-1).max():.4f}")
 
@@ -1063,95 +1307,118 @@ if __name__ == "__main__":
     save_dir = make_versioned_dir(args.output_dir)
     print(f"\n  Output directory: {save_dir}")
 
-    plot_full_visualization(
-        embeddings_2d, class_names_arr, is_known_arr, max_horo_arr,
-        prototypes_2d, known_class_names_orig, biases,
-        save_dir, curvature=args.hyp_c,
-        embeddings_hd=embeddings, prototypes_hd=prototypes.cpu(), hyp_c=args.hyp_c,
-        fpn_norms=fpn_norms_arr, pre_clip_norms=pre_clip_norms_arr,
+    # ---- Generate all diagnostic plots ----
+    plot_all_diagnostics(
+        data, prototypes_2d, embeddings_2d, prototypes.cpu(),
+        known_class_names_orig, save_dir, curvature=hyp_c,
+        adaptive_stats=adaptive_stats,
     )
 
     # ---- Save raw data ----
     ckpt_name = Path(args.ckpt).stem
-    np.savez(os.path.join(save_dir, f"umap_data_{ckpt_name}.npz"),
+    np.savez(os.path.join(save_dir, f"data_{ckpt_name}.npz"),
              embeddings_2d=embeddings_2d,
              prototypes_2d=prototypes_2d,
-             class_names=class_names_arr,
-             is_known=is_known_arr,
-             max_horo=max_horo_arr,
-             assigned_proto=assigned_proto_arr,
+             class_names=data['class_names'],
+             is_known=data['is_known'],
+             max_score=data['max_score'],
+             geo_scores=data['geo_scores'].numpy(),
+             assigned_proto=data['assigned_proto'],
              known_class_names=np.array(known_class_names_orig),
-             biases=biases.cpu().numpy(),
              prototypes_hd=prototypes.cpu().numpy(),
-             fpn_norms=fpn_norms_arr,
-             pre_clip_norms=pre_clip_norms_arr)
-    print(f"  Saved: {save_dir}/umap_data_{ckpt_name}.npz")
+             fpn_norms=data['fpn_norms'],
+             pre_clip_norms=data['pre_clip_norms'])
+    print(f"  Saved: {save_dir}/data_{ckpt_name}.npz")
 
     # ---- Write interpretation guide ----
     guide = """
 ================================================================================
-VISUALIZATION GUIDE — What to look for
+VISUALIZATION GUIDE — Geodesic Prototypical Framework
 ================================================================================
 
-1. umap_full_testset.png (Combined UMAP — all classes)
-   PURPOSE: Overview of entire embedding space.
-   IDEAL:   Known classes (dots) form tight clusters near their prototype star.
-            Unknown classes (x) should be near the disk CENTER (low norm),
-            far from all prototypes. This gives clean score separation.
-   PROBLEM: If unknowns scatter at the BOUNDARY near prototypes, the model
-            cannot distinguish them from knowns via horosphere scores.
+01_umap_full_testset.png — Overview UMAP (all classes)
+   LOOK FOR: Known clusters tight around their interior prototype star.
+   Unknown (x markers) scattered, ideally not overlapping with knowns.
 
-2. umap_with_horospheres.png (Combined + horosphere decision boundaries)
-   PURPOSE: See which regions are claimed by each class.
-   IDEAL:   Each horosphere cleanly encloses its class cluster.
-            Unknowns fall OUTSIDE all horospheres.
-   PROBLEM: If unknowns fall INSIDE horospheres, they'll be misclassified
-            as that known class (false positives).
+02_umap_voronoi.png — UMAP + Geodesic Voronoi decision boundaries
+   LOOK FOR: Each coloured region = nearest prototype by geodesic distance.
+   Ideal: known class dots fully inside their own colour region.
+   Problem: if unknowns fall deep inside a known region.
 
-3. score_distributions.png (Known vs Unknown max-horo score histograms)
-   PURPOSE: The key OOD metric — can we threshold to separate known/unknown?
-   IDEAL:   Known distribution shifted RIGHT (high scores), unknown shifted
-            LEFT (low scores), with minimal overlap.
-   PROBLEM: Heavy overlap means no clean threshold exists.
+03_score_distributions.png — Geodesic scores + adaptive thresholds
+   KEY FIGURE FOR LOSS TUNING.
+   Left: overall known vs unknown separation -> want large gap.
+   Middle: per-class + threshold (dotted lines).
+   Right: per-unknown-class.
+   WHAT TO TUNE:
+   - Overlap = weak separation -> increase beta_reg (push unknowns to lower norm)
+   - All scores bunched -> decrease score_scale or increase clip_r
+   - Some classes have wide std -> those prototypes are poorly learned
 
-4. per_class_horosphere.png (Individual class views)
-   PURPOSE: Per-class quality check — which classes are well-modeled?
-   IDEAL:   Blue dots (own class) tightly inside the horosphere.
-            Red x's (unknowns) outside.
+04_per_class_detail.png — Per-class zoomed view
+   LOOK FOR: blue dots (own class) clustered near prototype star.
+   Red x (unknowns) should be scattered/distant.
 
-5. umap_known_only.png (Known classes ONLY)
-   PURPOSE: See cluster quality without unknown clutter.
-   IDEAL:   Tight, well-separated clusters around their prototype.
-   PROBLEM: Diffuse or overlapping clusters = poor discrimination.
+05_umap_known_only.png — Known classes alone + Voronoi
+   LOOK FOR: Tight, well-separated clusters within their Voronoi cells.
+   Diffuse clusters = CE weight too low or prototype poorly initialised.
 
-6. umap_unknown_only.png (Unknown classes ONLY)
-   PURPOSE: See where unknowns project in the space.
-   IDEAL:   Unknowns concentrate near the disk center (low Poincare norm).
-            This means low horosphere scores → easy to threshold as OOD.
-   PROBLEM: Unknowns at the boundary near prototypes = indistinguishable
-            from knowns (YOUR CURRENT ISSUE).
+06_umap_unknown_only.png — Unknown classes alone + Voronoi
+   IDEAL: Unknowns far from all prototypes, near center or spread outside regions.
+   PROBLEM: If unknowns cluster near/around prototypes = they'll be classified as known.
 
-7. embedding_norms.png (Poincare ball norms)
-   PURPOSE: In hyperbolic space, norm = confidence. Near boundary = certain.
-   IDEAL:   Known classes at high norms (near clip_r=0.95, committed).
-            Unknown classes at LOWER norms (uncertain, toward origin).
-   PROBLEM: If both known and unknown have identical high norms, the model
-            is equally "confident" about unknowns — bad for OOD detection.
+07_embedding_norms.png — Poincare ball norms
+   IDEAL: Known at high norms (confident), unknown at LOWER norms.
+   PROBLEM: Both at same norm = loss doesn't create norm separation.
+   -> TUNE: increase beta_reg or add explicit norm-based regularisation.
 
-8. prototype_distance_heatmap.png (Class → Prototype affinity)
-   PURPOSE: Which prototype does each class (known & unknown) end up near?
-   IDEAL:   Known classes show LOW distance (green) to their OWN prototype,
-            HIGH distance (red) to all others.
-            Unknown classes show HIGH distance to ALL prototypes.
-   PROBLEM: If a unknown class (e.g., bus/truck) shows low distance to a
-            known prototype (e.g., car), that unknown is being absorbed.
+08_geodesic_score_heatmap.png — Score affinity matrix
+   KEY FIGURE: Each cell = mean score of class->prototype.
+   Diagonal of known block should be darkest green (highest score = closest).
+   Unknown rows should be uniformly red (far from all protos).
+   If an unknown has high score to some proto -> that proto is absorbing it.
 
+09_norm_pipeline.png — FPN -> Projector -> Poincare norms
+   Shows where known/unknown norm separation exists or collapses.
+   If separation exists at FPN but not at Poincare -> projector is collapsing signals.
+
+10_per_class_projector_norms.png — Pre-clip norms per class
+   Checks whether all classes are being clipped equally.
+   If every class is at clip_r ceiling -> all info is lost -> reduce clip_r.
+
+11_prototype_analysis.png — Inter-prototype distances + norms
+   Left: pairwise distances. Should ALL be large (well separated).
+   Small distances = prototypes too close -> increase lambda_sep or sep_margin.
+   Right: prototype norms. Should all be <= max_proto_norm.
+   If at ceiling -> optimizer is still pushing them toward boundary.
+
+12_statistical_summary.png — AUROC, Cohen's d, per-class calibration
+   TOP-LEFT: Key OOD metrics.
+     AUROC > 0.90 = good separation. < 0.70 = poor.
+     Cohen's d > 1.0 = large effect. < 0.5 = weak.
+     FPR@95: fraction of unknowns falsely classified as known at 95% recall.
+   TOP-RIGHT: Per-class calibration bars (from training set).
+   BOTTOM-LEFT: Prototype utilization -- imbalance means loss is biased.
+   BOTTOM-RIGHT: Where unknowns are attracted to -- guides loss weight tuning.
+
+LOSS TUNING DECISION TREE:
+  Low AUROC + overlapping score distributions:
+    -> increase beta_reg (norm regularisation)
+    -> increase lambda_sep (push prototypes apart)
+  Low AUROC + unknowns at high norm:
+    -> beta_reg too low, L_reg not effective
+    -> consider adding explicit unknown norm penalty
+  Good AUROC but bad per-class thresholds:
+    -> change calibration alpha (currently alpha=0.75)
+  Prototypes at max_proto_norm ceiling:
+    -> working as designed, but consider lowering max_proto_norm
+  Wide inter-class score variance:
+    -> class_balance_smoothing may need adjustment
 ================================================================================
 """
-    guide_path = os.path.join(save_dir, 'INTERPRETATION_GUIDE.txt')
-    with open(guide_path, 'w') as f:
+    with open(os.path.join(save_dir, 'INTERPRETATION_GUIDE.txt'), 'w') as f:
         f.write(guide)
-    print(f"  Saved: {guide_path}")
+    print(f"  Saved: INTERPRETATION_GUIDE.txt")
 
     print(f"\n{'='*60}")
     print(f"VISUALIZATION COMPLETE — {save_dir}")

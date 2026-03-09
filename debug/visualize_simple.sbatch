@@ -19,7 +19,7 @@
 BASE_DIR="/home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2"
 
 TASK="IDD_HYP/t1"
-CKPT="$BASE_DIR/IDD_HYP/t1/newmodel/model_final.pth"
+CKPT="$BASE_DIR/IDD_HYP/t1/geodesic_v1/model_final.pth"
 
 echo "=========================================="
 echo "POINCARÉ VISUALIZATION"
@@ -53,7 +53,7 @@ cd /home/agipml/sourav.rout/ALL_FILES/hypyolo/hypyolov2
 
 mkdir -p visualizations
 
-python debug/visualize_simple.py \
+python debug/visualize_simple_v1_horospherical.py \
     --config-file configs/IDD_HYP/base.yaml \
     --task $TASK \
     --ckpt $CKPT \
