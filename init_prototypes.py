@@ -15,14 +15,14 @@ Usage:
     # For T1 (8 classes):
     python init_prototypes.py \
         --classes "car,motorcycle,rider,person,autorickshaw,bicycle,traffic sign,traffic light" \
-        --out_dim 256 \
-        --output init_protos_t1.pt
+        --out_dim 64 \
+        --output datasets/prototype/init_protos_t1.pt
     
     # For T2 (14 classes):
     python init_prototypes.py \
         --classes "car,motorcycle,rider,person,autorickshaw,bicycle,traffic sign,traffic light,bus,truck,tanker_vehicle,crane_truck,street_cart,excavator" \
-        --out_dim 256 \
-        --output init_protos_t2.pt
+        --out_dim 64 \
+        --output datasets/prototype/init_protos_t2.pt
 """
 
 import argparse
@@ -195,8 +195,8 @@ def main():
     parser = argparse.ArgumentParser(description='Initialize prototype directions')
     parser.add_argument('--classes', type=str, required=True,
                         help='Comma-separated class names')
-    parser.add_argument('--out_dim', type=int, default=256,
-                        help='Output dimension for prototype directions')
+    parser.add_argument('--out_dim', type=int, default=64,
+                        help='Output dimension for prototype directions (must match embed_dim in config)')
     parser.add_argument('--output', type=str, default='init_protos.pt',
                         help='Output file path')
     parser.add_argument('--prompt_template', type=str, 

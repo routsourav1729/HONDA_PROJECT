@@ -40,9 +40,11 @@ torchrun \
 # ============================================================================
 # T2: Few-Shot Fine-Tuning  ← COMMENTED (run after T1 is done)
 # ============================================================================
-# Update T1_EXP_NAME to match whatever EXP_NAME was used for T1.
+# Set T1_EXP_NAME to match the EXP_NAME used in T1 training.
+# The T1 checkpoint path is also baked into t2.py:hyp_config.prev_ckpt,
+# but --ckpt here takes precedence and makes the dependency explicit.
 #
-# T1_EXP_NAME="hyp_v2"
+# T1_EXP_NAME="vmf_v1"
 # T1_CKPT="IDD_HYP/t1/${T1_EXP_NAME}/model_final.pth"
 # T2_PROTOS="datasets/prototype/init_protos_t2.pt"
 #
@@ -56,10 +58,9 @@ torchrun \
 #     --nproc_per_node=$NUM_GPUS \
 #     --master_port=$MASTER_PORT \
 #     dev_hyp_ddp.py \
-#     --config-file configs/IDD_HYP/base.yaml \
+#     --config-file configs/IDD_HYP/t2.yaml \
 #     --task $TASK_T2 \
 #     --ckpt $T1_CKPT \
-#     --init_protos $T2_PROTOS \
 #     --exp_name $EXP_NAME \
 #     --wandb
 

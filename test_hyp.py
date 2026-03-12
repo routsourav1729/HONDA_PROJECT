@@ -1,16 +1,16 @@
 """
-Geodesic Prototypical YOLO World Evaluation Script.
+vMF Hyperspherical YOLO World Evaluation Script.
 
-Inference with geodesic distance-based OOD detection using
+Inference with vMF distribution-based OOD detection using
 adaptive per-prototype thresholds.
 
 Thresholds are loaded directly from the checkpoint (embedded during training).
 No external JSON file needed -- the checkpoint is self-contained.
 
-For each detection assigned to prototype k with max_geo_score < tau_k -> unknown,
+For each detection assigned to prototype k with max_vmf_score < tau_k -> unknown,
 where tau_k = mean_k - alpha * std_k  (calibrated from training data).
 
-Geodesic scores = -d^2_B(x, z_k): higher = more ID, lower = more OOD.
+vMF scores = log Z_d(kappa_c) + kappa_c * mu_c^T * r: higher = more ID, lower = more OOD.
 """
 
 import os
@@ -156,23 +156,19 @@ if __name__ == "__main__":
     print(f"\n=== Loading checkpoint: {args.ckpt} ===")
     ckpt_data = torch.load(args.ckpt, map_location='cpu')
 
-    # Extract hyp_config (clip_r, curvature, etc.) from checkpoint
+    # Extract hyp_config from checkpoint
     hyp_config = ckpt_data.get('hyp_config', {})
-    hyp_c = hyp_config.get('curvature', 1.0)
+    framework = hyp_config.get('framework', 'vmf_spherical')
     hyp_dim = hyp_config.get('embed_dim', 64)
-    clip_r = hyp_config.get('clip_r', 2.0)
-    bi_lipschitz = hyp_config.get('bi_lipschitz', False)
-    prototype_init_norm = hyp_config.get('prototype_init_norm', 0.4)
-    max_proto_norm = hyp_config.get('max_proto_norm', 0.5)
-    beta_reg = hyp_config.get('beta_reg', 0.1)
-    lambda_sep = hyp_config.get('lambda_sep', 1.0)
-    sep_margin = hyp_config.get('sep_margin', 1.0)
-    framework = hyp_config.get('framework', 'geodesic_prototypical')
+    bi_lipschitz = hyp_config.get('bi_lipschitz', True)
+    kappa_init = hyp_config.get('kappa_init', 10.0)
+    ema_alpha = hyp_config.get('ema_alpha', 0.95)
+    use_projection_head = hyp_config.get('use_projection_head', True)
+    vmf_loss_weight = hyp_config.get('vmf_loss_weight', 1.5)
 
-    print(f"  hyp_config: c={hyp_c}, dim={hyp_dim}, clip_r={clip_r}, framework={framework}")
-    print(f"  prototype_init_norm={prototype_init_norm}, max_proto_norm={max_proto_norm}")
-    print(f"  beta_reg={beta_reg}, lambda_sep={lambda_sep}")
-    print(f"  bi_lipschitz={bi_lipschitz}")
+    print(f"  hyp_config: framework={framework}, dim={hyp_dim}")
+    print(f"  kappa_init={kappa_init}, ema_alpha={ema_alpha}")
+    print(f"  use_projection_head={use_projection_head}, bi_lipschitz={bi_lipschitz}")
 
     # Extract adaptive_stats
     adaptive_stats = ckpt_data.get('adaptive_stats', None)
@@ -206,14 +202,13 @@ if __name__ == "__main__":
 
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
-        hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
+        hyp_dim=hyp_dim,
         num_classifier_classes=classifier_num_classes,
         bi_lipschitz=bi_lipschitz,
-        prototype_init_norm=prototype_init_norm,
-        max_proto_norm=max_proto_norm,
-        beta_reg=beta_reg,
-        lambda_sep=lambda_sep,
-        sep_margin=sep_margin,
+        kappa_init=kappa_init,
+        ema_alpha=ema_alpha,
+        use_projection_head=use_projection_head,
+        vmf_loss_weight=vmf_loss_weight,
     )
     
     model = load_hyp_ckpt(model, args.ckpt,
@@ -227,7 +222,7 @@ if __name__ == "__main__":
     print(f"Task: {args.task}, Dataset: {dataset_key}")
     print(f"Classes: {len(class_names)} + 1 (unknown)")
     print(f"Prototypes: {model.prototypes.shape[0]} (norm={model.prototypes.norm(dim=-1).mean():.3f})")
-    print(f"Framework: geodesic prototypical (clip_r={clip_r})")
+    print(f"Framework: {framework}")
 
     # Compute adaptive thresholds
     adaptive_thresholds = None
@@ -265,8 +260,8 @@ if __name__ == "__main__":
                 continue
             
             # --- Step 1: OOD relabeling (BEFORE NMS, matching ovow test.py) ---
-            # Geodesic scores = -d²(x, ẑ_k): higher = more ID, lower = more OOD
-            # If max_geo_score < adaptive_threshold[proto_k] → unknown
+            # vMF scores = log Z + kappa * cos_sim: higher = more ID, lower = more OOD
+            # If max_vmf_score < adaptive_threshold[proto_k] → unknown
             if adaptive_thresholds is not None:
                 if hasattr(pred, 'geo_max_scores') and hasattr(pred, 'geo_assigned_proto'):
                     proto_indices = pred.geo_assigned_proto.long()
@@ -301,7 +296,7 @@ if __name__ == "__main__":
     print(f"RESULTS — {strategy_str}")
     print(f"{'='*60}")
     print(f"  Checkpoint: {args.ckpt}")
-    print(f"  Framework: geodesic prototypical (clip_r={clip_r})")
+    print(f"  Framework: {framework}")
     print(f"  NMS mode: {args.nms_mode} (iou={args.nms_iou})")
     print(f"  Total detections (pre-NMS): {total_dets}")
     print(f"  Total detections (post-NMS): {total_dets_after_nms}")

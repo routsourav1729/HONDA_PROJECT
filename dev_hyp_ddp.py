@@ -1,5 +1,5 @@
 """
-Geodesic Prototypical YOLO World Training Script - Multi-GPU DDP Version.
+vMF Hyperspherical YOLO World Training Script - Multi-GPU DDP Version.
 
 Supports both single-GPU and multi-GPU training.
 Launch:
@@ -168,13 +168,10 @@ if __name__ == "__main__":
     parser.add_argument("--resume_from", default="")
     parser.add_argument("--exp_name", default="")
     
-    # Hyperbolic params
-    parser.add_argument("--hyp_c", type=float, default=None)
+    # Hyperbolic/vMF params
     parser.add_argument("--hyp_dim", type=int, default=None)
-    parser.add_argument("--clip_r", type=float, default=None)
-    parser.add_argument("--hyp_loss_weight", type=float, default=None)
-    parser.add_argument("--beta_reg", type=float, default=None)
-    parser.add_argument("--lambda_sep", type=float, default=None)
+    parser.add_argument("--hyp_loss_weight", type=float, default=None,
+                        help="Override vmf_loss_weight from config")
     parser.add_argument("--init_protos", type=str, default=None)
     parser.add_argument("--wandb", action="store_true")
     
@@ -248,31 +245,27 @@ if __name__ == "__main__":
     train_loader = build_ddp_dataloader(cfgY, is_distributed, world_size, rank)
     print_rank0(f"Training loader: {len(train_loader)} batches/GPU (effective batch={cfgY.trlder.get('batch_size', 32) * world_size})", rank)
 
-    # Hyperbolic config
+    # Hyperbolic config (vMF spherical)
     hyp_cfg = cfgY.get('hyp_config', {})
-    hyp_c = args.hyp_c if args.hyp_c is not None else hyp_cfg.get('curvature', 1.0)
+    framework = hyp_cfg.get('framework', 'vmf_spherical')
     hyp_dim = args.hyp_dim if args.hyp_dim is not None else hyp_cfg.get('embed_dim', 64)
-    clip_r = args.clip_r if args.clip_r is not None else hyp_cfg.get('clip_r', 2.0)
-    hyp_loss_weight = args.hyp_loss_weight if args.hyp_loss_weight is not None else hyp_cfg.get('hyp_loss_weight', 1.0)
-    ce_weight = hyp_cfg.get('ce_weight', 1.0)
+    vmf_loss_weight = args.hyp_loss_weight if args.hyp_loss_weight is not None else hyp_cfg.get('vmf_loss_weight', 1.5)
     class_balance_smoothing = hyp_cfg.get('class_balance_smoothing', 0.5)
-    beta_reg = args.beta_reg if args.beta_reg is not None else hyp_cfg.get('beta_reg', 0.1)
-    lambda_sep = args.lambda_sep if args.lambda_sep is not None else hyp_cfg.get('lambda_sep', 1.0)
-    sep_margin = hyp_cfg.get('sep_margin', 1.0)
+    kappa_init = hyp_cfg.get('kappa_init', 10.0)
+    ema_alpha = hyp_cfg.get('ema_alpha', 0.95)
+    use_projection_head = hyp_cfg.get('use_projection_head', True)
+    repulsion_weight = hyp_cfg.get('repulsion_weight', 0.5)
+    repulsion_margin = hyp_cfg.get('repulsion_margin', 0.1)
+    hard_neg_threshold = hyp_cfg.get('hard_neg_threshold', 0.5)
     init_protos_path = args.init_protos if args.init_protos is not None else hyp_cfg.get('init_protos', '')
     prev_ckpt = args.ckpt if args.ckpt else hyp_cfg.get('prev_ckpt', '')
-    bi_lipschitz = hyp_cfg.get('bi_lipschitz', False)
-    prototype_init_norm = hyp_cfg.get('prototype_init_norm', 0.4)
-    max_proto_norm = hyp_cfg.get('max_proto_norm', 0.5)
-    prototype_lr = hyp_cfg.get('prototype_lr', 1e-3)
-    trainable_prototypes = hyp_cfg.get('trainable_prototypes', True)
+    bi_lipschitz = hyp_cfg.get('bi_lipschitz', True)
     
-    print_rank0(f"\n=== Geodesic Prototypical Config ===", rank)
-    print_rank0(f"  curvature: {hyp_c}, embed_dim: {hyp_dim}, clip_r: {clip_r}", rank)
-    print_rank0(f"  hyp_loss_weight: {hyp_loss_weight}, beta_reg: {beta_reg}, lambda_sep: {lambda_sep}", rank)
-    print_rank0(f"  sep_margin: {sep_margin}, prototype_init_norm: {prototype_init_norm}", rank)
-    print_rank0(f"  max_proto_norm: {max_proto_norm}", rank)
-    print_rank0(f"  bi_lipschitz: {bi_lipschitz}, prototype_lr: {prototype_lr}", rank)
+    print_rank0(f"\n=== vMF Hyperspherical Config ===", rank)
+    print_rank0(f"  framework: {framework}, embed_dim: {hyp_dim}", rank)
+    print_rank0(f"  vmf_loss_weight: {vmf_loss_weight}, kappa_init: {kappa_init}, ema_alpha: {ema_alpha}", rank)
+    print_rank0(f"  repulsion_weight: {repulsion_weight}, repulsion_margin: {repulsion_margin}", rank)
+    print_rank0(f"  use_projection_head: {use_projection_head}, bi_lipschitz: {bi_lipschitz}", rank)
     
     # Load init prototypes
     init_prototypes = None
@@ -292,22 +285,22 @@ if __name__ == "__main__":
     cur_cls = cfg.TEST.CUR_INTRODUCED_CLS
     classifier_num_classes = cur_cls if prev_cls > 0 else unknown_index
     
-    print_rank0(f"\n=== Building Geodesic Prototypical Model ===", rank)
+    print_rank0(f"\n=== Building vMF Hyperspherical Model ===", rank)
     print_rank0(f"  Classifier classes: {classifier_num_classes} ({'novel only' if prev_cls > 0 else 'all'})", rank)
     model = HypCustomYoloWorld(
         runner.model, unknown_index,
-        hyp_c=hyp_c, hyp_dim=hyp_dim, clip_r=clip_r,
+        hyp_dim=hyp_dim,
         num_classifier_classes=classifier_num_classes,
         init_prototypes=init_prototypes,
-        trainable_prototypes=trainable_prototypes,
         bi_lipschitz=bi_lipschitz,
-        prototype_init_norm=prototype_init_norm,
-        max_proto_norm=max_proto_norm,
-        ce_weight=ce_weight,
+        kappa_init=kappa_init,
+        ema_alpha=ema_alpha,
+        use_projection_head=use_projection_head,
+        vmf_loss_weight=vmf_loss_weight,
         class_balance_smoothing=class_balance_smoothing,
-        beta_reg=beta_reg,
-        lambda_sep=lambda_sep,
-        sep_margin=sep_margin,
+        repulsion_weight=repulsion_weight,
+        repulsion_margin=repulsion_margin,
+        hard_neg_threshold=hard_neg_threshold,
     )
     
     if args.resume_from:
@@ -348,30 +341,18 @@ if __name__ == "__main__":
     raw_model = model.module if isinstance(model, DDP) else model
     
     # Optimizer + LR schedule
-    # Separate param groups: prototypes get their own LR
-    proto_params = []
-    other_params = []
-    for name, param in raw_model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if 'classifier.prototypes' in name:
-            proto_params.append(param)
-        else:
-            other_params.append(param)
+    # In vMF framework, prototypes are EMA-updated buffers (not parameters).
+    # Only log_kappa + projector convs + MLP head are gradient-trained.
+    trainable_params_list = [p for p in raw_model.parameters() if p.requires_grad]
     
     param_groups = [
-        {'params': other_params, 'lr': cfgY.base_lr, 'weight_decay': cfgY.weight_decay},
+        {'params': trainable_params_list, 'lr': cfgY.base_lr, 'weight_decay': cfgY.weight_decay},
     ]
-    if proto_params:
-        param_groups.append(
-            {'params': proto_params, 'lr': prototype_lr, 'weight_decay': 0.0}
-        )
-        print_rank0(f"  Prototype LR: {prototype_lr} (separate group, no weight decay)", rank)
     
-    PROTO_FREEZE_EPOCHS = 0
     optimizer = optim.AdamW(param_groups)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfgY.max_epochs, eta_min=1e-6)
     print_rank0(f"Optimizer: AdamW, base_LR={cfgY.base_lr}, CosineAnnealing", rank)
+    print_rank0(f"  Trainable params: {sum(p.numel() for p in trainable_params_list):,}", rank)
 
     wb = None
     if args.wandb and is_main_process(rank):
@@ -379,7 +360,7 @@ if __name__ == "__main__":
             from wandb_config import WandbLogger
             wb = WandbLogger(
                 name=f"{args.task.replace('/', '_')}_{args.exp_name}_ddp{world_size}", 
-                config={'lr': cfgY.base_lr, 'c': hyp_c, 'world_size': world_size}
+                config={'lr': cfgY.base_lr, 'framework': framework, 'world_size': world_size}
             )
         except Exception as e:
             print(f"WARNING: WandB init failed ({e}), continuing without logging.")
@@ -407,13 +388,6 @@ if __name__ == "__main__":
         
         print_rank0(f"\n=== Epoch {epoch} ===", rank)
 
-        # Prototype freeze/unfreeze
-        if epoch < PROTO_FREEZE_EPOCHS:
-            raw_model.hyp_projector.classifier.prototypes.requires_grad_(False)
-        elif epoch == PROTO_FREEZE_EPOCHS:
-            if trainable_prototypes:
-                raw_model.hyp_projector.classifier.prototypes.requires_grad_(True)
-
         epoch_loss = {'cls': 0, 'dfl': 0, 'bbox': 0, 'geo': 0}
         steps = 0
         
@@ -429,7 +403,7 @@ if __name__ == "__main__":
             head_losses, hyp_loss = model(data['inputs'], data['data_samples'])
             
             loss = (head_losses['loss_cls'] + head_losses['loss_dfl'] + head_losses['loss_bbox'] 
-                    + hyp_loss_weight * hyp_loss)
+                    + vmf_loss_weight * hyp_loss)
             loss.backward()
             
             epoch_loss['cls'] += head_losses['loss_cls'].item()
@@ -444,8 +418,10 @@ if __name__ == "__main__":
                     with torch.no_grad():
                         protos = raw_model.hyp_projector.classifier.prototypes
                         proto_norms = protos.norm(dim=-1)
+                        kappa = raw_model.hyp_projector.classifier.kappa
                         print(f"    [Proto] norms: mean={proto_norms.mean():.4f} "
-                              f"min={proto_norms.min():.4f} max={proto_norms.max():.4f}")
+                              f"(should be ~1.0 on unit sphere)")
+                        print(f"    [Kappa] mean={kappa.mean():.2f} min={kappa.min():.2f} max={kappa.max():.2f}")
                 if wb:
                     wb.log({
                         'cls': head_losses['loss_cls'].item(), 
@@ -454,9 +430,6 @@ if __name__ == "__main__":
                     }, step=gs)
             
             optimizer.step()
-            
-            # Project prototypes back inside ball after optimizer step
-            raw_model.hyp_projector.classifier.project_prototypes_to_ball()
             
             steps += 1
             gs += 1
@@ -467,18 +440,44 @@ if __name__ == "__main__":
         if is_main_process(rank):
             n = max(steps, 1)
             epoch_time = time.time() - epoch_start
+            avg_cls  = epoch_loss['cls'] / n
+            avg_bbox = epoch_loss['bbox'] / n
+            avg_geo  = epoch_loss['geo'] / n
+            cur_lr   = scheduler.get_last_lr()[0]
+            with torch.no_grad():
+                kappa = raw_model.hyp_projector.classifier.kappa
+                kappa_mean = kappa.mean().item()
+                kappa_min  = kappa.min().item()
+                kappa_max  = kappa.max().item()
             print(f"Epoch {epoch} done ({epoch_time/60:.1f} min) | "
-                  f"Avg: cls={epoch_loss['cls']/n:.4f} bbox={epoch_loss['bbox']/n:.4f} geo={epoch_loss['geo']/n:.4f}")
-            print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
+                  f"Avg: cls={avg_cls:.4f} bbox={avg_bbox:.4f} geo={avg_geo:.4f}")
+            print(f"  LR: {cur_lr:.6f}")
+            if wb:
+                wb.log({
+                    'epoch': epoch,
+                    'epoch/cls':  avg_cls,
+                    'epoch/bbox': avg_bbox,
+                    'epoch/geo':  avg_geo,
+                    'epoch/total': avg_cls + avg_bbox + vmf_loss_weight * avg_geo,
+                    'epoch/lr':   cur_lr,
+                    'epoch/kappa_mean': kappa_mean,
+                    'epoch/kappa_min':  kappa_min,
+                    'epoch/kappa_max':  kappa_max,
+                }, step=gs)
             
             # Save checkpoints (rank 0 only)
             hyp_config_save = {
-                'curvature': hyp_c, 'embed_dim': hyp_dim, 'clip_r': clip_r,
+                'framework': 'vmf_spherical',
+                'embed_dim': hyp_dim,
                 'bi_lipschitz': bi_lipschitz,
-                'beta_reg': beta_reg, 'lambda_sep': lambda_sep,
-                'sep_margin': sep_margin, 'prototype_init_norm': prototype_init_norm,
-                'max_proto_norm': max_proto_norm,
-                'framework': 'geodesic_prototypical',
+                'kappa_init': kappa_init,
+                'ema_alpha': ema_alpha,
+                'use_projection_head': use_projection_head,
+                'vmf_loss_weight': vmf_loss_weight,
+                'repulsion_weight': repulsion_weight,
+                'repulsion_margin': repulsion_margin,
+                'hard_neg_threshold': hard_neg_threshold,
+                'class_balance_smoothing': class_balance_smoothing,
             }
             if epoch % 5 == 0:
                 save_model(model, optimizer, epoch, save_dir, hyp_config=hyp_config_save)
@@ -531,7 +530,6 @@ if __name__ == "__main__":
             t2_stats = calibrate(
                 raw_model, cal_loader, class_names,  # full list (global indices)
                 dataset_root='./datasets',
-                hyp_c=hyp_c,
             )
             
             # Merge: base stats from T1, novel stats from T2
@@ -564,20 +562,20 @@ if __name__ == "__main__":
             adaptive_stats = calibrate(
                 raw_model, cal_loader, class_names,
                 dataset_root='./datasets',
-                hyp_c=hyp_c,
             )
         
         hyp_config_dict = {
-            'curvature': hyp_c,
+            'framework': 'vmf_spherical',
             'embed_dim': hyp_dim,
-            'clip_r': clip_r,
             'bi_lipschitz': bi_lipschitz,
-            'beta_reg': beta_reg,
-            'lambda_sep': lambda_sep,
-            'sep_margin': sep_margin,
-            'prototype_init_norm': prototype_init_norm,
-            'max_proto_norm': max_proto_norm,
-            'framework': 'geodesic_prototypical',
+            'kappa_init': kappa_init,
+            'ema_alpha': ema_alpha,
+            'use_projection_head': use_projection_head,
+            'vmf_loss_weight': vmf_loss_weight,
+            'repulsion_weight': repulsion_weight,
+            'repulsion_margin': repulsion_margin,
+            'hard_neg_threshold': hard_neg_threshold,
+            'class_balance_smoothing': class_balance_smoothing,
         }
         
         save_model(model, optimizer, 'final', save_dir,

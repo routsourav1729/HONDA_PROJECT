@@ -12,7 +12,7 @@
 #SBATCH --time=24:00:00
 
 # ============================================================================
-# Hyperbolic YOLO-World Training - SBATCH Script
+# vMF Hyperspherical YOLO-World Training - SBATCH Script
 # ============================================================================
 # Usage:
 #   sbatch train_hyp.sbatch              # T1 training
@@ -28,7 +28,7 @@ TASK="IDD_HYP/$SPLIT"
 PRETRAINED_CKPT="yolo_world_v2_xl_obj365v1_goldg_cc3mlite_pretrain-5daf1395.pth"
 
 echo "=========================================="
-echo "HYPERBOLIC YOLO-WORLD TRAINING"
+echo "vMF HYPERSPHERICAL YOLO-WORLD TRAINING"
 echo "=========================================="
 echo "Job started at: $(date)"
 echo "Running on node: $(hostname)"
@@ -39,8 +39,8 @@ echo "  Task: $TASK"
 echo "  Experiment: $EXP_NAME"
 echo "  Output dir: $TASK/$EXP_NAME"
 echo ""
-echo "NOTE: All hyperbolic params are in configs/IDD_HYP/$SPLIT.py"
-echo "      Edit hyp_config section to change: curvature, embed_dim, clip_r, etc."
+echo "NOTE: All vMF params are in configs/IDD_HYP/$SPLIT.py"
+echo "      Edit hyp_config section to change: kappa_init, embed_dim, ema_alpha, etc."
 echo "=========================================="
 
 # Activate conda environment

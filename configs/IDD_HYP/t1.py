@@ -21,49 +21,42 @@ text_model_name = 'openai/clip-vit-base-patch32'
 ood_threshold = 4.0  # Adjusted for IDD
 
 # =============================================================================
-# Geodesic Prototypical Hyperbolic Configuration
+# vMF Hyperspherical Configuration (SIREN-style)
 # =============================================================================
 hyp_config = dict(
-    # Poincaré ball parameters
-    curvature=1.0,           # c=1.0 means ball radius R=1/√c=1.0
-    embed_dim=64,            # Reduced from 256 → 64 for sharper geometry
+    # Framework identifier
+    framework='vmf_spherical',
     
-    # clip_r: SAFETY clamp on Euclidean norm before expmap0.
-    # L_reg keeps norms small so this rarely triggers.
-    # tanh(2.0) = 0.964, so max Poincaré norm ~0.964.
-    clip_r=2.0,
+    # Embedding dimension (matches projector output)
+    embed_dim=64,
     
-    # Overall hyp loss multiplier
-    hyp_loss_weight=1.0,
+    # Overall vMF loss multiplier
+    vmf_loss_weight=1.5,         # λ_vmf * (CE + repulsion)
     
-    # Geodesic prototype loss components
-    ce_weight=1.0,               # Cross-entropy over -d^2_B scores
+    # vMF classifier parameters
+    kappa_init=10.0,             # Initial concentration (learnable per-class log_kappa)
+    ema_alpha=0.95,              # EMA decay for prototype update
+    
+    # vMF loss components
     class_balance_smoothing=0.5, # sqrt-inverse-frequency weights
     
-    # L_reg: pre-expmap norm regularization (CRITICAL for preventing tanh saturation)
-    # β * mean(||x_hat||^2) where x_hat = projector output before expmap0
-    # Target: keep mean(||x_hat||) around 1-2 so tanh operates in linear range
-    beta_reg=0.1,
-    
-    # L_sep: prototype separation loss
-    # max(0, margin - d_B(z_i, z_j)) for all prototype pairs
-    lambda_sep=1.0,              # Weight for separation loss
-    sep_margin=1.0,              # Minimum geodesic distance between prototypes
+    # Background repulsion for dense anchors (our addition)
+    repulsion_weight=0.5,        # Weight for hinge loss on background anchors
+    repulsion_margin=0.1,        # Margin for cos_sim hinge
+    hard_neg_threshold=0.5,      # cos_sim > this → hard negative
     
     # BiLipschitz projector (SNGP-style spectral-normed residual)
     bi_lipschitz=True,
     
-    # Trainable prototypes — interior points, not on boundary
-    trainable_prototypes=True,
-    prototype_lr=1e-3,           # Separate LR for prototypes (standard Adam, project after step)
-    prototype_init_norm=0.4,     # Initial Poincaré norm for prototypes inside ball\n    max_proto_norm=0.5,          # Hard ceiling on prototype norm (prevents boundary drift)
+    # MLP projection head (SIREN showed +4.37% AUROC)
+    use_projection_head=True,
     
     # Prototype initialization (REQUIRED!)
     # Run: bash scripts/init_protos.sh  (outputs to datasets/prototype/init_protos_t1.pt)
     init_protos='datasets/prototype/init_protos_t1.pt',
     
-    # OOD detection threshold (for inference)
-    ood_threshold=0.0,           # Higher score = more OOD; adjust after calibration
+    # NOTE: OOD threshold is computed via adaptive calibration at end of training
+    # (see calibrate_thresholds.py). No static threshold needed here.
 )
 
 # scaling model from X to XL

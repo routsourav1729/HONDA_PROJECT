@@ -13,7 +13,7 @@
 #SBATCH --time=30:00:00
 
 # ============================================================================
-# Hyperbolic YOLO-World Training - DDP (single or multi-GPU)
+# vMF Hyperspherical YOLO-World Training - DDP (single or multi-GPU)
 # ============================================================================
 # Usage:
 #   sbatch train_hyp_ddp.sbatch              # T1, 1 GPU on a40
@@ -29,7 +29,7 @@ TASK="IDD_HYP/$SPLIT"
 PRETRAINED_CKPT="yolo_world_v2_xl_obj365v1_goldg_cc3mlite_pretrain-5daf1395.pth"
 
 echo "=========================================="
-echo "HYPERBOLIC YOLO-WORLD DDP TRAINING"
+echo "vMF HYPERSPHERICAL YOLO-WORLD DDP TRAINING"
 echo "=========================================="
 echo "Job started at: $(date)"
 echo "Running on node: $(hostname)"

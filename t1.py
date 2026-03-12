@@ -145,21 +145,18 @@ env_cfg = dict(
     dist_cfg=dict(backend='nccl'),
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0))
 hyp_config = dict(
-    beta_reg=0.1,
     bi_lipschitz=True,
-    ce_weight=1.0,
     class_balance_smoothing=0.5,
-    clip_r=2.0,
-    curvature=1.0,
+    ema_alpha=0.95,
     embed_dim=64,
-    hyp_loss_weight=1.0,
+    framework='vmf_spherical',
+    hard_neg_threshold=0.5,
     init_protos='datasets/prototype/init_protos_t1.pt',
-    lambda_sep=1.0,
-    ood_threshold=0.0,
-    prototype_init_norm=0.4,
-    prototype_lr=0.001,
-    sep_margin=1.0,
-    trainable_prototypes=True)
+    kappa_init=10.0,
+    repulsion_margin=0.1,
+    repulsion_weight=0.5,
+    use_projection_head=True,
+    vmf_loss_weight=1.5)
 img_scale = (
     640,
     640,
