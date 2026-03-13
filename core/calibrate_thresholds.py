@@ -1,18 +1,14 @@
 """
 Adaptive Per-Prototype Threshold Calibration.
 
-Runs the model over the training set and collects per-class geodesic distance
-scores from GT-assigned anchors.  These per-class (mean, std) values
+Runs the model over the training set and collects per-class vMF scores
+from GT-assigned anchors.  These per-class (mean, std) values
 define adaptive OOD thresholds:
 
-    tau_k = mean_k + alpha * std_k
-
-Note: In geodesic framework, OOD score = min_k d^2_B (higher = more OOD).
-So threshold direction is REVERSED vs Busemann: score > tau_k -> unknown.
-For per-class calibration, we use max geodesic score (-d^2, higher = more ID)
-and threshold as: score < tau_k -> unknown:
-
     tau_k = mean_k - alpha * std_k
+
+vMF scores = log Z_d(kappa_c) + kappa_c * mu_c^T * r: higher = more ID.
+If max_c score < tau_k -> unknown.
 
 This module is called automatically at the end of training (dev_hyp_ddp.py).
 The resulting stats are embedded in the final checkpoint so that test_hyp.py
@@ -24,7 +20,7 @@ import torch
 from tqdm import tqdm
 from collections import defaultdict
 
-from core.hyperbolic import pmath
+# pmath no longer needed (vMF uses L2-normalized embeddings, no Poincare ops)
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +64,7 @@ def calibrate(model, train_loader, known_class_names, dataset_root=None, hyp_c=1
     dataset_root : str, optional
         Unused (kept for API compatibility).
     hyp_c : float
-        Poincaré ball curvature.
+        Unused (kept for API compatibility with old callers).
     max_batches : int
         Max batches to process (0 = all). Default 0 = full dataset.
         At batch_size=32 with 3001 batches, full pass ~5-8 min (no XML I/O).
@@ -84,8 +80,8 @@ def calibrate(model, train_loader, known_class_names, dataset_root=None, hyp_c=1
     was_training = model.training
     model.eval()
 
-    prototypes = model.prototypes.detach()   # (K, dim) interior points — not used directly
-    # Scoring is done via model.compute_geodesic_scores() which accesses prototypes internally
+    prototypes = model.prototypes.detach()   # (K, dim) unit vectors — scoring handled internally
+    # Scoring is done via model.compute_vmf_scores() which accesses prototypes internally
 
     per_class_scores = defaultdict(list)
     samples_count = defaultdict(int)
@@ -125,7 +121,7 @@ def calibrate(model, train_loader, known_class_names, dataset_root=None, hyp_c=1
                 else:
                     x = model.parent.neck(x)
 
-            hyp_embeddings, _ = model.hyp_projector(x)  # (B, 8400, dim), ignore pre_expmap_norms
+            hyp_embeddings, _ = model.hyp_projector(x)  # (B, 8400, dim), ignore raw_proj
 
             h, w = data_batch['inputs'].shape[-2:]
             anchor_centers = get_anchor_centers(h, w, device=hyp_embeddings.device)
@@ -162,10 +158,10 @@ def calibrate(model, train_loader, known_class_names, dataset_root=None, hyp_c=1
                           - anchor_centers.unsqueeze(0)) ** 2).sum(-1)  # (M, A)
                 nearest_indices = dists.argmin(dim=1)  # (M,)
 
-                # Batch geodesic scores
+                # Batch vMF scores
                 embs = hyp_embeddings[b_idx, nearest_indices]       # (M, dim)
-                geo_scores = model.compute_geodesic_scores(embs)     # (M, K)
-                max_geo = geo_scores.max(dim=-1).values              # (M,)
+                vmf_scores = model.compute_vmf_scores(embs)          # (M, K)
+                max_geo = vmf_scores.max(dim=-1).values              # (M,)
 
                 # Accumulate per-class
                 for j in range(len(labels)):

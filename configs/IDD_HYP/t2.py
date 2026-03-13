@@ -19,32 +19,43 @@ train_batch_size_per_gpu = 16  # Must match trlder.batch_size below
 affine_scale = 0.5
 max_aspect_ratio = 120
 text_model_name = 'openai/clip-vit-base-patch32'
-ood_threshold = 4.0  # Same as T1
-
 # =============================================================================
-# Horospherical/Hyperbolic Configuration for T2
+# vMF Hyperspherical Configuration for T2 (MUST match T1 embed_dim!)
 # =============================================================================
 hyp_config = dict(
-    # Poincaré ball parameters (MUST match T1!)
-    curvature=1.0,           # c=1.0 means ball radius R=1/√c=1.0
-    embed_dim=256,           # Hyperbolic embedding dimension
-    clip_r=1.0,              # Must match T1
-    
-    # Loss weights
-    hyp_loss_weight=1.0,     # Weight for horospherical CE loss
-    dispersion_weight=0.1,   # T2: enable cross-dispersion to separate new from frozen
-    bias_reg_weight=0.1,     # L2 penalty on biases
-    compactness_weight=0.05, # Mild compactness (match T1)
-    
-    # Prototype initialization for NEW classes (6 novel)
-    # Run: python init_prototypes.py --classes "bus,truck,tanker_vehicle,crane_truck,street_cart,excavator" --output init_protos_t2.pt
-    init_protos='init_protos_t2.pt',
-    
-    # Previous task checkpoint (T1 model)
-    prev_ckpt='IDD_HYP/t1/horo_2conv/model_final.pth',
-    
-    # OOD detection threshold (for inference)
-    ood_threshold=0.0,       # Adjust after calibration
+    # Framework identifier (MUST match T1)
+    framework='vmf_spherical',
+
+    # Embedding dimension — MUST match T1's projector output
+    embed_dim=64,
+
+    # Overall vMF loss multiplier
+    vmf_loss_weight=1.5,
+
+    # vMF classifier parameters (MUST match T1)
+    kappa_init=10.0,             # Initial concentration for novel-class log_kappa
+    ema_alpha=0.95,              # EMA decay for prototype update
+
+    # vMF loss components
+    class_balance_smoothing=0.5,
+
+    # Background repulsion for dense anchors
+    repulsion_weight=0.5,
+    repulsion_margin=0.1,
+    hard_neg_threshold=0.5,
+
+    # BiLipschitz projector (MUST match T1 architecture)
+    bi_lipschitz=True,
+
+    # MLP projection head (MUST match T1)
+    use_projection_head=True,
+
+    # Prototype initialization for NOVEL classes (6 novel)
+    # Generated via: bash scripts/init_protos.sh t2
+    init_protos='datasets/prototype/init_protos_t2.pt',
+
+    # Previous task checkpoint (T1 model) — frozen base prototypes loaded from here
+    prev_ckpt='IDD_HYP/t1/vmf_v1/model_final.pth',
 )
 
 # scaling model from X to XL

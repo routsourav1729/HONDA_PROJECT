@@ -12,17 +12,16 @@
 #SBATCH --time=01:00:00
 
 # ============================================================================
-# Hyperbolic YOLO-World Evaluation
+# vMF Hyperspherical YOLO-World Evaluation
 # ============================================================================
 # Everything is loaded from the checkpoint:
-#   - hyp_config (curvature, embed_dim, clip_r)
-#   - adaptive_stats (per-class thresholds)
-# Just point CKPT to the model and run.
+#   - hyp_config (framework, embed_dim, kappa_init, ema_alpha, ...)
+#   - adaptive_stats (per-class calibration thresholds)
+# Just point CKPT to model_final.pth and run.
 # ============================================================================
 
 TASK="IDD_HYP/t1"
-# CKPT="IDD_HYP/t1/horo_2conv/model_final.pth"  # V1 (dim=256)
-CKPT="IDD_HYP/t1/geodesic_v1/model_final.pth"        # V2 (dim=64)
+CKPT="IDD_HYP/t1/vmf_v1/model_final.pth"
 
 
 # Optional: override alpha (default=0.75 from calibration)
@@ -30,7 +29,7 @@ CKPT="IDD_HYP/t1/geodesic_v1/model_final.pth"        # V2 (dim=64)
 ALPHA_ARG=""
 
 echo "=========================================="
-echo "HYPERBOLIC YOLO-WORLD EVALUATION"
+echo "vMF HYPERSPHERICAL YOLO-WORLD EVALUATION"
 echo "=========================================="
 echo "Job started at: $(date)"
 echo "Checkpoint: $CKPT"
