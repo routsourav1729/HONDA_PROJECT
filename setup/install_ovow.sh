@@ -1,22 +1,19 @@
 #!/bin/bash
-# OVOW Environment Installation Script - FINAL WORKING VERSION
-# Tested and confirmed working on Jan 27, 2026
-# Based on actual successful deployment for IDD T1 training
 
 set -e  # Exit on error
 
 echo "=========================================="
-echo "  Installing OVOW Environment"
+echo "  Installing  Environment"
 echo "  Final Working Configuration"
 echo "=========================================="
 
 # Step 1: Create conda environment with Python 3.11
-echo "[1/13] Creating conda environment 'ovow' with Python 3.11..."
-conda create -n ovow python=3.11 -y
+echo "[1/13] Creating conda environment 'hypyolo' with Python 3.11..."
+conda create -n hypyolo python=3.11 -y
 
 # Activate environment
 eval "$(conda shell.bash hook)"
-conda activate ovow
+conda activate hypyolo
 
 # Step 2: Install PyTorch 2.1.0 with CUDA 12.1 (CRITICAL: Must be 2.1.0 for mmcv compatibility)
 echo "[2/13] Installing PyTorch 2.1.0+cu121..."
@@ -110,10 +107,10 @@ echo "  - CLIP, supervision, wandb"
 echo "  - LD_LIBRARY_PATH configured automatically"
 echo ""
 echo "To activate the environment:"
-echo "  conda activate ovow"
+echo "  conda activate hypyolo"
 echo ""
 echo "To verify installation:"
-echo "  conda deactivate && conda activate ovow  # Reload environment to apply library path"
+echo "  conda deactivate && conda activate hypyolo  # Reload environment to apply library path"
 echo "  python -c 'import torch; print(f\"PyTorch: {torch.__version__}\")'"
 echo "  python -c 'import mmcv; print(f\"mmcv: {mmcv.__version__}\")'"
 echo "  python -c 'import mmdet; print(f\"mmdet: {mmdet.__version__}\")'"
@@ -121,8 +118,8 @@ echo "  python -c 'import mmyolo; print(f\"mmyolo: {mmyolo.__version__}\")'"
 echo "  python -c 'import detectron2; print(f\"detectron2: {detectron2.__version__}\")'"
 echo ""
 echo "To start training:"
-echo "  conda activate ovow"
-echo "  cd /path/to/ovow"
+echo "  conda activate hypyolo"
+echo "  cd /path/to/hypyolo"
 echo "  CUDA_VISIBLE_DEVICES=0 bash train.sh"
 echo ""
 

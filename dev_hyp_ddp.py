@@ -31,6 +31,7 @@ from core.pascal_voc import register_pascal_voc, inital_prompts
 from core.hyp_customyoloworld import HypCustomYoloWorld, load_hyp_ckpt
 from core.calibrate_thresholds import calibrate
 from core.eval_utils import Trainer
+from core.gpm import compute_gpm_bases, precompute_projection_matrices, project_gradients
 
 from mmengine.config import Config
 from mmengine.runner import Runner
@@ -260,6 +261,11 @@ if __name__ == "__main__":
     init_protos_path = args.init_protos if args.init_protos is not None else hyp_cfg.get('init_protos', '')
     prev_ckpt = args.ckpt if args.ckpt else hyp_cfg.get('prev_ckpt', '')
     bi_lipschitz = hyp_cfg.get('bi_lipschitz', True)
+
+    # GPM config
+    use_gpm = hyp_cfg.get('use_gpm', False)
+    gpm_threshold = hyp_cfg.get('gpm_threshold', 0.97)
+    gpm_max_batches = hyp_cfg.get('gpm_max_batches', 20)
     
     print_rank0(f"\n=== vMF Hyperspherical Config ===", rank)
     print_rank0(f"  framework: {framework}, embed_dim: {hyp_dim}", rank)
@@ -272,7 +278,15 @@ if __name__ == "__main__":
     if init_protos_path and os.path.exists(init_protos_path):
         proto_data = torch.load(init_protos_path)
         init_prototypes = proto_data['init_directions']
-        print_rank0(f"  Loaded {init_prototypes.shape[0]} prototype directions", rank)
+        if init_prototypes.shape[-1] != hyp_dim:
+            print_rank0(
+                f"WARNING: init_protos dim mismatch ({init_prototypes.shape[-1]} != hyp_dim {hyp_dim}). "
+                "Ignoring init_protos and using classifier random initialization for novel classes.",
+                rank,
+            )
+            init_prototypes = None
+        else:
+            print_rank0(f"  Loaded {init_prototypes.shape[0]} prototype directions", rank)
     elif init_protos_path:
         print_rank0(f"ERROR: init_protos not found: {init_protos_path}", rank)
         cleanup_ddp()
@@ -307,6 +321,15 @@ if __name__ == "__main__":
         model = load_hyp_ckpt(model, args.resume_from, cfg.TEST.PREV_INTRODUCED_CLS, cfg.TEST.CUR_INTRODUCED_CLS)
     elif cfg.TEST.PREV_INTRODUCED_CLS > 0:
         ckpt_path = prev_ckpt if prev_ckpt else args.ckpt
+        if not ckpt_path:
+            print_rank0("ERROR: T2+ training requires a previous-task checkpoint (--ckpt).", rank)
+            cleanup_ddp()
+            exit(1)
+        if not os.path.exists(ckpt_path):
+            print_rank0(f"ERROR: T2+ checkpoint not found: {ckpt_path}", rank)
+            cleanup_ddp()
+            exit(1)
+        print_rank0(f"Loading T2 initialization checkpoint: {ckpt_path}", rank)
         model = load_hyp_ckpt(model, ckpt_path, cfg.TEST.PREV_INTRODUCED_CLS, cfg.TEST.CUR_INTRODUCED_CLS)
     
     model = model.to(device)
@@ -315,8 +338,30 @@ if __name__ == "__main__":
     trainable = ['embeddings']
     for name, param in model.named_parameters():
         param.requires_grad = name in trainable
-    model.enable_projector_grad(cfg.TEST.PREV_INTRODUCED_CLS)
-    
+    model.enable_projector_grad(cfg.TEST.PREV_INTRODUCED_CLS, use_gpm=use_gpm)
+
+    save_dir = os.path.join(args.task, args.exp_name if args.exp_name else "horospherical")
+
+    # GPM: load or compute projection matrices for T2
+    gpm_proj_matrices = None
+    if use_gpm and prev_cls > 0:
+        gpm_bases_path = hyp_cfg.get('gpm_bases_path', '')
+        if gpm_bases_path and os.path.exists(gpm_bases_path):
+            print_rank0(f"[GPM] Loading pre-computed bases from {gpm_bases_path}", rank)
+            gpm_bases = torch.load(gpm_bases_path, map_location=device)
+        else:
+            print_rank0(f"[GPM] Computing bases from T1 data (threshold={gpm_threshold})...", rank)
+            gpm_bases = compute_gpm_bases(
+                model, train_loader, threshold=gpm_threshold,
+                max_batches=gpm_max_batches, device=device)
+            if is_main_process(rank):
+                save_path = os.path.join(save_dir, 'gpm_bases.pt')
+                os.makedirs(save_dir, exist_ok=True)
+                torch.save(gpm_bases, save_path)
+                print(f"[GPM] Saved bases to {save_path}")
+        gpm_proj_matrices = precompute_projection_matrices(gpm_bases)
+        print_rank0(f"[GPM] Projection matrices ready for {len(gpm_proj_matrices)} layers", rank)
+
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print_rank0(f"Trainable: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)", rank)
@@ -371,7 +416,6 @@ if __name__ == "__main__":
         start_epoch = load_checkpoint(model, optimizer, args.resume_from)
 
     model.train()
-    save_dir = os.path.join(args.task, args.exp_name if args.exp_name else "horospherical")
     print_rank0(f"Save directory: {save_dir}", rank)
     
     gs = 0
@@ -405,7 +449,11 @@ if __name__ == "__main__":
             loss = (head_losses['loss_cls'] + head_losses['loss_dfl'] + head_losses['loss_bbox'] 
                     + vmf_loss_weight * hyp_loss)
             loss.backward()
-            
+
+            # GPM: project out base-class subspace from conv gradients
+            if gpm_proj_matrices is not None:
+                project_gradients(raw_model, gpm_proj_matrices)
+
             epoch_loss['cls'] += head_losses['loss_cls'].item()
             epoch_loss['dfl'] += head_losses['loss_dfl'].item()
             epoch_loss['bbox'] += head_losses['loss_bbox'].item()

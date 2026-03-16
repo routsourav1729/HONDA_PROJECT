@@ -56,6 +56,13 @@ hyp_config = dict(
 
     # Previous task checkpoint (T1 model) — frozen base prototypes loaded from here
     prev_ckpt='IDD_HYP/t1/vmf_v1/model_final.pth',
+
+    # GPM (Gradient Projection Memory) — protects base-class conv subspace during T2
+    # Bases are auto-computed by train_hyp.sh before training if not present.
+    use_gpm=True,
+    gpm_threshold=0.97,
+    gpm_max_batches=20,
+    gpm_bases_path='IDD_HYP/t1/vmf_v1/gpm_bases.pt',
 )
 
 # scaling model from X to XL

@@ -1,32 +1,32 @@
 #!/bin/bash
-#SBATCH --job-name=hyp_t1
+#SBATCH --job-name=hyp_t2_fs
 #SBATCH --output=slurm_logs/hyp_ddp_%j.out
 #SBATCH --error=slurm_logs/hyp_ddp_%j.err
-#SBATCH --partition=dgx
-#SBATCH --qos=dgx
+#SBATCH --partition=l40
+#SBATCH --qos=l40
 #SBATCH --exclude=cn15-dgx
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:2
-#SBATCH --mem=128G
-#SBATCH --time=30:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --mem=64G
+#SBATCH --time=10:00:00
 
 # ============================================================================
 # vMF Hyperspherical YOLO-World Training - DDP (single or multi-GPU)
 # ============================================================================
 # Usage:
-#   sbatch train_hyp_ddp.sbatch              # T1, 1 GPU on a40
-#   sbatch train_hyp_ddp.sbatch t1 my_exp    # T1, custom exp name
+#   sbatch train_hyp_ddp.sbatch                          # T2 few-shot (default)
+#   sbatch train_hyp_ddp.sbatch t2 vmf_t2_fs 2 IDD_HYP/t1/vmf_v1/model_final.pth
 # ============================================================================
 
 # Arguments
-SPLIT=${1:-t1}
-EXP_NAME=${2:-hyp_v2}
-NUM_GPUS=${3:-2}
+SPLIT=${1:-t2}
+EXP_NAME=${2:-vmf_t2_fs}
+NUM_GPUS=${3:-1}
+T2_CKPT=${4:-IDD_HYP/t1/vmf_v1/model_final.pth}
 
 TASK="IDD_HYP/$SPLIT"
-PRETRAINED_CKPT="yolo_world_v2_xl_obj365v1_goldg_cc3mlite_pretrain-5daf1395.pth"
 
 echo "=========================================="
 echo "vMF HYPERSPHERICAL YOLO-WORLD DDP TRAINING"
@@ -39,6 +39,7 @@ echo "Configuration:"
 echo "  Task: $TASK"
 echo "  Experiment: $EXP_NAME"
 echo "  GPUs: $NUM_GPUS"
+echo "  T2 init ckpt: $T2_CKPT"
 echo "  Output dir: $TASK/$EXP_NAME"
 echo "=========================================="
 
@@ -87,7 +88,7 @@ echo "=========================================="
 echo "Starting DDP TRAINING with $NUM_GPUS GPUs"
 echo "=========================================="
 
-bash scripts/train_hyp.sh $NUM_GPUS $MASTER_PORT $EXP_NAME
+bash scripts/train_hyp.sh $SPLIT $NUM_GPUS $MASTER_PORT $EXP_NAME $T2_CKPT
 
 echo ""
 echo "=========================================="

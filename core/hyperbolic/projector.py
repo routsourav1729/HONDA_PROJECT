@@ -274,7 +274,8 @@ class vMFLoss(nn.Module):
 
         # ==== 1. vMF Classification Loss (foreground only) ====
         if fg_mask.sum() == 0:
-            vmf_loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
+            # Keep graph connectivity for DDP even when a batch has no foreground.
+            vmf_loss = logits.sum() * 0.0
         else:
             fg_logits = logits[fg_mask]  # (N_fg, K)
             fg_labels = labels[fg_mask]  # (N_fg,)
@@ -295,12 +296,14 @@ class vMFLoss(nn.Module):
                 hard_cos = max_cos_sim[hard_mask]
                 repulsion_loss = torch.clamp(hard_cos - self.repulsion_margin, min=0).mean()
             else:
-                repulsion_loss = torch.tensor(0.0, device=logits.device)
+                # Preserve graph path for DDP when no hard negatives are present.
+                repulsion_loss = max_cos_sim.sum() * 0.0
 
             loss_dict['n_hard_bg'] = hard_mask.sum().item()
             loss_dict['bg_max_cos_mean'] = max_cos_sim.mean().item()
         else:
-            repulsion_loss = torch.tensor(0.0, device=logits.device)
+            # Preserve graph path for DDP when no background anchors are present.
+            repulsion_loss = embeddings.sum() * 0.0
             loss_dict['n_hard_bg'] = 0
             loss_dict['bg_max_cos_mean'] = 0.0
 

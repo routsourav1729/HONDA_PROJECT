@@ -31,10 +31,9 @@ python test_hyp.py \
 # Few-shot fine-tuned model with merged calibration (T1 base + T2 novel)
 # ============================================================================
 
-
-# T2_EXP=${T2_EXP:-"fewshotfinetunev3"}
-# python test_hyp.py \
-#     --task ${BENCHMARK}/t2 \
-#     --config-file configs/${BENCHMARK}/t2.yaml \
-#     --ckpt ${BENCHMARK}/t2/${T2_EXP}/model_final.pth
+T2_EXP=${T2_EXP:-$EXP}
+python test_hyp.py \
+    --task ${BENCHMARK}/t2 \
+    --config-file configs/${BENCHMARK}/t2.yaml \
+    --ckpt ${BENCHMARK}/t2/${T2_EXP}/model_final.pth
 

@@ -20,13 +20,18 @@
 # Just point CKPT to model_final.pth and run.
 # ============================================================================
 
-TASK="IDD_HYP/t1"
-CKPT="IDD_HYP/t1/vmf_v1/model_final.pth"
+TASK=${1:-"IDD_HYP/t1"}
+CKPT=${2:-"IDD_HYP/t1/vmf_v1/model_final.pth"}
 
 
 # Optional: override alpha (default=0.75 from calibration)
-# ALPHA_ARG="--alpha 1.0"
-ALPHA_ARG=""
+# Usage: sbatch scripts/test_hyp.sbatch IDD_HYP/t2 IDD_HYP/t2/vmf_t2_fs/model_final.pth 1.0
+ALPHA=${3:-""}
+if [ -n "$ALPHA" ]; then
+    ALPHA_ARG="--alpha $ALPHA"
+else
+    ALPHA_ARG=""
+fi
 
 echo "=========================================="
 echo "vMF HYPERSPHERICAL YOLO-WORLD EVALUATION"

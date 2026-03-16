@@ -617,8 +617,13 @@ class HypCustomYoloWorld(nn.Module):
 
         return results
 
-    def enable_projector_grad(self, index):
-        """Enable gradients for training."""
+    def enable_projector_grad(self, index, use_gpm=False):
+        """Enable gradients for training.
+
+        Args:
+            index: PREV_INTRODUCED_CLS (0 for T1, >0 for T2+)
+            use_gpm: If True, unfreeze all projector params (GPM protects convs externally)
+        """
         if index == 0:
             # T1: Train projector convs + MLP head + log_kappa
             # Prototypes are EMA-updated (no grad needed, they are buffers)
@@ -629,6 +634,14 @@ class HypCustomYoloWorld(nn.Module):
             print(f"  [T1] Training projector convs + MLP head + log_kappa (kappa trainable={kappa_trainable})")
             print(f"  [T1] Prototypes updated via EMA (not gradient)")
             print(f"  [T1] Total trainable params: {n_trainable:,}")
+        elif use_gpm:
+            # T2+ with GPM: unfreeze all projector params
+            # GPM gradient projection protects conv weights externally
+            for p in self.hyp_projector.parameters():
+                p.requires_grad = True
+            n_trainable = sum(p.numel() for p in self.hyp_projector.parameters() if p.requires_grad)
+            print(f"  [T2+GPM] All projector params trainable (GPM protects base subspace)")
+            print(f"  [T2+GPM] Total trainable params: {n_trainable:,}")
         else:
             # T2+: Freeze Conv + MLP, train only log_kappa (novel)
             # Novel prototypes updated via EMA

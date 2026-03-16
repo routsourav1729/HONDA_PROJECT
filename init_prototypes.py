@@ -267,22 +267,78 @@ def main():
         'mode': 'all',
     }
 
-    # T2+ mode: extract novel-only directions
+    # T2+ mode: Procrustes-aligned novel directions
     if args.base_protos and args.num_base > 0:
-        print(f"\n=== T2 Mode: Extracting novel directions only ===")
+        print(f"\n=== T2 Mode: Procrustes-aligned novel prototypes ===")
         ckpt = torch.load(args.base_protos, map_location='cpu')
         state = ckpt.get('model_state_dict', ckpt)
-        base_dir_key = next((k for k in state if 'prototype_direction' in k), None)
-        assert base_dir_key is not None, f"No prototype_direction found in {args.base_protos}"
-        trained_base = F.normalize(state[base_dir_key][:args.num_base], dim=-1)
-        novel_directions = init_directions[args.num_base:]
+
+        # Load trained T1 prototypes (try vMF key first, then legacy)
+        trained_base = None
+        for key in ['hyp_projector.classifier.prototypes',
+                     'hyp_projector.classifier.prototype_direction']:
+            if key in state:
+                trained_base = F.normalize(state[key][:args.num_base].float(), dim=-1)
+                print(f"  Loaded trained base prototypes from '{key}': {trained_base.shape}")
+                break
+        if trained_base is None:
+            # Try frozen_prototypes or frozen_directions
+            for key in ['frozen_prototypes', 'frozen_directions']:
+                if key in state:
+                    trained_base = F.normalize(state[key][:args.num_base].float(), dim=-1)
+                    print(f"  Loaded trained base prototypes from '{key}': {trained_base.shape}")
+                    break
+        assert trained_base is not None, (
+            f"No prototypes found in {args.base_protos}. "
+            f"Available keys: {[k for k in state if 'proto' in k.lower() or 'direction' in k.lower()]}"
+        )
+        assert trained_base.shape[-1] == D, (
+            f"Trained prototype dim {trained_base.shape[-1]} != out_dim {D}. "
+            f"Ensure --out_dim matches the T1 training embed_dim."
+        )
+
+        # GW-OT positions for all 14 classes
+        gw_base = init_directions[:args.num_base]    # (8, D)
+        gw_novel = init_directions[args.num_base:]   # (6, D)
+
+        # Procrustes: find orthogonal R such that R @ gw_base^T ≈ trained_base^T
+        # Minimize ||trained_base - gw_base @ R^T||^2
+        # Solution: R = V @ U^T where M = trained_base^T @ gw_base = U S V^T
+        M = trained_base.T @ gw_base  # (D, D)
+        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+        # Handle reflection: ensure det(R) > 0
+        det_sign = torch.sign(torch.linalg.det(U @ Vh))
+        Vh[-1] *= det_sign
+        R = U @ Vh  # (D, D) orthogonal rotation matrix
+
+        # Apply rotation to novel GW-OT positions
+        novel_rotated = (R @ gw_novel.T).T  # (6, D)
+        novel_directions = F.normalize(novel_rotated, dim=-1)
+
+        # Verify: how well does R align base prototypes?
+        base_aligned = F.normalize((R @ gw_base.T).T, dim=-1)
+        base_cos = (base_aligned * trained_base).sum(dim=-1)
+        print(f"\n  Procrustes alignment quality (base cos_sim):")
+        for i, name in enumerate(class_names[:args.num_base]):
+            print(f"    {name:<20s}: cos_sim = {base_cos[i]:.4f}")
+        print(f"    Mean: {base_cos.mean():.4f}")
+
+        # Cross-similarity between novel and trained base
         cross_sim = (novel_directions @ trained_base.T).abs()
-        print(f"  Base: {args.num_base}, Novel: {novel_directions.shape[0]}")
-        print(f"  Cross |cos_sim|: max={cross_sim.max():.4f}, mean={cross_sim.mean():.4f}")
+        print(f"\n  Novel-Base cross |cos_sim|: max={cross_sim.max():.4f}, mean={cross_sim.mean():.4f}")
+
+        # Novel-novel similarity
+        novel_sim = novel_directions @ novel_directions.T
+        novel_mask = ~torch.eye(novel_directions.shape[0], dtype=torch.bool)
+        print(f"  Novel-Novel cos_sim: max={novel_sim[novel_mask].max():.4f}, mean={novel_sim[novel_mask].mean():.4f}")
+
         save_dict['init_directions'] = novel_directions
         save_dict['base_directions'] = trained_base
+        save_dict['gw_base'] = gw_base
+        save_dict['gw_novel'] = gw_novel
+        save_dict['procrustes_R'] = R
         save_dict['num_base'] = args.num_base
-        save_dict['mode'] = 'novel_only'
+        save_dict['mode'] = 'novel_only_procrustes'
 
     torch.save(save_dict, args.output)
     print(f"\n✓ Saved to: {args.output}")

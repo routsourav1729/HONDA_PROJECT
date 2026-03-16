@@ -224,6 +224,120 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
         
         return unknown_class_stats
 
+    def compute_unknown_known_confusion(self, predictions, iou_thresh=0.5):
+        with PathManager.open(self._image_set_path, "r") as f:
+            lines = f.readlines()
+        imagenames = [x.strip() for x in lines]
+
+        mapping = {}
+        recs = {}
+        for imagename in imagenames:
+            rec = parse_rec(self._anno_file_template.format(imagename), tuple(self.known_classes))
+            if rec is None:
+                continue
+            recs[imagename] = rec
+            try:
+                mapping[int(imagename)] = imagename
+            except ValueError:
+                continue
+
+        unknown_objs_by_image = {}
+        unknown_gt_totals = defaultdict(int)
+        for imagename, rec in recs.items():
+            objs = [obj for obj in rec if obj["name"] == "unknown" and not obj["difficult"]]
+            unknown_objs_by_image[imagename] = objs
+            for obj in objs:
+                unknown_gt_totals[obj["original_name"]] += 1
+
+        det_confusion = defaultdict(lambda: defaultdict(int))
+        det_confusion_by_known = defaultdict(int)
+        best_known_per_unknown_gt = {}
+
+        for cls_id in range(self.num_seen_classes):
+            cls_name = self._class_names[cls_id]
+            lines = predictions.get(cls_id, [])
+            for line in lines:
+                splitline = line.strip().split(" ")
+                if len(splitline) < 6:
+                    continue
+
+                try:
+                    image_id = int(splitline[0])
+                except ValueError:
+                    continue
+
+                imagename = mapping.get(image_id)
+                if imagename is None:
+                    continue
+
+                unknown_objs = unknown_objs_by_image.get(imagename, [])
+                if len(unknown_objs) == 0:
+                    continue
+
+                try:
+                    score = float(splitline[1])
+                    bb = np.array([float(z) for z in splitline[2:6]], dtype=float)
+                except ValueError:
+                    continue
+
+                unknown_bboxes = np.array([x["bbox"] for x in unknown_objs], dtype=float)
+                ixmin = np.maximum(unknown_bboxes[:, 0], bb[0])
+                iymin = np.maximum(unknown_bboxes[:, 1], bb[1])
+                ixmax = np.minimum(unknown_bboxes[:, 2], bb[2])
+                iymax = np.minimum(unknown_bboxes[:, 3], bb[3])
+                iw = np.maximum(ixmax - ixmin + 1.0, 0.0)
+                ih = np.maximum(iymax - iymin + 1.0, 0.0)
+                inters = iw * ih
+
+                uni = (
+                    (bb[2] - bb[0] + 1.0) * (bb[3] - bb[1] + 1.0)
+                    + (unknown_bboxes[:, 2] - unknown_bboxes[:, 0] + 1.0)
+                    * (unknown_bboxes[:, 3] - unknown_bboxes[:, 1] + 1.0)
+                    - inters
+                )
+                overlaps = inters / np.maximum(uni, np.finfo(np.float64).eps)
+
+                jmax = int(np.argmax(overlaps))
+                ovmax = float(overlaps[jmax])
+                if ovmax <= iou_thresh:
+                    continue
+
+                original_name = unknown_objs[jmax]["original_name"]
+                det_confusion[original_name][cls_name] += 1
+                det_confusion_by_known[cls_name] += 1
+
+                gt_key = (imagename, jmax)
+                best_prev = best_known_per_unknown_gt.get(gt_key)
+                if best_prev is None or score > best_prev["score"]:
+                    best_known_per_unknown_gt[gt_key] = {
+                        "score": score,
+                        "known_cls": cls_name,
+                        "original_name": original_name,
+                    }
+
+        gt_confusion = defaultdict(lambda: defaultdict(int))
+        gt_misclassified_by_unknown = defaultdict(int)
+        for _, item in best_known_per_unknown_gt.items():
+            original_name = item["original_name"]
+            known_cls = item["known_cls"]
+            gt_confusion[original_name][known_cls] += 1
+            gt_misclassified_by_unknown[original_name] += 1
+
+        total_unknown_gt = int(sum(unknown_gt_totals.values()))
+        total_gt_misclassified = int(sum(gt_misclassified_by_unknown.values()))
+        total_det_misclassified = int(sum(det_confusion_by_known.values()))
+
+        return {
+            "unknown_gt_totals": unknown_gt_totals,
+            "gt_confusion": gt_confusion,
+            "gt_misclassified_by_unknown": gt_misclassified_by_unknown,
+            "det_confusion": det_confusion,
+            "det_confusion_by_known": det_confusion_by_known,
+            "total_unknown_gt": total_unknown_gt,
+            "total_gt_misclassified": total_gt_misclassified,
+            "total_det_misclassified": total_det_misclassified,
+        }
+
     def compute_WI_at_many_recall_level(self, recalls, tp_plus_fp_cs, fp_os):
         wi_at_recall = {}
         for r in range(1, 10):
@@ -328,6 +442,113 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
         total_num_unk = num_unks[50][0]
         self._logger.info('Absolute OSE (total_num_unk_det_as_known): ' + str(total_num_unk_det_as_known))
         self._logger.info('total_num_unk ' + str(total_num_unk))
+
+        self._logger.info("\n" + "=" * 80)
+        self._logger.info("AOSE@50 BY PREDICTED KNOWN CLASS")
+        self._logger.info("=" * 80)
+        self._logger.info(f"{'Known Class':25s} {'Count':>10s} {'% AOSE@50':>12s}")
+        self._logger.info("-" * 80)
+
+        aose_50_total = float(total_num_unk_det_as_known.get(50, 0.0))
+        class_counts = []
+        for cls_id in range(self.num_seen_classes):
+            cls_name = self._class_names[cls_id]
+            cls_count = float(unk_det_as_knowns[50][cls_id])
+            class_counts.append((cls_name, cls_count))
+
+        class_counts = sorted(class_counts, key=lambda x: x[1], reverse=True)
+        for cls_name, cls_count in class_counts:
+            pct = (100.0 * cls_count / aose_50_total) if aose_50_total > 0 else 0.0
+            self._logger.info(f"{cls_name:25s} {int(cls_count):10d} {pct:12.2f}")
+
+        self._logger.info("-" * 80)
+        self._logger.info(f"{'TOTAL':25s} {int(aose_50_total):10d} {100.0 if aose_50_total > 0 else 0.0:12.2f}")
+        self._logger.info("=" * 80)
+
+        unk_known_stats = self.compute_unknown_known_confusion(predictions, iou_thresh=0.5)
+
+        self._logger.info("\n" + "=" * 80)
+        self._logger.info("UNKNOWN-ORIGIN -> KNOWN MISCLASSIFICATION (GT-LEVEL)")
+        self._logger.info("=" * 80)
+        self._logger.info(
+            f"{'Unknown Class':20s} {'Total GT':>9s} {'Miscls GT':>10s} {'Miscls %':>10s} {'Top Known Class':20s} {'Top %':>8s}"
+        )
+        self._logger.info("-" * 80)
+
+        unknown_gt_totals = unk_known_stats["unknown_gt_totals"]
+        gt_misclassified_by_unknown = unk_known_stats["gt_misclassified_by_unknown"]
+        gt_confusion = unk_known_stats["gt_confusion"]
+
+        for unk_cls in sorted(unknown_gt_totals.keys()):
+            total_gt = int(unknown_gt_totals[unk_cls])
+            mis_gt = int(gt_misclassified_by_unknown.get(unk_cls, 0))
+            mis_pct = (100.0 * mis_gt / total_gt) if total_gt > 0 else 0.0
+
+            top_known = "-"
+            top_pct = 0.0
+            if len(gt_confusion[unk_cls]) > 0:
+                top_known, top_count = max(gt_confusion[unk_cls].items(), key=lambda x: x[1])
+                top_pct = (100.0 * top_count / mis_gt) if mis_gt > 0 else 0.0
+
+            self._logger.info(
+                f"{unk_cls:20s} {total_gt:9d} {mis_gt:10d} {mis_pct:10.2f} {top_known:20s} {top_pct:8.2f}"
+            )
+
+        total_unknown_gt = int(unk_known_stats["total_unknown_gt"])
+        total_gt_misclassified = int(unk_known_stats["total_gt_misclassified"])
+        total_gt_mis_pct = (100.0 * total_gt_misclassified / total_unknown_gt) if total_unknown_gt > 0 else 0.0
+        self._logger.info("-" * 80)
+        self._logger.info(
+            f"{'TOTAL':20s} {total_unknown_gt:9d} {total_gt_misclassified:10d} {total_gt_mis_pct:10.2f} {'-':20s} {0.0:8.2f}"
+        )
+        self._logger.info("=" * 80)
+
+        self._logger.info("\n" + "=" * 80)
+        self._logger.info("TOP UNKNOWN->KNOWN CONFUSIONS (GT-LEVEL)")
+        self._logger.info("=" * 80)
+        flat_confusions = []
+        for unk_cls, known_map in gt_confusion.items():
+            for known_cls, cnt in known_map.items():
+                flat_confusions.append((unk_cls, known_cls, int(cnt)))
+        flat_confusions = sorted(flat_confusions, key=lambda x: x[2], reverse=True)
+        if len(flat_confusions) == 0:
+            self._logger.info("No unknown->known GT-level confusions found.")
+        else:
+            self._logger.info(f"{'Unknown Class':20s} {'Pred Known':20s} {'Count':>10s} {'% of GT-miscls':>15s}")
+            self._logger.info("-" * 80)
+            denom = float(total_gt_misclassified) if total_gt_misclassified > 0 else 1.0
+            for unk_cls, known_cls, cnt in flat_confusions[:25]:
+                pct = 100.0 * cnt / denom
+                self._logger.info(f"{unk_cls:20s} {known_cls:20s} {cnt:10d} {pct:15.2f}")
+        self._logger.info("=" * 80)
+
+        self._logger.info("\\n" + "=" * 80)
+        self._logger.info("TOP UNKNOWN->KNOWN CONFUSIONS (DETECTION-LEVEL)")
+        self._logger.info("=" * 80)
+        det_confusion = unk_known_stats["det_confusion"]
+        total_det_misclassified = int(unk_known_stats["total_det_misclassified"])
+        flat_det_confusions = []
+        for unk_cls, known_map in det_confusion.items():
+            for known_cls, cnt in known_map.items():
+                flat_det_confusions.append((unk_cls, known_cls, int(cnt)))
+        flat_det_confusions = sorted(flat_det_confusions, key=lambda x: x[2], reverse=True)
+        if len(flat_det_confusions) == 0:
+            self._logger.info("No unknown->known detection-level confusions found.")
+        else:
+            self._logger.info(f"{'Unknown Class':20s} {'Pred Known':20s} {'Count':>10s} {'% of det-miscls':>16s}")
+            self._logger.info("-" * 80)
+            det_denom = float(total_det_misclassified) if total_det_misclassified > 0 else 1.0
+            for unk_cls, known_cls, cnt in flat_det_confusions[:25]:
+                pct = 100.0 * cnt / det_denom
+                self._logger.info(f"{unk_cls:20s} {known_cls:20s} {cnt:10d} {pct:16.2f}")
+            self._logger.info("-" * 80)
+            self._logger.info(f"{'TOTAL':20s} {'-':20s} {total_det_misclassified:10d} {100.0 if total_det_misclassified > 0 else 0.0:16.2f}")
+        self._logger.info("=" * 80)
+
+        ret["aose50"] = float(aose_50_total)
+        ret["aose50_rate_vs_unk_gt"] = float((100.0 * aose_50_total / total_num_unk) if total_num_unk > 0 else 0.0)
+        ret["unk_gt_miscls_to_known"] = float(total_gt_misclassified)
+        ret["unk_gt_miscls_to_known_rate"] = float(total_gt_mis_pct)
         # =================================================================
         # Per-Class Results Table (labeled by group)
         # =================================================================
