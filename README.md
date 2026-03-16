@@ -52,8 +52,8 @@ OOD Detection: max_c(score_c) < tau_c  ->  unknown
 
 ```bash
 # Clone and enter repo
-git clone <this-repo>
-cd hypyolov2
+
+cd hypyolov
 
 # Clone YOLO-World dependency (if not present)
 git clone https://github.com/AILab-CVC/YOLO-World.git
@@ -259,17 +259,3 @@ hypyolov2/
   YOLO-World/                # YOLO-World dependency (git submodule)
 ```
 
-## Citation
-
-If you find this work useful, please cite the original OVOW paper this builds upon:
-
-```bibtex
-@inproceedings{Li_2025_BMVC,
-  author    = {Zizhao Li and Zhengkang Xiang and Joseph West and Kourosh Khoshelham},
-  title     = {From Open Vocabulary to Open World: Teaching Vision Language Models to Detect Novel Objects},
-  booktitle = {36th British Machine Vision Conference 2025, {BMVC} 2025, Sheffield, UK, November 24-27, 2025},
-  publisher = {BMVA},
-  year      = {2025},
-  url       = {https://bmva-archive.org.uk/bmvc/2025/assets/papers/Paper_717/paper.pdf}
-}
-```
